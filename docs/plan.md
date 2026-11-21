@@ -1,25 +1,26 @@
-# Crew and Firstmate on Windows — plan v1
+# Crew on Windows — design history
 
-Plan version: 1 (2026-11-17). This is the single current plan. It replaces the earlier
+Original plan version: 1 (2026-11-17), retained as design history. It replaced the earlier
 "Firstmate–Herdr integration" plans (v5–v7), which were private working notes.
+Crew now has its own repository with tool files at the root; historical PR numbers below
+refer to the Firstmate fork.
 How to use crew is in [`../README.md`](../README.md); this document covers where the work
 stands, why it went this way, and what is left.
 
 Status: crew 0.6.0 is the working route for orchestration from Herdr on Windows. The
-original Firstmate still runs from this fork with a small series of Windows fixes and is
-kept as it is.
+original Firstmate was kept in its separate fork with a small series of Windows fixes.
 
 ## 1. What this is
 
 Two machines: the **main PC**, where the Herdr app is used, and **pc2**, reached over SSH,
 which does the work as a server. Herdr Core runs every terminal on both.
 
-This repository is a fork of Firstmate (`kunchenguid/firstmate`) and holds two things:
+The original development fork held both orchestrators. They are now separate projects:
 
-| Part | Where | Role |
+| Part | Repository | Role |
 |---|---|---|
-| Firstmate, with Windows fixes | everything outside `crew/` | the original orchestrator; preserved, started by hand |
-| crew | `crew/` | a small orchestration tool built directly on Herdr Core; the route in daily use |
+| Firstmate, with Windows fixes | `timurproko/firstmate` | the original orchestrator; preserved, started by hand |
+| crew | `timurproko/crew`, files at the root | a small orchestration tool built directly on Herdr Core; the route in daily use |
 
 A Herdr profile marked **Run as crew coordinator** starts an agent (A1, Pi or Claude Code)
 as a crew coordinator on the profile's machine. The coordinator runs `crew` commands;
@@ -47,14 +48,14 @@ dependency-free Node file in the same fork, with Firstmate's code close by as re
 
 | Folder | What it is |
 |---|---|
-| `~/.crew/core` | the installed copy of this fork on each machine (`~/.crew/tool` before 0.7); updates itself at `crew start` |
+| `~/.crew/core` | the installed copy of crew on each machine (`~/.crew/tool` before 0.7); updates itself at `crew start` |
 | `~/.crew` | the home: projects (`crew.json`), `tasks/`, backlog, pages |
 | `~/.crew/coordinator` | the coordinator's rules and the folder it starts in. Herdr names the space after the folder, so the space is called "coordinator" |
 | `~/.crew/.worktrees` | workers' working copies on a machine without the shared delivery workflow (never under `coordinator/`, so a worker never loads the coordinator's rules). With it, `delivery start` makes the copy: a treehouse pool slot or `<project>/.worktrees/<id>` |
 | `~/.crew/state` | update and crash records |
-| `D:\Git\crew` | development clone of this fork on both machines. On pc2 it is also the Firstmate install and holds Firstmate's untracked `config/`, `data/`, `projects/`, `state/` |
+| development clone | crew's own repository, separate from the Firstmate install and its local state |
 
-Do not edit `~/.crew/core`; change crew in the development clone and merge to `main`.
+`~/.crew/core` is the installed copy; use a separate development clone for source edits.
 
 ## 4. Crew: verified state
 
@@ -76,10 +77,10 @@ All on native Windows, most on pc2 with a real coordinator.
 
 Rules crew keeps: one live owner per home; an unknown answer from Core never justifies
 takeover, failure or deletion; uncommitted work in a code task is kept unless forced;
-crew never merges a project's pull request; a self-repair may only touch `crew/` and must
+crew never merges a project's pull request; a self-repair may only touch root `crew.mjs`, `crew.test.mjs`, `README.md`, `bin/` and `docs/`, and must
 pass the full test suite before it is published.
 
-## 5. Firstmate on Windows: state of the fork
+## 5. Firstmate on Windows: historical state of the separate fork
 
 Upstream Firstmate had not been run on Windows with A1, so each stage after launch needed
 a small fix. `main` is upstream `427056c4` plus:
@@ -109,7 +110,7 @@ earlier line.
 Kept in the user's private Herdr customizations, not in this repository:
 
 - **Crew plugin**: requirements checklist per machine ("Install on" chooses whose list is
-  shown and installed to); installs this fork into `~/.crew/core`; the tools from section 4
+  shown and installed to); installs crew into `~/.crew/core`; the tools from section 4
   are optional rows.
 - **Profile checkbox** "Run as crew coordinator", offered for a profile on any machine;
   crew is checked on the profile's own machine at launch.
@@ -134,9 +135,9 @@ Crew, in order:
 
 Environment:
 
-- GitHub Actions has started no run on this fork since 2026-11-13, so the gate skips its
+- Historically, GitHub Actions had started no run on the Firstmate fork since 2026-11-13, so the gate skipped its
   CI step by default (`crew project add … --gate-skip`).
-- The fork's gate lint command is a bash script and cannot run on pc2 (no shellcheck or
+- The Firstmate fork's gate lint command was a bash script and could not run on pc2 (no shellcheck or
   actionlint on the gate's PATH), so lint is skipped there as well.
 - Two Claude Code workers started in the same second can log each other out; that is in
   the account launcher, outside crew.
@@ -151,7 +152,7 @@ Firstmate, only if it is taken further:
 
 - Fail closed. No typed keystrokes into an agent, no forced exits, no answering an agent's
   permission or trust prompt on the person's behalf.
-- Test crew with `node crew/crew.test.mjs` and check the exit code explicitly.
+- Test crew with `node crew.test.mjs` and check the exit code explicitly.
 - A live trial uses its own home (`CREW_HOME`) and ends with the coordinator closed and
   its working copies removed.
 - Report PASS / FAIL / NOT RUN as observed; a passing automated check is not the same as

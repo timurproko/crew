@@ -1,16 +1,38 @@
 # crew
 
-A small, agent-agnostic crew tool on Herdr Core. One coordinator agent hands work to worker
-agents, each in its own Core terminal and its own git worktree. It lives in this fork next
-to Firstmate, borrows Firstmate's ideas (briefs, scout and ship tasks, written reports,
-isolated copies, one owner per home) and none of its runtime: no watcher, no hooks, no
-background service. Every command is one short Node process that talks to Core through `hc`.
+A small, agent-agnostic orchestration tool on Herdr Core. One coordinator agent hands work
+to worker agents, each in its own Core terminal and isolated git worktree, and collects
+written reports. No watcher, hooks or background service: every command is one short Node
+process that talks to Core through `hc`.
 
-It exists because Firstmate's shell runtime starts thousands of small processes per task,
-which is slow on Windows (Git Bash). Measured on the same machine and task (three read-only
-scouts requested at once): about 1 minute with crew against about 31 minutes with Firstmate.
+Crew began inside a fork of [Firstmate](https://github.com/kunchenguid/firstmate) (MIT)
+and works with its companion tools.
 
-Where the work stands, why it went this way and what is left: [`docs/plan.md`](docs/plan.md).
+Design history and earlier measurements: [`docs/plan.md`](docs/plan.md).
+
+## Install
+
+Requires Node.js 20+ and Git. Crew has no npm dependencies; no install step is needed.
+To coordinate real workers, install Herdr Core with `hc` on PATH and an agent (`a1`, `pi`
+or `claude`); the companion tools below are optional.
+
+```bash
+git clone https://github.com/timurproko/crew.git
+cd crew
+node crew.mjs --version
+export PATH="$PWD/bin:$PATH"
+```
+
+Add the clone's `bin` folder to your persistent PATH to use `crew` from any folder.
+Windows uses `bin/crew.cmd`; POSIX shells (including Git Bash) use `bin/crew`.
+The Herdr Crew plugin instead installs its managed clone at `~/.crew/core`.
+All source files live at the repository root; the former nested source layout is not supported.
+
+## Development
+
+From the clone's root, run `node crew.test.mjs` (or `npm test`). The suite needs only Node
+and Git, not Core, agents, optional companion tools or GitHub access. It uses temporary
+homes, fake terminals and local repositories. No dependencies or lockfile are required.
 
 ## Layout on a machine
 
@@ -43,7 +65,7 @@ crew status [--all] [--json]             tasks, terminals and elapsed time; JSON
 crew stop <id> [--force]                 ask the worker to leave
 crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
 crew done [<id>]                         (worker) my report is written
-crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
+crew tools [--json]                      companion tools on this machine and what crew does with each
 crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
 crew tell <id> "<message>"               send the worker a follow-up; it reports again
 crew review <id> [who]                   start a reviewer on a ship task's branch
@@ -86,7 +108,7 @@ Adding one is a line in `AGENTS` in `crew.mjs`.
 
 ## Who does the work
 
-Firstmate's model is kept, in its own file and format: `<home>/config/crew-dispatch.json`.
+Worker selection is configured in `<home>/config/crew-dispatch.json`.
 A *profile* names the agent program and optionally its model and effort; `default` is an
 ordered list of them, `rules` pair a description of a kind of work with the profiles to use
 for it, `shared_quota: true` turns quota reading off. Crew adds two things for a machine with
@@ -112,7 +134,7 @@ Claude profile.
   with `account` is started through the plugin's launcher as that account. A Claude profile
   without one stands for every saved account, each a candidate of its own, with
   `CREW_CLAUDE_ACCOUNT` (what Herdr's account choice sets) first.
-- **A floor** (`"floor": 50` on a profile, Firstmate's field) is the share of its quota, in percent, a profile
+- **A floor** (`"floor": 50` on a profile) is the share of its quota, in percent, a profile
   keeps in reserve: once it is known to have less left, it yields to the next. It is not dropped but moved
   behind the others, so when everybody else is out it is still used and work goes on. The figure is the
   minimum remaining percentage of applicable effective availability from quota-axi: account-wide
@@ -233,7 +255,7 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
 For every kind, first land requires a reported worker, an existing copy, and clean tracked
 and untracked files, even when it only records a link. An already-landed PR can return early.
 
-## The tools Firstmate works with
+## Companion tools
 
 crew runs without any of them and uses each one that is installed. `crew tools` lists them
 with their versions; the Herdr plugin installs them (Settings > Plugins > Crew).
@@ -271,13 +293,13 @@ the defect. The person reviews and merges the repair's pull request.
 `crew selfmerge` remains an alias for `crew selfrepair`. The fixer commits and stops;
 it does not push or open the pull request itself. Crew refuses delivery unless the fixer
 reported, nothing is uncommitted, the branch can incorporate the published `main`,
-and the whole suite passes in the fixer's copy (`node crew/crew.test.mjs`).
+and the whole suite passes in the fixer's copy (`node crew.test.mjs`).
 
 Only the tool's own `crew.mjs`, `crew.test.mjs`, `README.md`, and files inside its `bin/`
-and `docs/` may change, with the allowlist written relative to the tool's own folder. Repository
+and `docs/` may change, with the allowlist relative to the repository root. Repository
 infrastructure such as `.github/`, root agent instructions, package metadata, scripts,
-licence, ignore and attribute files is excluded. The repository root README
-is also excluded; the tool's README is `crew/README.md`.
+licence, ignore and attribute files, and `openspec/` is excluded. The root `README.md`
+is the tool's README and is included.
 
 Crew checks the shared-delivery pull request body with `delivery check-body --final` when
 installed. The body has Proposal, ticked repair Implementation, and Acceptance sections,
@@ -377,7 +399,7 @@ task with its copy waiting. The next finish or start retries safely, as the outp
 
 ## Tests
 
-`node crew/crew.test.mjs` runs everything against a fake Core. Self-repair delivery,
+`node crew.test.mjs` runs everything against a fake Core. Self-repair delivery,
 updates, and rollback use isolated repositories, fake GitHub responses, and local remotes;
 no real terminals or GitHub are touched.
 The suite needs only Node.js and git.
