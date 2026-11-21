@@ -1911,7 +1911,7 @@ function stateFile(name, before) {
 const PREVIOUS = () => stateFile('previous', 'tool-previous'), PINNED = () => stateFile('pinned', 'tool-pinned'), CRASHES = () => stateFile('crashes', 'crashes');
 const SELF_PROJECT = 'crew:self'; // not a valid project name, so it can never be a registered one
 const toolGit = (...args) => run('git', ['-C', TOOL_ROOT, ...args], { timeout: 120000 });
-const toolRevision = () => { const r = toolGit('rev-parse', 'HEAD'); return r.code === 0 ? r.stdout.trim() : null; };
+const toolRevision = () => { if (!isClone()) return null; const r = toolGit('rev-parse', 'HEAD'); return r.code === 0 ? r.stdout.trim() : null; };
 const short = revision => String(revision ?? '').slice(0, 8) || 'unknown';
 const lastLine = text => String(text ?? '').trim().split(/\r?\n/).filter(Boolean).at(-1) ?? 'no message';
 const readLine = file => { try { return fs.readFileSync(file, 'utf8').trim() || null; } catch { return null; } };
