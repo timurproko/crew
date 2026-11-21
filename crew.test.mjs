@@ -11,6 +11,7 @@ import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVer
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
 const slash = p => p.replace(/\\/g, '/');
+const WINDOWS = process.platform === 'win32';
 
 // Pure helpers.
 assert.ok(validId('readme-lines') && validId('a1') && !validId('Bad') && !validId('-x') && !validId('a'.repeat(41)) && !validId('../x'));
@@ -173,6 +174,12 @@ gapTests['root-layout'] = () => {
   r = crew(['start'], { script: path.join(installed, 'crew.mjs'), cwd: f.home, terminal: f.owner, env: { ...f.env, HOME: user, USERPROFILE: user, CREW_AUTO_UPDATE: '', CREW_NO_UPDATE: '', CREW_TOOL_ROOT: '' } });
   assert.equal(r.code, 0, r.out); assert.match(r.out, /crew updated itself/);
   assert.equal(git('-C', installed, 'rev-parse', 'HEAD').trim(), repaired, 'Installed root clone updates without an override');
+  const differentCase = path.join(user, '.crew', 'CORE');
+  if (!WINDOWS) git('clone', '-q', f.origin, differentCase);
+  git('-C', differentCase, 'reset', '-q', '--hard', first);
+  r = crew(['start'], { script: path.join(differentCase, 'crew.mjs'), cwd: f.home, terminal: f.owner, env: { ...f.env, HOME: user, USERPROFILE: user, CREW_AUTO_UPDATE: '', CREW_NO_UPDATE: '', CREW_TOOL_ROOT: '' } });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(git('-C', differentCase, 'rev-parse', 'HEAD').trim(), WINDOWS ? repaired : first, 'Only Windows treats CORE as the installed core folder');
   fs.writeFileSync(path.join(broken, 'crew.json'), JSON.stringify({ version: 1, tag: 'broken' }));
   r = crew(['project', 'list'], { cwd: broken, env: { HOME: user, USERPROFILE: user, CREW_TOOL_ROOT: t.worktree } });
   assert.equal(r.code, 70, r.out);
@@ -292,6 +299,30 @@ function gapFixture(name, extra = {}) {
   const leave = () => { const w = readWorld(); delete w.terminals[`guest-${name}`]; fs.writeFileSync(world, JSON.stringify(w)); };
   return { dir, home, repo, call, task, save, spawn, guest, leave };
 }
+gapTests['platform-paths'] = () => {
+  const f = gapFixture('platform-paths');
+  for (const [id, variant] of [
+    ['case', p => p.replace(/case$/, 'CASE')],
+    ['slashes', p => p.replace(/\/(?=[^/]+$)/, '\\')],
+    ['child', p => `${p}/child`],
+    ['sibling', p => `${p}-other`],
+  ]) {
+    const t = f.spawn(id), holds = id === 'child' || (WINDOWS && id !== 'sibling');
+    f.guest(t);
+    const w = readWorld(), guest = w.terminals['guest-platform-paths'];
+    guest.cwd = variant(t.worktree);
+    // A label differing only in case has moved on POSIX, but not on Windows.
+    guest.labels['custom.cwd'] = t.worktree.replace(/[^/]+$/, name => name.toUpperCase());
+    fs.writeFileSync(world, JSON.stringify(w));
+    const r = f.call(['finish', id]); assert.equal(r.code, 0, r.out);
+    assert.equal(Boolean(f.task(id).copyToReturn), holds, `${id}: ${r.out}`);
+    assert.equal(fs.existsSync(t.worktree), holds, `${id}: ${r.out}`);
+    if (holds) assert.equal(r.out.includes('opened in the copy, now in'), !WINDOWS, r.out);
+    f.leave();
+    assert.equal(f.call(['finish', id]).code, 0);
+    assert.ok(!fs.existsSync(t.worktree));
+  }
+};
 gapTests.ignored = () => {
   const f = gapFixture('ignored'), count = Math.max(12001, Number(process.env.CREW_TEST_IGNORED_FILES) || 12001);
   const fill = t => { fs.mkdirSync(path.join(t.worktree, 'scratch')); for (let i = 0; i < count; i++) fs.writeFileSync(path.join(t.worktree, 'scratch', `${i}.txt`), 'old'); fs.utimesSync(path.join(t.worktree, 'scratch'), 1700000000, 1700000000); };
@@ -1668,7 +1699,9 @@ if (a[0] === '--version') process.exit(0);`);
     {
       const mine = task2('plain'), w = readWorld(), setWorld = f => { const v = readWorld(); f(v); fs.writeFileSync(world, JSON.stringify(v)); };
       // Opened from the worker's tab, then moved on: Core's cwd is still the copy, the label says where it is now.
-      w.terminals.guest = { address: 'guest', agent: 'claude-code', state: 'live', labels: { 'custom.cwd': 'C:/elsewhere' }, status: null, cwd: mine.worktree.replace(/\//g, '\\').toUpperCase() };
+      const elsewhere = WINDOWS ? 'C:/elsewhere' : '/elsewhere';
+      const movedGuest = `guest claude-code (opened in the copy, now in ${elsewhere})`;
+      w.terminals.guest = { address: 'guest', agent: 'claude-code', state: 'live', labels: { 'custom.cwd': elsewhere }, status: null, cwd: WINDOWS ? mine.worktree.replace(/\//g, '\\').toUpperCase() : mine.worktree };
       w.terminals['pc2/t1'] = { address: 'pc2/t1', state: 'live', labels: {}, status: null, cwd: mine.worktree };
       w.terminals.sibling = { address: 'sibling', state: 'live', labels: {}, status: null, cwd: `${mine.worktree}-other` };
       fs.writeFileSync(world, JSON.stringify(w));
@@ -1689,14 +1722,15 @@ if (a[0] === '--version') process.exit(0);`);
       // Now finish goes through: the task is closed, its own terminal removed, the copy and the guest kept.
       q = crew2(['finish', 'plain']); assert.equal(q.code, 0, q.out);
       assert.ok(!q.out.includes('still held by another terminal'), 'One line: the sweep does not repeat the task just finished');
-      assert.match(q.out, /finished plain \([^)]*\); its working copy is kept for now \(terminal guest claude-code \(opened in the copy, now in C:\/elsewhere\) holds it\) and crew returns it by itself once nothing holds it/);
+      assert.match(q.out, /finished plain \([^)]*\); its working copy is kept for now/);
+      assert.ok(q.out.includes(`(terminal ${movedGuest} holds it) and crew returns it by itself once nothing holds it`), q.out);
       assert.ok(!q.out.includes('pc2/t1') && !q.out.includes('sibling'), 'A terminal of another machine or of a sibling folder does not hold the copy');
       assert.equal(task2('plain').state, 'closed'); assert.ok(task2('plain').copyToReturn);
       assert.equal(readWorld().terminals[mine.terminal], undefined, 'Its own terminal is gone');
       assert.ok(fs.existsSync(mine.worktree) && readWorld().terminals.guest.state === 'live', 'The copy and the guest are kept');
       // Nothing is hidden: status says it, --all shows who holds it.
       assert.match(crew2(['status']).out, /1 working copy of finished tasks still to be returned \(crew status --all\)/);
-      assert.match(crew2(['status', '--all']).out, /plain\tclosed\t.*working copy still to be returned, held by guest claude-code \(opened in the copy, now in C:\/elsewhere\)/);
+      assert.ok(crew2(['status', '--all']).out.includes(`working copy still to be returned, held by ${movedGuest}`));
       assert.match(JSON.parse(crew2(['status', '--all', '--json']).out).tasks.find(t => t.id === 'plain').copyToReturn.heldBy, /^guest claude-code/);
       // While it is held, start and other finishes leave it.
       q = crew2(['start']); assert.equal(q.code, 0, q.out); assert.match(q.out, /1 working copy of finished tasks still held by another terminal/);
