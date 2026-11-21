@@ -6,8 +6,9 @@ The completed `crew-standalone` change remained active after PR 1 merged before 
 
 ## What Changes
 
-- Archive `crew-standalone` with the shared pinned OpenSpec CLI, allowing its normal spec synchronization and dated archive move.
-- Check the resulting specifications and archived task completion with OpenSpec validation.
+- Preserve the historical archive produced by `delivery openspec archive crew-standalone --yes`, including its five unchanged original files.
+- Carry the exact historical `tool-maintenance` delta in this housekeeping change and leave draft canonical specs identical to the target branch, so delivery automation performs the final synchronization.
+- Check OpenSpec validity and reproduce the bot's finalization preparation before pushing; let the bot promote and finalize the pull request.
 - Stop and report any duplicate delta or conflict instead of bypassing validation or forcing spec edits.
 
 ## Capabilities
@@ -18,7 +19,7 @@ None.
 
 ### Modified Capabilities
 
-None newly defined here. The existing `crew-standalone` delta owns the pending `tool-maintenance` requirements; this housekeeping plan introduces no additional behavior and declares `skip_specs: true`.
+- `tool-maintenance`: apply the exact existing `crew-standalone` root-layout and repair-scope delta during bot finalization. The delta is carried forward without introducing or changing any historical requirement.
 
 ## Impact
 

@@ -2,26 +2,26 @@
 
 ## Context
 
-See `proposal.md` for motivation. All 11 tasks in `crew-standalone` are checked. Its only delta targets `tool-maintenance`: the ADDED root-layout requirement is absent from the baseline, while the MODIFIED repair-scope requirement exists with the older wording and fewer scenarios. No duplicate or conflicting delta is apparent from this comparison. Initial `delivery openspec validate --all --strict --no-interactive` passed all four existing items.
+See `proposal.md` for motivation. `delivery openspec archive crew-standalone --yes` completed cleanly and produced `openspec/changes/archive/2026-11-21-crew-standalone/`, with five unchanged files and one added plus one modified canonical requirement. However, delivery run 44930357661 blocked the draft with `draft-delivery-specs-diverged`.
 
 ## Goals / Non-Goals
 
-**Goal:** Use OpenSpec's own synchronization and archive operation for the already-completed historical change.
+**Goal:** Preserve the historical archive and deliver its exact original specification updates through existing bot finalization.
 
-**Non-goals:** No new runtime behavior, replacement delta, hand-edited baseline, code change, or permanent rule for late archives.
+**Non-goals:** No new runtime behavior, altered historical requirements, workflow changes, repository settings changes, or manual ready mutation.
 
 ## Decisions
 
-- After plan approval, run `delivery openspec archive crew-standalone --yes`. The standalone `openspec` executable is not on PATH; `delivery openspec` runs the workflow's pinned CLI. Keep spec updates and validation enabled: neither `--skip-specs` nor `--no-validate` is acceptable for this historical change.
-- Let the CLI choose the dated archive directory and apply the original delta. Inspect the diff for exactly the old change's move and tool-maintenance synchronization, apart from this housekeeping plan's progress.
-- This separate housekeeping change uses `skip_specs: true` because it introduces no requirements of its own; the original change remains the sole owner of the spec delta. This marker must not be confused with skipping synchronization when archiving `crew-standalone`.
-- Run strict all-item validation and archived task validation after the archive. No runtime test suite is needed because runtime files do not change.
+- `publish-openspec-finalization.mjs` calls `reconcileFinalization`, whose draft path invokes `prepareSinglePrDelivery` with canonical target-branch blobs from `readCanonicalSpecs`. Before sandbox archiving, `canonicalSpecsMatch` requires equal file counts and byte equality at every path under `openspec/specs/`. It compares the entire canonical tree, not only capabilities in the linked delta. Any draft spec divergence fails even when a matching delta exists.
+- Keep the five historical archive files untouched. Restore the draft canonical spec from current `origin/main`, and carry a byte-identical copy of the historical delta in this active housekeeping change. Remove `skip_specs: true` because this change now delivers that pending delta. This preserves the required final spec while allowing the bot to perform its normal archive/sync operation.
+- Do not simply restore the baseline while retaining `skip_specs`: that would lose the pending spec update. Adding only a delta without restoring the baseline would still fail the early equality check. Removing Automation would evade linked finalization rather than deliver the declared change.
+- Use a non-writing `prepareSinglePrDelivery` rehearsal against current target blobs to verify that the generated canonical spec equals the earlier successful historical archive's output. Local rehearsal must not finalize the actual branch; readiness, the finalization commit, and acceptance metadata remain bot-owned.
 
 ## Risks / Trade-offs
 
-- A fresh default-branch update may introduce a duplicate requirement or conflict → recheck the baseline before archiving; if the CLI cannot apply cleanly, stop and report the exact blocker rather than forcing or bypassing it.
-- The CLI operation has not been executed during planning → compatibility is based on the observed delta/baseline comparison and successful initial validation, not a claimed archive dry run.
+- The original delta is present in both the preserved historical archive and this delivery change → they represent the same pending update, not two active updates; only this active change is synchronized by the bot.
+- The default branch may advance → merge it before pushing, then recheck exact canonical equality; report actual conflicts instead of forcing edits.
 
 ## Migration Plan
 
-After approval, archive the historical change, inspect its generated move and synchronized spec, then run `delivery openspec validate --all --strict --no-interactive` and `delivery openspec validate --archived --strict --no-interactive`. Before commit, a failed or unexpected operation is a blocker, not permission to modify unrelated specs. The eventual change is documentation-only and can be reverted through normal review if needed.
+The coordinator authorized this correction after the bot refusal. Retain the historical archive, carry its delta in the active housekeeping change, restore target canonical bytes, validate all items and archived tasks, and rehearse finalization. Push a normal corrective commit on the existing PR. Inspect bot promotion and finalization results without manually marking ready or changing automation. Pull any bot finalization commit before further pushes.
