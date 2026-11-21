@@ -29,6 +29,10 @@ Add final Acceptance bullets describing script-folder root resolution and overri
 
 Read the resulting Delivery disposition without a foreground watch. The bot alone promotes the draft, archives `crew-standalone`, synchronizes its tool-maintenance delta and records exact-head acceptance. A content refusal is a blocker to report, not permission to edit shared scripts, repository settings or unrelated specifications. Never manually mark ready, archive or merge.
 
-## Approval boundary
+## Approved follow-up completion
 
-Status: plan only, awaiting approval. No follow-up implementation, canonical-spec edit or archive operation has been performed. Hosted promotion, finalization and final-head checks remain unverified until the approved follow-up is submitted to the bot.
+The coordinator approved this plan and requested implementation. The existing implementation matches the original maintenance delta: `TOOL_ROOT` resolves `CREW_TOOL_ROOT` or the running script folder; `repairFile` accepts only root tool files plus `bin/` and `docs/`; fixer instructions and the default repair suite use root-relative paths. Existing allowlist and root-layout regression tests cover the matching scenarios. All 11 original tasks remain complete and unchanged.
+
+The follow-up preparation is complete. Its only authored change is this context and completion record inside `crew-standalone`; runtime code, original change artifacts, shared workflows, repository settings and canonical specs remain untouched. The PR's single outcome acknowledges already-delivered code and completed preparation, not a new runtime implementation or a claim that archiving has already happened.
+
+No known implementation gap was found during reconciliation. Strict validation of the original change, final PR-body validation and whitespace/scope checks are the targeted local checks for this documentation-only follow-up. Bot promotion, archive/spec synchronization and final-head required checks are subsequent hosted results to be reported separately; only the bot may create the archive, synchronized spec and acceptance manifest.
