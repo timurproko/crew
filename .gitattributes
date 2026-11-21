@@ -1,0 +1,3 @@
+bin/crew text eol=lf
+bin/crew.cmd text eol=crlf
+*.mjs text eol=lf
