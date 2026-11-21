@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const VERSION = '0.12.0';
+export const VERSION = '0.12.1';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === 'win32';
 // Everything of crew on a machine lives under ~/.crew, which is also the default home:
@@ -44,6 +44,11 @@ class Refusal extends Error { constructor(message, code = 2) { super(message); t
 const refuse = (message, code) => { throw new Refusal(message, code); };
 export const validId = id => typeof id === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(id);
 const slash = p => String(p).replace(/\\/g, '/');
+// Windows accepts either slash and ignores case; POSIX paths do neither.
+const comparablePath = p => {
+  const resolved = path.resolve(String(p));
+  return (WINDOWS ? slash(resolved).toLowerCase() : resolved).replace(/\/+$/, '');
+};
 // Single-quoted for a POSIX shell, whatever the text contains.
 export const shq = text => `'${String(text).replace(/'/g, `'\\''`)}'`;
 // A Windows path as Git Bash spells it (D:\x -> /d/x); other paths unchanged.
@@ -1380,7 +1385,7 @@ function dropMergedBranch(project, task) {
 function otherTerminalsIn(folder, own) {
   const { code, value } = hcJson(['ls', '--json']);
   if (code !== 0 || !Array.isArray(value?.terminals)) return null;
-  const norm = p => slash(path.resolve(String(p))).replace(/\/+$/, '').toLowerCase(), root = norm(folder);
+  const norm = comparablePath, root = norm(folder);
   // A terminal of another machine (`machine/t1`) names a folder there, not here.
   return value.terminals.filter(t => t.state === 'live' && t.address !== own && !String(t.address).includes('/') && t.cwd && (norm(t.cwd) === root || norm(t.cwd).startsWith(`${root}/`)));
 }
@@ -1389,7 +1394,7 @@ function otherTerminalsIn(folder, own) {
 // reports where the shell is now in the label `custom.cwd`; `hc ls` does not carry labels, so
 // each holder is asked once. A tab that moved on is said to have, since it looks unrelated.
 function describeHolders(holders, folder) {
-  const norm = p => slash(path.resolve(String(p))).replace(/\/+$/, '').toLowerCase(), root = norm(folder);
+  const norm = comparablePath, root = norm(folder);
   return holders.map(t => {
     const name = `${t.address}${t.agent ? ` ${String(t.agent).split(/[\\/]/).pop()}` : ''}`;
     const now = probe(t.address).t?.labels?.['custom.cwd'];
@@ -1917,7 +1922,7 @@ const lastLine = text => String(text ?? '').trim().split(/\r?\n/).filter(Boolean
 const readLine = file => { try { return fs.readFileSync(file, 'utf8').trim() || null; } catch { return null; } };
 const isClone = () => fs.existsSync(path.join(TOOL_ROOT, '.git'));
 // Only the copy Herdr installed updates itself; a developer's checkout is left alone.
-const installedCopy = () => process.env.CREW_AUTO_UPDATE === '1' || ['core', 'tool'].some(name => slash(path.join(CREW_DIR, name)).toLowerCase() === TOOL_ROOT.toLowerCase());
+const installedCopy = () => process.env.CREW_AUTO_UPDATE === '1' || ['core', 'tool'].some(name => comparablePath(path.join(CREW_DIR, name)) === comparablePath(TOOL_ROOT));
 
 // Fast-forwards the tool to the published main. Never merges, rebases or discards anything.
 function updateTool({ respectPin = false } = {}) {
