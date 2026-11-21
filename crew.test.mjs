@@ -163,6 +163,8 @@ gapTests['root-layout'] = () => {
   assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), first, 'Developer clone never updates itself');
   r = f.call(['update']); assert.equal(r.code, 0, r.out); assert.match(r.out, /crew updated/);
   assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), repaired);
+  assert.equal(f.call(['rollback'], { CREW_TOOL_ROOT: path.join(f.repo, 'docs') }).code, 2, 'A non-clone override must not inherit its parent repository revision');
+  assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), repaired, 'Rejected override cannot roll back the parent clone');
   r = f.call(['rollback']); assert.equal(r.code, 0, r.out);
   assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), first);
   // Crash revision and root use the explicit override, with an isolated state directory.

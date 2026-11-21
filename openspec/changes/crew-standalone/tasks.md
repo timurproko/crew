@@ -14,8 +14,8 @@
 
 ## 3. Crew adopts shared delivery and xrbuild-style cross-platform CI
 
-- [ ] 3.1 Generate shared instructions with `delivery instructions --apply`, copy the unchanged delivery caller/bootstrap templates, and verify template byte equality plus a matching `delivery instructions` report.
-- [ ] 3.2 Complete the initialized OpenSpec scaffold and three concise existing-behavior specs without local skills or CLI pins; check the linked maintenance delta and all specs using `delivery openspec validate --all --strict --no-interactive`.
-- [ ] 3.3 Add the test workflow with xrbuild-style readiness/events/concurrency, shared OpenSpec action, deterministic Git setup, Windows/Ubuntu Node 20 suites and one strict `CI required` aggregate; inspect success/failure/skip/cancellation and draft/ready conditions.
+- [x] 3.1 Generate shared instructions with `delivery instructions --apply`, copy the unchanged delivery caller/bootstrap templates, and verify template byte equality plus a matching `delivery instructions` report.
+- [x] 3.2 Complete the initialized OpenSpec scaffold and three concise existing-behavior specs without local skills or CLI pins; check the linked maintenance delta and all specs using `delivery openspec validate --all --strict --no-interactive`.
+- [x] 3.3 Add the test workflow with xrbuild-style readiness/events/concurrency, shared OpenSpec action, deterministic Git setup, Windows/Ubuntu Node 20 suites and one strict `CI required` aggregate; inspect success/failure/skip/cancellation and draft/ready conditions.
 - [ ] 3.4 Run `node crew.test.mjs` once with elapsed-time logging under clean Git config, and exercise version, isolated home creation and update in a throwaway branch clone at a fake installed `core` path; record exact outputs without touching the real crew home or published main.
 - [ ] 3.5 Record the observed GitHub prerequisites from shared docs and read-only xrbuild settings, and explicitly identify unverified hosted CI/bot behavior; confirm no repository settings or MyWorkflows files were changed.
