@@ -303,7 +303,7 @@ gapTests['platform-paths'] = () => {
   const f = gapFixture('platform-paths');
   for (const [id, variant] of [
     ['case', p => p.replace(/case$/, 'CASE')],
-    ['slashes', p => p.replace(/\//g, '\\')],
+    ['slashes', p => p.replace(/\/(?=[^/]+$)/, '\\')],
     ['child', p => `${p}/child`],
     ['sibling', p => `${p}-other`],
   ]) {
