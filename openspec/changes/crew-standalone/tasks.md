@@ -9,8 +9,8 @@
 
 ## 2. Crew has standalone project documentation and metadata
 
-- [ ] 2.1 Write the standalone README opening, clone/install/development commands, Node 20+ and no-dependency notes, and one MIT Firstmate origin/compatibility sentence; check all documented local commands and links use the root layout.
-- [ ] 2.2 Add MIT LICENSE with copyright 2026 Timur Proko, private ESM package metadata with the specified engine and test/prepare scripts, and the three ignores; parse metadata and confirm no dependencies, lockfile or attribute-rule changes.
+- [x] 2.1 Write the standalone README opening, clone/install/development commands, Node 20+ and no-dependency notes, and one MIT Firstmate origin/compatibility sentence; check all documented local commands and links use the root layout.
+- [x] 2.2 Add MIT LICENSE with copyright 2026 Timur Proko, private ESM package metadata with the specified engine and test/prepare scripts, and the three ignores; parse metadata and confirm no dependencies, lockfile or attribute-rule changes.
 
 ## 3. Crew adopts shared delivery and xrbuild-style cross-platform CI
 

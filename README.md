@@ -5,7 +5,34 @@ to worker agents, each in its own Core terminal and isolated git worktree, and c
 written reports. No watcher, hooks or background service: every command is one short Node
 process that talks to Core through `hc`.
 
-Where the work stands, why it went this way and what is left: [`docs/plan.md`](docs/plan.md).
+Crew began inside a fork of [Firstmate](https://github.com/kunchenguid/firstmate) (MIT)
+and works with its companion tools.
+
+Design history and earlier measurements: [`docs/plan.md`](docs/plan.md).
+
+## Install
+
+Requires Node.js 20+ and Git. Crew has no npm dependencies; no install step is needed.
+To coordinate real workers, install Herdr Core with `hc` on PATH and an agent (`a1`, `pi`
+or `claude`); the companion tools below are optional.
+
+```bash
+git clone https://github.com/timurproko/crew.git
+cd crew
+node crew.mjs --version
+export PATH="$PWD/bin:$PATH"
+```
+
+Add the clone's `bin` folder to your persistent PATH to use `crew` from any folder.
+Windows uses `bin/crew.cmd`; POSIX shells (including Git Bash) use `bin/crew`.
+The Herdr Crew plugin instead installs its managed clone at `~/.crew/core`.
+All source files live at the repository root; the former nested source layout is not supported.
+
+## Development
+
+From the clone's root, run `node crew.test.mjs` (or `npm test`). The suite needs only Node
+and Git, not Core, agents, optional companion tools or GitHub access. It uses temporary
+homes, fake terminals and local repositories. No dependencies or lockfile are required.
 
 ## Layout on a machine
 

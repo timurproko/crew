@@ -1,0 +1,12 @@
+{
+  "name": "crew",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node crew.test.mjs",
+    "prepare": "node scripts/workflow-bootstrap.mjs"
+  }
+}
