@@ -2,10 +2,10 @@
 
 ## 1. Crew runs and repairs itself from the repository root
 
-- [ ] 1.1 Default the tool root to the script folder while retaining the override; cover installed copies, developer worktree clone detection, update/rollback and crash-root reporting with focused regressions.
-- [ ] 1.2 Make fixer briefs, default repair suite and allowlist enforcement root-relative; cover allowed root README/tool files and rejected infrastructure, OpenSpec and former nested tool paths.
-- [ ] 1.3 Rebuild repair/update fixtures as root-layout repositories by copying only tool-owned files, and change PATH expectations to root `bin/`; run the affected regression selectors and inspect their exit codes.
-- [ ] 1.4 Correct obsolete source-layout/fork wording throughout code, tests, README, embedded usage/coordinator rules and `docs/plan.md`; delete the two completed plans and review remaining `crew/` matches for legitimate home, URL or historical branch references.
+- [x] 1.1 Default the tool root to the script folder while retaining the override; cover installed copies, developer worktree clone detection, update/rollback and crash-root reporting with focused regressions.
+- [x] 1.2 Make fixer briefs, default repair suite and allowlist enforcement root-relative; cover allowed root README/tool files and rejected infrastructure, OpenSpec and former nested tool paths.
+- [x] 1.3 Rebuild repair/update fixtures as root-layout repositories by copying only tool-owned files, and change PATH expectations to root `bin/`; run the affected regression selectors and inspect their exit codes.
+- [x] 1.4 Correct obsolete source-layout/fork wording throughout code, tests, README, embedded usage/coordinator rules and `docs/plan.md`; delete the two completed plans and review remaining `crew/` matches for legitimate home, URL or historical branch references.
 
 ## 2. Crew has standalone project documentation and metadata
 

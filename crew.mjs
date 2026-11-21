@@ -4,7 +4,7 @@
 // One coordinator agent owns a crew home and calls these commands; each worker is an
 // ordinary agent in its own Core terminal and its own git worktree. Everything is one
 // short process talking to Core through `hc`; there is no watcher, no hook and no
-// background service. See crew/README.md for the design and its limits.
+// background service. See README.md for the design and its limits.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -547,14 +547,14 @@ export function agentCommand(name, agent, instruction, env = process.env, pick =
 }
 
 // --- who does the work ----------------------------------------------------------------
-// Firstmate's model, kept: a *profile* names the agent program, and optionally its model and
+// A *profile* names the agent program, and optionally its model and
 // effort ({ "harness": "a1", "model": "openai-codex/gpt-x", "effort": "high" }), and
 // <home>/config/crew-dispatch.json lists them: `default` is an ordered array, `rules` pair a
 // description of a kind of work (`when`) with the profiles to `use` for it, `shared_quota`
 // turns quota reading off. Added for crew: `roles` (an array per scout, ship, review, fix),
 // and `account` on a Claude profile, a login saved by the account-switcher plugin. A Claude
 // profile without one stands for every saved account, each a candidate of its own.
-// `floor` (Firstmate's too) is the share of quota, in percent, a profile keeps in reserve.
+// `floor` is the share of quota, in percent, a profile keeps in reserve.
 // `projects` gives one project a list of its own (an array, or { default, roles }), for a
 // project where an agent of the general list cannot work; "crew:self" is crew's own source.
 // The resulting ordered list is a fallback chain. Before a worker starts, candidates whose
@@ -595,13 +595,13 @@ export function cleanProfile(raw, where = '') {
     out[key] = String(p[key]);
   }
   if (out.account && harness !== 'claude') refuse(`${at}Only Claude Code has saved accounts. ${harness} chooses its login with the model, as in "github-copilot/<id>".`);
-  // Firstmate's optional `floor`: the share of quota, in percent, below which this profile yields to the next.
+  // Optional `floor`: the share of quota, in percent, below which this profile yields to the next.
   if (p.floor !== undefined && p.floor !== null) {
     const floor = Number(p.floor);
     if (!Number.isFinite(floor) || floor < 0 || floor > 100) refuse(`${at}Not a usable floor (0 to 100): ${p.floor}`);
     out.floor = floor;
   }
-  // Firstmate's optional `provider` is the quota-axi family the profile spends from.
+  // Optional `provider` is the quota-axi family the profile spends from.
   const provider = p.provider ?? p.family; // `family` is the normalized form in saved candidates.
   if (typeof provider === 'string' && WORD.test(provider)) out.family = provider;
   return out;
@@ -677,7 +677,7 @@ function nativeProvider(harness) {
 }
 const familyOf = c => c.family ?? (c.harness === 'claude' ? 'claude' : QUOTA_FAMILY[c.model?.includes('/') ? c.model.split('/')[0] : nativeProvider(c.harness)] ?? null);
 
-// One provider row of a quota-axi --json reading, as it bears on a model. Firstmate's rule:
+// One provider row of a quota-axi --json reading, as it bears on a model. Quota rule:
 // a candidate is out only when a scope that bounds it is exhausted now or has nothing left;
 // a reading that could not be taken is uncertainty, never proof of an empty account.
 export function quotaVerdict(row, model) {
@@ -801,7 +801,7 @@ function cmdAgents(args) {
   config.rules.forEach((r, i) => console.log(`rule ${i + 1}: ${r.when}\n        use ${r.use.map(pickLabel).join(', then ')}  (--rule ${i + 1})`));
 }
 
-// --- the tools Firstmate works with -----------------------------------------------
+// --- optional companion tools ----------------------------------------------------
 // crew runs without any of them. Each one that is installed is used for what it is good at:
 // by crew itself (`crew` column) or by the agents, who are told about it in their brief or
 // rules. `brief` is the line a worker gets when the tool is on this machine.
@@ -1893,8 +1893,8 @@ function githubEnvironment(remote) {
 // --- crew maintains itself -------------------------------------------------------
 // A worker commits a repair; crew checks its scope, rebases and tests before opening a PR.
 // The person merges it. Machines pick it up at update/start; rollback stays per machine.
-const TOOL_ROOT = slash(path.resolve(process.env.CREW_TOOL_ROOT || path.join(HERE, '..')));
-// Paths here are relative to the tool's own folder, not to its repository.
+const TOOL_ROOT = slash(path.resolve(process.env.CREW_TOOL_ROOT || HERE));
+// The tool's own folder is the repository root; infrastructure is not a repair target.
 export function repairFile(file) {
   return ['crew.mjs', 'crew.test.mjs', 'README.md'].includes(file) || /^(bin|docs)\/.+/.test(file);
 }
@@ -1989,14 +1989,14 @@ function cmdFix(args) {
   while (fs.existsSync(taskDir(h, `fix-${n}`))) n++;
   const id = `fix-${n}`, crashes = recentCrashes();
   const task = [
-    'Repair a defect in the crew tool itself. This working copy is crew\'s own source: the tool is `crew/crew.mjs`, its tests are `crew/crew.test.mjs`, its design is in `crew/README.md`.',
+    'Repair a defect in the crew tool itself. This working copy is crew\'s own source: the tool is `crew.mjs`, its tests are `crew.test.mjs`, its design is in `README.md`.',
     '', '## The problem, as the coordinator saw it', problem,
     ...(crashes.length ? ['', '## Crash records from this machine (read them)', ...crashes.map(f => `- \`${slash(f)}\``)] : []),
     '', '## What to do',
-    '1. Find the cause in `crew/crew.mjs`. Say so in the report if the problem is not a defect in crew.',
-    '2. Add a check to `crew/crew.test.mjs` that fails because of the defect, then make the smallest change that fixes it.',
-    '3. Change only `crew/crew.mjs`, `crew/crew.test.mjs`, `crew/README.md`, or files under `crew/bin/` and `crew/docs/`. Repository infrastructure is out of scope.',
-    '4. Run `node crew/crew.test.mjs` and keep going until it exits 0. The fix is published only if the whole suite passes.',
+    '1. Find the cause in `crew.mjs`. Say so in the report if the problem is not a defect in crew.',
+    '2. Add a check to `crew.test.mjs` that fails because of the defect, then make the smallest change that fixes it.',
+    '3. Change only `crew.mjs`, `crew.test.mjs`, `README.md`, or files under `bin/` and `docs/`. Repository infrastructure is out of scope.',
+    '4. Run `node crew.test.mjs` and keep going until it exits 0. The fix is published only if the whole suite passes.',
     '5. Commit on this branch and stop. Do not push or open a pull request: after its checks, the coordinator opens the pull request with `crew selfrepair`. The person merges it.',
     '6. In the report give the cause, the change and the new check, each in a line or two.',
   ].join('\n');
@@ -2036,10 +2036,10 @@ function cmdSelfmerge(args) {
   if (changed.code !== 0) no('its changed files could not be read; nothing was pushed.');
   const files = changed.stdout.split('\0').filter(Boolean);
   if (!files.length) no('it changes nothing compared with the published main.');
-  const outside = files.filter(f => !f.startsWith('crew/') || !repairFile(f.slice('crew/'.length)));
+  const outside = files.filter(f => !repairFile(f));
   if (outside.length) no(`it changes files outside crew's own files (${outside.slice(0, 5).join(', ')}). Repository infrastructure is out of scope.`);
   // The suite runs as it would on a clean machine: nothing of this session leaks into it.
-  const command = process.env.CREW_SELFTEST || 'node crew/crew.test.mjs';
+  const command = process.env.CREW_SELFTEST || 'node crew.test.mjs';
   const testEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(CREW_|HC_TERMINAL_ID$)/i.test(key)));
   const tested = run(command, [], { shell: true, cwd: wt, env: testEnv, timeout: 15 * 60 * 1000 });
   if (tested.code !== 0) no(`the test suite fails (${command}, exit ${tested.code ?? 'timeout'}):\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
@@ -2149,7 +2149,7 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew land <id> [--title "<title>"]       push/open a plain PR, or record the workflow/gate PR
       first land requires a reported worker, existing copy and clean tracked/untracked files; an already-landed PR can return early
       plain PR text uses the first 200 report lines plus attribution; workflow draft/outcome summary is best-effort
-  crew tools [--json]                      Firstmate's tools on this machine and what crew does with each
+  crew tools [--json]                      companion tools on this machine and what crew does with each
   crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
   crew show <page.html>                    open a page for the person (lavish-axi) with a link in Herdr's status bar
   crew fix [who] "<problem>"               start a worker that repairs crew itself
