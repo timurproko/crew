@@ -2,10 +2,10 @@
 
 ## 1. Versioned bounded discovery returns exact task PRs without recording state
 
-- [ ] 1.1 Add the opt-in JSON-only mode, version-1 envelope, per-task result shape and recorded-link canonicalization; verify focused fixtures for known, none, unavailable and invalid flag usage.
-- [ ] 1.2 Add exact worktree/common-directory, explicit branch and origin verification plus bounded GitHub repository/head lookups; verify fake-only cases for workflow, gate, plain, SSH alias resolution, missing identities, foreign branches/forks and ambiguous PRs.
-- [ ] 1.3 Enforce serial reads, two-second subprocess limits, one-MiB output limits and a ten-second shared deadline with no retries; verify fake runner/clock assertions and a real timeout of a fake subprocess, including unqueried budget-exhausted results.
-- [ ] 1.4 Document the flag, v1 JSON fields, reason codes and timing/partial-result limits in README.md and docs/status-pr-discovery.md; verify documented examples against fixture output.
+- [x] 1.1 Add the opt-in JSON-only mode, version-1 envelope, per-task result shape and recorded-link canonicalization; verify focused fixtures for known, none, unavailable and invalid flag usage.
+- [x] 1.2 Add exact worktree/common-directory, explicit branch and origin verification plus bounded GitHub repository/head lookups; verify fake-only cases for workflow, gate, plain, SSH alias resolution, missing identities, foreign branches/forks and ambiguous PRs.
+- [x] 1.3 Enforce serial reads, two-second subprocess limits, one-MiB output limits and a ten-second shared deadline with no retries; verify fake runner/clock assertions and a real timeout of a fake subprocess, including unqueried budget-exhausted results.
+- [x] 1.4 Document the flag, v1 JSON fields, reason codes and timing/partial-result limits in README.md and docs/status-pr-discovery.md; verify documented examples against fixture output.
 
 ## 2. Legacy status and lifecycle compatibility have fake-only integration coverage and a documented app adapter contract
 

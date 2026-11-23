@@ -2086,12 +2086,105 @@ function formatDuration(seconds) {
   return parts.slice(0, 2).join(' ') || '0s';
 }
 
+// Discovery is an output-only overlay: never feed an early PR back into done/land.
+const prResult = (status, url = null, source = null, reason = null) => ({ status, url, source, reason });
+export function canonicalPrUrl(value) {
+  if (typeof value !== 'string' || value.length > 2048 || /\s/.test(value)) return null;
+  const match = /^https?:\/\/github\.com\/([a-z0-9-]+)\/([a-z0-9_.-]+)\/pull\/([1-9][0-9]*)(?:\/?(?:[?#][^\s]*)?)?$/i.exec(value);
+  if (!match || ['.', '..'].includes(match[2])) return null;
+  return `https://github.com/${match[1]}/${match[2]}/pull/${match[3]}`;
+}
+// Runner/clock injection keeps deadline and failure tests deterministic; production reads
+// are serial, bounded subprocesses. This helper neither reads reports nor writes anything.
+export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => performance.now() } = {}) {
+  const deadline = clock() + 10000, repositories = new Map();
+  const fail = reason => { throw new Error(reason); };
+  const read = (command, args, cwd, failure) => {
+    const remaining = Math.floor(deadline - clock());
+    if (remaining <= 0) fail('budget-exhausted');
+    const result = execute(command, args, { cwd, timeout: Math.min(2000, remaining), killSignal: 'SIGKILL', maxBuffer: 1048576,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GH_PROMPT_DISABLED: '1', GH_HOST: 'github.com', GH_REPO: '', GH_PAGER: 'cat' } });
+    if (result.error?.code === 'ETIMEDOUT') fail('timeout');
+    if (result.error?.code === 'ENOBUFS' || Buffer.byteLength(result.stdout ?? '') + Buffer.byteLength(result.stderr ?? '') > 1048576) fail('invalid-response');
+    if (result.error || result.code !== 0) fail(failure);
+    if (clock() >= deadline) fail('budget-exhausted');
+    return result.stdout.trim();
+  };
+  const ask = (args, cwd) => GH.endsWith('.mjs')
+    ? read(process.execPath, [GH, ...args], cwd, 'github-unavailable') : read(GH, args, cwd, 'github-unavailable');
+  const parse = text => { try { return JSON.parse(text); } catch { fail('invalid-response'); } };
+  const samePath = (a, b) => comparablePath(fs.realpathSync.native(a)) === comparablePath(fs.realpathSync.native(b));
+  const repoName = value => typeof value === 'string' && /^[a-z0-9-]+\/[a-z0-9_.-]+$/i.test(value) && !['.', '..'].includes(value.split('/')[1]);
+  return tasks.map(task => {
+    if (task.pr != null) {
+      const url = canonicalPrUrl(task.pr);
+      return url ? prResult('known', url, 'recorded') : prResult('unavailable', null, null, 'invalid-recorded-pr');
+    }
+    if (task.kind !== 'ship') return prResult('none');
+    try {
+      if (clock() >= deadline) fail('budget-exhausted');
+      const project = projects?.[task.project];
+      if (!task.branch || typeof task.branch !== 'string' || !task.worktree || typeof task.worktree !== 'string' || !project?.path) fail('missing-identity');
+      if (!fs.existsSync(task.worktree) || !fs.existsSync(project.path)) fail('worktree-unavailable');
+      const git = (cwd, ...args) => read('git', ['-C', cwd, ...args], cwd, 'worktree-unavailable');
+      git(task.worktree, 'check-ref-format', `refs/heads/${task.branch}`);
+      const copy = git(task.worktree, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir').split(/\r?\n/);
+      const parent = git(project.path, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-common-dir').split(/\r?\n/);
+      if (copy.length !== 2 || parent.length !== 2 || !samePath(copy[0], task.worktree) || !samePath(copy[1], parent[1])) fail('repository-mismatch');
+      // Full symbolic ref avoids ambiguity with tags and never substitutes another branch.
+      const branch = read('git', ['-C', task.worktree, 'symbolic-ref', '--quiet', 'HEAD'], task.worktree, 'branch-mismatch');
+      if (branch !== `refs/heads/${task.branch}`) fail('branch-mismatch');
+      const origin = read('git', ['-C', task.worktree, 'remote', 'get-url', 'origin'], task.worktree, 'unsupported-remote');
+      const projectOrigin = read('git', ['-C', project.path, 'remote', 'get-url', 'origin'], project.path, 'unsupported-remote');
+      if (origin !== projectOrigin) fail('repository-mismatch');
+      const key = JSON.stringify([parent[1], origin]);
+      let repository = repositories.get(key);
+      if (!repository) {
+        // Only GitHub, including SSH Host aliases resolved locally by ssh -G. No
+        // network probe is made for local paths, GitLab or other unsupported origins.
+        const remote = /^(https:\/\/|ssh:\/\/git@|git@)([a-z0-9][a-z0-9.-]*)(?:\/|:)([^\s]+)$/i.exec(origin);
+        if (!remote) fail('unsupported-remote');
+        let host = remote[2].toLowerCase();
+        if (host !== 'github.com' && remote[1].toLowerCase() !== 'https://') {
+          const config = read('ssh', ['-G', host], task.worktree, 'unsupported-remote');
+          host = /^hostname\s+(\S+)\s*$/mi.exec(config)?.[1]?.toLowerCase();
+        }
+        const name = remote[3].replace(/\.git\/?$/i, '').replace(/\/$/, '');
+        if (host !== 'github.com' || !repoName(name)) fail('unsupported-remote');
+        const resolved = parse(ask(['repo', 'view', `https://github.com/${name}`, '--json', 'nameWithOwner,url'], task.worktree));
+        if (!repoName(resolved?.nameWithOwner) || resolved.url !== `https://github.com/${resolved.nameWithOwner}`) fail('invalid-response');
+        repository = resolved.nameWithOwner;
+        repositories.set(key, repository);
+      }
+      const prs = parse(ask(['api', '--hostname', 'github.com', '-X', 'GET', `repos/${repository}/pulls`,
+        '-f', 'state=all', '-f', `head=${repository.split('/')[0]}:${task.branch}`, '-f', 'per_page=2'], task.worktree));
+      if (!Array.isArray(prs) || prs.length > 2) fail('invalid-response');
+      if (!prs.length) return prResult('none');
+      for (const pr of prs) {
+        const url = canonicalPrUrl(pr?.html_url);
+        if (!url || !Number.isSafeInteger(pr.number) || pr.number <= 0 || url.toLowerCase() !== `https://github.com/${repository}/pull/${pr.number}`.toLowerCase()
+          || pr.head?.ref !== task.branch || typeof pr.head?.repo?.full_name !== 'string' || pr.head.repo.full_name.toLowerCase() !== repository.toLowerCase()
+          || typeof pr.base?.repo?.full_name !== 'string' || pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase()) fail('invalid-response');
+      }
+      if (prs.length !== 1) fail('ambiguous-pr');
+      return prResult('known', canonicalPrUrl(prs[0].html_url), 'github');
+    } catch (error) {
+      // Only our stable reason codes escape; filesystem/runner errors reveal no paths,
+      // credentials, raw stderr or report content, and cannot fail the status command.
+      const reasons = ['missing-identity', 'worktree-unavailable', 'branch-mismatch', 'repository-mismatch', 'unsupported-remote', 'github-unavailable', 'invalid-response', 'ambiguous-pr', 'timeout', 'budget-exhausted'];
+      return prResult('unavailable', null, null, reasons.includes(error.message) ? error.message : 'worktree-unavailable');
+    }
+  });
+}
+
 function cmdStatus(args) {
+  const json = args.includes('--json'), all = args.includes('--all'), discover = args.includes('--discover-prs');
+  if (discover && !json) refuse('Usage: crew status --json --discover-prs [--all]');
   const h = home();
-  const json = args.includes('--json'), all = args.includes('--all');
   const { owner, live, mine } = ownerState(h);
   const currentTime = Date.now();
-  const tasks = allTasks(h).filter(t => all || t.state !== 'closed').map(t => {
+  const records = allTasks(h).filter(t => all || t.state !== 'closed');
+  const tasks = records.map(t => {
     const core = ['closed', 'failed'].includes(t.state) ? null : terminal(t.terminal);
     return { id: t.id, state: t.state, kind: t.kind, agent: t.agent, launch: t.launch ? { ...t.launch, label: pickLabel(t.launch) } : null, standby: (t.chain ?? []).map(pickLabel),
       standbyStatus: (t.chain ?? []).map(c => { const fact = t.candidateChecks?.facts?.[pickKey(c)]; return { ...c, label: pickLabel(c), status: fact?.status ?? 'unknown', note: fact?.note ?? 'no recorded reading', remaining: fact?.remaining ?? null, passedOver: Boolean(fact && !['ok', 'unknown'].includes(fact.status)), checkedAt: t.candidateChecks?.checkedAt ?? null }; }), fallbacks: t.fallbacks ?? [], project: t.project, terminal: t.terminal,
@@ -2106,7 +2199,11 @@ function cmdStatus(args) {
   // A closed task whose copy still waits to be returned is not hidden: --all lists it with its
   // holders, and plain status (which is about unfinished work) says how many there are.
   const waiting = all ? 0 : allTasks(h).filter(t => t.state === 'closed' && t.copyToReturn).length;
-  if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks, ...(all ? {} : { copiesToReturn: waiting }) })); return; }
+  if (discover) {
+    const results = discoverTaskPrs(records, h.config.projects);
+    tasks.forEach((task, i) => { task.prDiscovery = results[i]; });
+  }
+  if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks, ...(all ? {} : { copiesToReturn: waiting }), ...(discover ? { prDiscovery: { version: 1 } } : {}) })); return; }
   console.log(`home ${slash(h.dir)} - ${owner ? `owner ${owner.terminal}${mine ? ' (you)' : live ? ' (live, you are read-only)' : ' (gone)'}` : 'no owner'}`);
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
   // A workflow task's stage is what its last report said it is; GitHub is not asked here.
@@ -2140,6 +2237,7 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; recover stopped or idle workers
       CREW_NO_FALLBACK=1 also disables recovery and hand-over; questions/permissions need a person even with candidates left; ended terminals fail without hand-over
   crew status [--all] [--json]             tasks, terminals, PR links and elapsed time; --all also shows why finished copies wait
+  crew status --json --discover-prs       versioned read-only PR lookup; bounded network reads, no task-state writes
       JSON: elapsedSeconds, recorded deliveryKind (gate/workflow/plain, null for non-ships), standby labels and standbyStatus with recorded skip reasons; no quota refresh
       recovery: current Core errors and continuation counts; JSON includes nudges history and the active recovery record; no messages sent
   crew stop <id> [--force]                 ask the worker to leave
