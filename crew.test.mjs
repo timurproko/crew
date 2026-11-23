@@ -1265,9 +1265,12 @@ gapTests['review-label-storage-failures'] = () => {
     f.save({ ...f.task(parent.id), pr: f.url, landed: new Date().toISOString() });
     r = f.call(['land', parent.id]); assert.equal(r.code, 0, `${mode}: ${r.out}`); assert.match(r.out, /already has a pull request/);
     const n = f.calls().length;
-    const status = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), 'status', '--all', '--json'], { cwd: f.home, encoding: 'utf8', env: { ...process.env, ...f.env, CREW_HOME: f.home, CREW_TERMINAL: f.owner } });
-    assert.equal(status.status, 0, status.stderr); JSON.parse(status.stdout);
-    assert.equal(f.calls().length, n, 'Even damaged metadata must not make status call GitHub');
+    for (const flags of [[], ['--discover-prs']]) {
+      const status = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), 'status', '--all', '--json', ...flags], { cwd: f.home, encoding: 'utf8', env: { ...process.env, ...f.env, CREW_HOME: f.home, CREW_TERMINAL: f.owner } });
+      assert.equal(status.status, 0, status.stderr); const result = JSON.parse(status.stdout);
+      assert.equal(result.prDiscovery?.version, flags.length ? 1 : undefined);
+      assert.equal(f.calls().length, n, 'Damaged label metadata cannot trigger label recovery in either status mode');
+    }
   }
   // Records created by the previous version have no authoritative session field. The
   // current terminal remains able to report even after its advisory metadata is lost.
@@ -1298,6 +1301,9 @@ gapTests['review-label-recovery'] = () => {
   let saved = snapshot(), n = f.calls().length;
   let status = JSON.parse(f.call(['status', '--json']).out); assert.equal(status.tasks.find(x => x.id === t.id).reviewLabel.operation, 'add');
   assert.deepEqual(snapshot(), saved); assert.equal(f.calls().length, n, 'Owner status performs no GitHub request');
+  const discovery = JSON.parse(f.call(['status', '--json', '--discover-prs']).out);
+  assert.equal(discovery.prDiscovery.version, 1); assert.equal(discovery.tasks.find(x => x.id === t.id).reviewLabel.operation, 'add');
+  assert.deepEqual(snapshot(), saved); assert.equal(f.calls().length, n, 'Explicit PR discovery must not retry label signaling');
   const outsider = crew(['status', '--json'], { cwd: f.home, terminal: 'outsider', env: f.env }); assert.equal(outsider.code, 0, outsider.out); JSON.parse(outsider.out);
   assert.deepEqual(snapshot(), saved); assert.equal(f.calls().length, n, 'Nonowner status performs no GitHub request');
   assert.match(f.call(['status']).out, /review label add pending/);
