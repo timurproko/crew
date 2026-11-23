@@ -62,6 +62,7 @@ crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   c
 crew relaunch <id> [who] ["<why>"]       end the current session and hand over working, stopped or failed work; copy stays
 crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; recover stopped or idle workers
 crew status [--all] [--json]             tasks, terminals and elapsed time; JSON also shows delivery kind, standby eligibility and recovery
+crew status --json --discover-prs       opt-in, versioned read-only PR discovery before workers report
 crew stop <id> [--force]                 ask the worker to leave
 crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
 crew done [<id>]                         (worker) my report is written
@@ -361,6 +362,17 @@ otherwise it is looked up on `PATH`.
 
 `crew status` shows pull request links and elapsed time (`elapsedSeconds` in JSON), from the
 original spawn or creation to report, stop, failure, closure, or now. Relaunch does not reset it.
+
+Ordinary status forms read recorded PRs only and make no network calls. Opt in with
+`crew status --json --discover-prs` (also accepts `--all`) to discover a ship task's PR
+before its first report, for workflow, gate and plain projects. The version-1 overlay
+adds top-level `prDiscovery.version` and per-task `prDiscovery` with `status` (`known`,
+`none`, `unavailable`), `url`, `source` and `reason`. `tasks[].pr` remains the stored
+value: discovery never records links, changes stages, or lands tasks and is available to
+non-owners. Lookups verify the task's exact copy, recorded branch and project origin;
+unsupported remotes and failures are unavailable, not confirmed absence. Added reads run
+serially with two-second subprocess limits and a ten-second shared budget; remaining
+tasks can be unavailable. See [the JSON contract and limits](docs/status-pr-discovery.md).
 
 ## Crew repairs itself
 
