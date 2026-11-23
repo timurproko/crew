@@ -9,11 +9,11 @@
 
 ## 2. Review endings preserve labels until the last local reviewer ends
 
-- [ ] 2.1 Serialize local per-PR label decisions with bounded acquisition and conservative dead-process recovery, recomputing desired state from fresh attempt records; fake concurrent completion/launch cases prove second opinions and stale cleanup cannot clear a newer review.
-- [ ] 2.2 Release activity on both verdicts, malformed or failed completion, confirmed stop/finish and launch failures without changing existing refusals; fake cases cover missing reports, unknown Core answers, unconfirmed stops and repeated closure.
-- [ ] 2.3 Integrate attempt boundaries with relaunch, automatic fallback and reviewer tell, including no-candidate dead reviewers and failed replacements; fake cases prove old cleanup precedes new signaling and old terminal completion cannot end a new attempt.
-- [ ] 2.4 Treat confirmed absent assignments as successful removal but retain inaccessible 404, denied permission and network failures as pending; fake cases assert unrelated labels survive and cleanup never changes normal command results.
-- [ ] 2.5 Document local overlap guarantees, verdict independence and the absence of cross-home coordination in README; compare examples with the second-opinion and replacement fixtures.
+- [x] 2.1 Serialize local per-PR label decisions with bounded acquisition and conservative dead-process recovery, recomputing desired state from fresh attempt records; fake concurrent completion/launch cases prove second opinions and stale cleanup cannot clear a newer review.
+- [x] 2.2 Release activity on both verdicts, malformed or failed completion, confirmed stop/finish and launch failures without changing existing refusals; fake cases cover missing reports, unknown Core answers, unconfirmed stops and repeated closure.
+- [x] 2.3 Integrate attempt boundaries with relaunch, automatic fallback and reviewer tell, including no-candidate dead reviewers and failed replacements; fake cases prove old cleanup precedes new signaling and old terminal completion cannot end a new attempt.
+- [x] 2.4 Treat confirmed absent assignments as successful removal but retain inaccessible 404, denied permission and network failures as pending; fake cases assert unrelated labels survive and cleanup never changes normal command results.
+- [x] 2.5 Document local overlap guarantees, verdict independence and the absence of cross-home coordination in README; compare examples with the second-opinion and replacement fixtures.
 
 ## 3. Existing lifecycle commands recover advisory signaling and explain its limits
 

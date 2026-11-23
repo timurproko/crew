@@ -970,11 +970,11 @@ const PICK_USAGE = `[--agent ${Object.keys(AGENTS).join('|')}] [--model <id>] [-
 // Starts the terminal in which `pick` works on a task. The agent starts with one instruction
 // as its argument, so nothing is typed into it and there is no race with its startup. The
 // shell stays afterwards so the terminal survives the agent leaving; `crew finish` removes it.
-function startTerminal(h, { id, worktree, label, pick, instruction }) {
+function startTerminal(h, { id, worktree, label, pick, instruction, reviewAttempt = null }) {
   const agent = AGENTS[pick.harness];
   if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
   const line = [
-    `export CREW_HOME=${shq(bashPath(h.dir))} CREW_TASK=${shq(id)} PATH=${shq(`${bashPath(path.join(HERE, 'bin'))}`)}:"$PATH"`,
+    `export CREW_HOME=${shq(bashPath(h.dir))} CREW_TASK=${shq(id)}${reviewAttempt ? ` CREW_REVIEW_ATTEMPT=${shq(reviewAttempt)}` : ''} PATH=${shq(`${bashPath(path.join(HERE, 'bin'))}`)}:"$PATH"`,
     agentCommand(pick.harness, agent, instruction, process.env, pick),
     'exec bash --login -i',
   ].join('; ');
@@ -1037,7 +1037,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   if (workflow) { record = { ...record, workflow: 'delivery' }; saveTask(h, record); }
   fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project), workflow, branch }));
 
-  const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, instruction: `Read the brief at ${brief} and carry it out exactly.` });
+  const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, reviewAttempt: record.reviewAttempt, instruction: `Read the brief at ${brief} and carry it out exactly.` });
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
     if (delivered) runTool('delivery', ['finish', worktree, '--force'], { cwd: project.path, timeout: 120000 });
@@ -1080,15 +1080,24 @@ function relaunch(h, task, reason, flags = null) {
     if (seen !== 'absent') { hc(['kill', task.terminal]); hc(['rm', task.terminal]); seen = probe(task.terminal).state; }
     if (seen !== 'absent') refuse(`Core still has terminal ${task.terminal}; task ${task.id} was not handed over.`, 6);
   }
+  if (task.reviews) {
+    endReviewSignal(h, task);
+    task = { ...task, reviewAttempt: beginReviewSignal(h, task), terminal: null, state: 'preparing' };
+    saveTask(h, task);
+  }
   const instruction = `Read the brief at ${task.brief} and carry it out exactly. Another worker (${pickLabel(before)}) began this task and had to stop: ${reason}. What it did is already in this working copy: look at \`git status\` and \`git log\`, and at ${task.report} if it exists, then continue from there instead of starting again.`;
-  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, instruction });
+  let started;
+  try { started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, instruction, reviewAttempt: task.reviewAttempt }); }
+  catch (error) { endReviewSignal(h, task); throw error; }
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
+    endReviewSignal(h, task);
     saveTask(h, { ...task, state: 'failed', terminal: null, error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
     refuse(`Core did not start the next worker for ${task.id}: ${JSON.stringify(started.value)}. Its working copy is kept: ${task.worktree}`, 5);
   }
-  const { error, ...kept } = task;
-  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
+  const current = loadTask(h, task.id);
+  const { error, ...kept } = current;
+  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: current.state === 'reported' ? 'reported' : 'working', terminal: address, relaunched: now(),
     fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
   return { pick, rest, address };
 }
@@ -1195,8 +1204,11 @@ function cmdDone(args) {
   const task = loadTask(h, id);
   const mine = me();
   if (task.terminal && mine && task.terminal !== mine) refuse(`Task ${id} belongs to terminal ${task.terminal}, not this one.`, 3);
-  if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
+  if (task.reviews && process.env.CREW_REVIEW_ATTEMPT && process.env.CREW_REVIEW_ATTEMPT !== readJson(signalFile(h, task.reviewAttempt))?.sessionAttempt) refuse(`Task ${id} has a newer review attempt; this report belongs to the old reviewer.`, 3);
   if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
+  // A completion attempt ends reviewing activity even if its report is malformed or absent.
+  endReviewSignal(h, task);
+  if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
   saveTask(h, { ...task, state: 'reported', reported: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
   console.log(`reported ${id}. You are finished; stop here.`);
 }
@@ -1254,6 +1266,7 @@ function cmdWait(args) {
         // The agent is gone and left no report: the next candidate takes the task over.
         quiet.delete(id);
         const said = lastWords(task.terminal), reason = `its agent ended without a report${said ? ` (${said})` : ''}`, from = pickLabel(task.launch ?? { harness: task.agent });
+        endReviewSignal(h, task);
         const moved = relaunch(h, loadTask(h, id), reason);
         if (moved.pick) console.log(`== ${id}: ${from} is gone: ${reason}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
         else { blocked.set(id, `${from} is gone: ${reason}, and ${moved.why}`); settled.set(id, 'needs a person'); }
@@ -1261,6 +1274,7 @@ function cmdWait(args) {
         // The worker cannot go on for want of quota or a login: the next candidate of its
         // chain takes the task over in the same working copy, and the wait goes on.
         const reason = stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12), from = pickLabel(task.launch ?? { harness: task.agent });
+        endReviewSignal(h, task);
         const moved = relaunch(h, loadTask(h, id), reason);
         if (moved.pick) console.log(`== ${id}: ${from} stopped (${reason}); ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
         else { blocked.set(id, `${from} stopped (${reason}) and ${moved.why}`); settled.set(id, 'needs a person'); }
@@ -1275,6 +1289,7 @@ function cmdWait(args) {
         if (recovery.handover) {
           const latest = loadTask(h, id);
           if (latest.state !== 'working' || latest.terminal !== task.terminal) continue;
+          endReviewSignal(h, latest);
           const moved = relaunch(h, latest, recovery.handover);
           if (moved.pick) console.log(`== ${id}: ${recovery.tried}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
           else { blocked.set(id, `${recovery.tried}, and ${moved.why}`); settled.set(id, 'needs a person'); }
@@ -1355,6 +1370,7 @@ function cmdStop(args) {
   if (!id) refuse('Usage: crew stop <id> [--force]');
   const task = loadTask(h, id);
   const result = stopWorker(task, { force });
+  if (result.stopped) endReviewSignal(h, task);
   if (result.stopped && task.state !== 'closed') saveTask(h, { ...loadTask(h, id), state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now() });
   console.log(`${result.stopped ? 'stopped' : 'not stopped'} ${id}: ${result.how}`);
   if (!result.stopped) process.exitCode = 6;
@@ -1628,6 +1644,7 @@ function returnWaiting(h, task, { force = false } = {}) {
     try {
       const result = stopWorker(task, { force });
       if (!result.stopped) return { state: 'held', line: `The working copy of ${task.id} is kept: its worker stop is not confirmed (${result.how}). The next crew finish or crew start retries it.` };
+      endReviewSignal(h, task);
       copyToReturn.stopPending = false;
       saveTask(h, task);
     } catch (error) {
@@ -1665,6 +1682,7 @@ function cmdFinish(args) {
   if (!id) refuse('Usage: crew finish <id> [--force]');
   const task = loadTask(h, id);
   if (task.state === 'closed') {
+    if (!task.copyToReturn?.stopPending) endReviewSignal(h, task);
     // A closed task whose copy still waits: --force is the person's word to discard what was
     // found in it and return it now. A terminal in it still keeps it, forced or not.
     if (task.copyToReturn && force) {
@@ -1698,6 +1716,7 @@ function cmdFinish(args) {
     result = { stopped: false, how: error.message };
   }
   if (!result.stopped && !attempted) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
+  if (result.stopped) endReviewSignal(h, task);
   const project = projectOf(h, task);
   const forget = () => (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) && forgetClaudeFolder(task.worktree);
   const closed = { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state };
@@ -1746,10 +1765,12 @@ function cmdTell(args) {
   const text = `Message from the coordinator about task ${id}: ${message}\nWhen you have dealt with it, rewrite ${task.report} so it holds the complete, current result, then run \`crew done ${id}\` again and stop.`;
   // The task is open again BEFORE the message goes out, so a fast worker's new report is
   // never overwritten by this command.
-  saveTask(h, { ...task, state: 'working', told: now(), tells: (task.tells ?? 0) + 1 });
+  const attempt = task.reviews && task.state === 'reported' ? beginReviewSignal(h, task, null, readJson(signalFile(h, task.reviewAttempt))?.sessionAttempt) : task.reviewAttempt;
+  saveTask(h, { ...task, ...(attempt ? { reviewAttempt: attempt } : {}), state: 'working', told: now(), tells: (task.tells ?? 0) + 1 });
   const sent = hc(['send', task.terminal, text]);
   if (sent.code !== 0) {
-    saveTask(h, { ...loadTask(h, id), state: task.state });
+    if (attempt && attempt !== task.reviewAttempt) endReviewSignal(h, { reviewAttempt: attempt });
+    saveTask(h, { ...loadTask(h, id), state: task.state, ...(task.reviews ? { reviewAttempt: task.reviewAttempt } : {}) });
     refuse(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
   }
   console.log(`told ${id}; next: crew wait ${id}`);
@@ -1797,7 +1818,8 @@ function withReviewSignalLock(h, work) {
     try { fs.mkdirSync(lock); break; }
     catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      const names = fs.readdirSync(lock);
+      let names;
+      try { names = fs.readdirSync(lock); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
       if (names.length === 1 && /^\d+-[a-f0-9-]+$/.test(names[0])) {
         const pid = Number(names[0].split('-')[0]);
         let dead = false;
@@ -1839,7 +1861,8 @@ function syncReviewTarget(h, target) {
     }
   }
   if (result.code !== 0) throw new Error(`${active ? 'add' : 'cleanup'} failed on ${target.repo}#${target.pr} (${lastLine(result.stderr) || result.error?.message || 'GitHub did not answer'})`);
-  for (const s of signals) writeJson(signalFile(h, s.attempt), { ...s, pending: false, error: null });
+  const changed = reviewSignals(h).filter(s => s.target?.key === target.key).some(s => signalActive(h, s)) !== active;
+  for (const s of signals) writeJson(signalFile(h, s.attempt), { ...s, pending: changed, applied: active, error: null });
 }
 function syncReviewSignal(h, attempt) {
   try {
@@ -1854,12 +1877,12 @@ function syncReviewSignal(h, attempt) {
     });
   } catch (error) { reviewWarning(error.message); }
 }
-function beginReviewSignal(h, task, resolved = null) {
+function beginReviewSignal(h, task, resolved = null, sessionAttempt = null) {
   const attempt = randomUUID();
   try {
     const found = resolved ?? reviewTarget(loadTask(h, task.reviews));
     fs.mkdirSync(reviewSignalsDir(h), { recursive: true });
-    const s = { attempt, task: task.id, parent: task.reviews, target: found.target ?? null, pending: Boolean(found.target || found.error), error: found.error ?? null, launcher: process.pid, created: now() };
+    const s = { attempt, sessionAttempt: sessionAttempt ?? attempt, task: task.id, parent: task.reviews, target: found.target ?? null, pending: Boolean(found.target || found.error), error: found.error ?? null, launcher: process.pid, created: now() };
     writeJson(signalFile(h, attempt), s);
     if (found.error) reviewWarning(found.error);
     else if (!found.target) console.log(`review label: ${task.id} has no implementation PR at review time; nothing to label`);
@@ -1869,7 +1892,12 @@ function beginReviewSignal(h, task, resolved = null) {
 }
 function endReviewSignal(h, task) {
   if (!task.reviewAttempt) return;
-  try { fs.writeFileSync(signalEnded(h, task.reviewAttempt), ''); syncReviewSignal(h, task.reviewAttempt); }
+  try {
+    fs.writeFileSync(signalEnded(h, task.reviewAttempt), '');
+    const s = readJson(signalFile(h, task.reviewAttempt));
+    if (s) writeJson(signalFile(h, s.attempt), { ...s, pending: Boolean(s.target), error: null });
+    syncReviewSignal(h, task.reviewAttempt);
+  }
   catch (error) { reviewWarning(error.message); }
 }
 

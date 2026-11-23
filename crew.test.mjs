@@ -1,7 +1,7 @@
 // Runs with plain `node crew.test.mjs`. Core is replaced by a small fake `hc`, so no
 // terminal, agent or machine is touched; the live checks are recorded in README.md.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -638,6 +638,7 @@ const fail = text => { console.error(text); process.exit(1); };
 if(a[0]==='auth') { console.log('fake-token'); process.exit(0); }
 if(a[0]==='pr' && a[1]==='view') { if(s.lookupError) fail('network unavailable'); if(!s.pr) fail('no pull requests found for branch'); console.log(${JSON.stringify(url)}); process.exit(0); }
 if(a[0]!=='api') fail('unexpected fake command');
+if(s.slowDelete && method==='DELETE') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,300);
 if(s.inaccessible) fail('HTTP 404: Not Found');
 if(endpoint.includes('/labels/') && method==='GET') { if(!s.defined) fail('HTTP 404: label missing'); console.log(JSON.stringify({name:label,color:'840479',description:''})); }
 else if(method==='POST') { if(s.addDenied) fail('HTTP 403: denied'); if(!s.defined) fail('must not create missing definition'); if(!s.labels.includes(label)) s.labels.push(label); fs.writeFileSync(file,JSON.stringify(s)); if(s.ambiguousAdd) fail('connection lost after write'); console.log(JSON.stringify(s.labels.map(name=>({name})))); }
@@ -646,7 +647,7 @@ else if(method==='GET' && endpoint.endsWith('/labels')) console.log(JSON.stringi
 else fail('unexpected fake endpoint');
 `);
   fs.writeFileSync(hcFake, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process'; const a=process.argv.slice(2), s=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)},'utf8')); if(a[0]==='run') { fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({kind:'launch'})+'\\n'); if(s.failRun) { console.log('{}'); process.exit(1); } } const r=spawnSync(process.execPath,[${JSON.stringify(fake)},...a],{encoding:'utf8'}); process.stdout.write(r.stdout); process.stderr.write(r.stderr); process.exit(r.status);`);
-  const env = { CREW_GH: ghFake, CREW_HC: hcFake, CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', CREW_NO_QUOTA: '1' };
+  const env = { CREW_GH: ghFake, CREW_HC: hcFake, CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', CREW_NO_QUOTA: '1', CREW_AGENT_PATH: '' };
   const f = gapFixture(`review-${name}`, env), owner = `owner-review-${name}`;
   const state = patch => { const s = JSON.parse(fs.readFileSync(stateFile, 'utf8')); if (patch) fs.writeFileSync(stateFile, JSON.stringify({ ...s, ...patch })); return patch ? state() : s; };
   const events = () => fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
@@ -692,9 +693,67 @@ gapTests['review-label-launch'] = () => {
   assert.ok(!f.calls().some(c => c.a.includes('create') || c.method === 'PUT'));
 };
 
+gapTests['review-label-endings'] = () => {
+  const f = reviewLabelFixture('endings'); f.parent();
+  const first = f.start(), second = f.start();
+  fs.writeFileSync(first.report, 'APPROVE\n'); let r = f.worker(first); assert.equal(r.code, 0, r.out);
+  assert.ok(f.state().labels.includes(f.label)); assert.ok(!f.calls().some(e => e.method === 'DELETE'));
+  fs.writeFileSync(second.report, 'CHANGES NEEDED\n'); r = f.worker(second); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(f.state().labels, ['unrelated']);
+  assert.ok(f.calls().some(e => e.method === 'DELETE' && e.endpoint.endsWith('/%F0%9F%A4%96%20Under%20review')));
+  r = f.worker(second); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Repeated absent removal is success');
+  for (const [id, report] of [['malformed', 'not a verdict'], ['empty', '']]) {
+    f.parent(id); const t = f.start(id); fs.writeFileSync(t.report, report); r = f.worker(t); assert.equal(r.code, report ? 0 : 2, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
+  }
+  f.parent('stop'); const stopped = f.start('stop'); r = f.call(['stop', stopped.id]); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
+  f.parent('finish'); const finished = f.start('finish'); setTerminal(finished.terminal, { status: { state: 'working', app: 'pi' } });
+  r = f.call(['finish', finished.id]); assert.equal(r.code, 6, r.out); assert.ok(f.state().labels.includes(f.label), 'Refused finish leaves live review labeled');
+  r = f.call(['finish', finished.id, '--force']); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
+  f.parent('silent'); const silent = f.start('silent'); const w = readWorld(); w.silent = true; fs.writeFileSync(world, JSON.stringify(w));
+  r = f.call(['stop', silent.id]); assert.equal(r.code, 4, r.out); assert.ok(f.state().labels.includes(f.label));
+  w.silent = false; fs.writeFileSync(world, JSON.stringify(w)); assert.equal(f.call(['stop', silent.id]).code, 0);
+  f.parent('failed'); f.state({ failRun: true, ambiguousAdd: true }); r = f.call(['review', 'failed']); assert.equal(r.code, 5, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
+  f.state({ failRun: false, ambiguousAdd: false });
+  f.parent('copy'); const badDelivery = path.join(f.dir, 'bad-delivery.mjs'); fs.writeFileSync(badDelivery, "console.error('no working copy'); process.exit(1);");
+  r = f.call(['review', 'copy'], { CREW_TOOL_DELIVERY: badDelivery }); assert.equal(r.code, 5, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
+  f.parent('retry'); let t = f.start('retry'); fs.writeFileSync(t.report, 'APPROVE'); f.state({ removeDenied: true });
+  r = f.worker(t); assert.equal(r.code, 0, r.out); assert.match(r.out, /cleanup failed/); assert.ok(f.records().find(s => s.attempt === t.reviewAttempt).pending);
+  f.state({ removeDenied: false, inaccessible: true }); r = f.worker(t); assert.equal(r.code, 0, r.out); assert.match(r.out, /cleanup failed/); assert.ok(f.records().find(s => s.attempt === t.reviewAttempt).pending);
+  f.state({ inaccessible: false }); const newer = f.start('retry'), before = f.calls().length;
+  r = f.worker(t); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
+  assert.ok(!f.calls().slice(before).some(c => c.method === 'DELETE'), 'Stale failed cleanup must not delete a newer review label');
+  fs.writeFileSync(newer.report, 'APPROVE'); r = f.worker(newer); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
+  r = f.call(['tell', t.id, 'Review again.']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
+  r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewAttempt }); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
+};
+gapTests['review-label-replacement'] = () => {
+  const f = reviewLabelFixture('replacement'); f.parent(); const old = f.start();
+  let n = f.calls().length, r = f.call(['relaunch', old.id, '--agent', 'claude']); assert.equal(r.code, 0, r.out);
+  const next = f.task(old.id); assert.notEqual(next.reviewAttempt, old.reviewAttempt);
+  const actions = f.calls().slice(n).filter(c => ['DELETE', 'POST'].includes(c.method)); assert.deepEqual(actions.map(c => c.method), ['DELETE', 'POST']);
+  fs.writeFileSync(next.report, 'APPROVE'); r = f.worker(old, ['done', old.id], { CREW_REVIEW_ATTEMPT: old.reviewAttempt }); assert.equal(r.code, 3, r.out); assert.ok(f.state().labels.includes(f.label));
+  const oldMarker = path.join(f.home, 'state', 'review-labels', `${old.reviewAttempt}.ended`); assert.ok(fs.existsSync(oldMarker));
+  r = f.worker(next, ['done', next.id], { CREW_REVIEW_ATTEMPT: next.reviewAttempt }); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
+  f.parent('failure'); const fail = f.start('failure'); f.state({ failRun: true });
+  r = f.call(['relaunch', fail.id, '--agent', 'claude']); assert.equal(r.code, 5, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
+  f.state({ failRun: false }); f.parent('dead'); const dead = f.start('dead', 'a1');
+  r = f.call(['wait', dead.id, '--timeout', '1']); assert.equal(r.code, 7, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'No-candidate agent death releases ownership');
+};
+gapTests['review-label-concurrent'] = async () => {
+  const f = reviewLabelFixture('concurrent'); f.parent(); const old = f.start(); fs.writeFileSync(old.report, 'APPROVE'); f.state({ slowDelete: true });
+  const child = spawn(process.execPath, [path.join(here, 'crew.mjs'), 'done', old.id], { cwd: f.home, env: { ...process.env, ...f.env, CREW_HOME: f.home, CREW_TERMINAL: old.terminal } });
+  let output = ''; child.stdout.on('data', b => output += b); child.stderr.on('data', b => output += b);
+  const ended = new Promise(resolve => child.on('close', code => resolve(code)));
+  const deadline = Date.now() + 10000;
+  while (!f.calls().some(c => c.method === 'DELETE') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+  const next = f.start(); assert.equal(await ended, 0, output);
+  assert.ok(f.state().labels.includes(f.label), 'Old cleanup cannot run after a newer successful add');
+  fs.writeFileSync(next.report, 'CHANGES NEEDED'); assert.equal(f.worker(next).code, 0); assert.deepEqual(f.state().labels, ['unrelated']);
+};
+
 try {
   const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
-  for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { test(); console.log(`PASS: gap ${name}`); }
+  for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { await test(); console.log(`PASS: gap ${name}`); }
   if (!onlyGaps) {
   // The focused fixtures have their own homes and copies, but share the fake Core transport.
   fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));

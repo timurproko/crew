@@ -271,6 +271,13 @@ write or another sufficient existing label-write grant, never an App key. Missin
 permissions or network errors produce visible warnings without preventing review. This is
 activity only, not a GitHub approval or a readiness/merge gate; absence proves nothing.
 
+Either review verdict ends the activity label, as does a malformed completion, a confirmed
+stop/finish or a failed launch. Relaunch hands ownership to a fresh attempt; telling a
+reported reviewer to review again resumes signaling. With two local reviewers on one PR,
+the label stays until the last ends. Old cleanup cannot clear a newer local review's label.
+These guarantees cover one crew home only: independent runners must avoid overlapping
+ownership on the same PR. Unrelated labels are never replaced or removed.
+
 ## Companion tools
 
 crew runs without any of them and uses each one that is installed. `crew tools` lists them
