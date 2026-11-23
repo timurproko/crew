@@ -300,24 +300,39 @@ and untracked files, even when it only records a link. An already-landed PR can 
 
 ### Advisory review labels
 
-After saving a launched reviewer, `crew review` best-effort adds `🤖 Under review` to its
-implementation PR and removes existing `🤖 Approved` / `🤖 Changes needed` labels. After
-saving `crew done`, an exact first-line `APPROVE` or `CHANGES NEEDED` removes Under review
-and adds the matching verdict label. Malformed or missing reports cause no label change.
-Workflow, gate and plain projects use the same hooks; Plan reports and plain branches
-without a PR at review time are skipped. Status remains read-only.
+After saving a launched reviewer, `crew review` best-effort adds the current activity label
+(initially `🤖 Review`) to its implementation PR and removes previous verdict labels
+(initially `🤖 Approved` / `🤖 Rework`). After saving `crew done`, an exact first-line
+`APPROVE` or `CHANGES NEEDED` clears activity and opposite verdict labels and adds the
+matching current verdict label. Both hooks also remove assigned historical names, including
+`🤖 Under review` and `🤖 Changes needed`, preserving unrelated labels. Malformed or missing
+reports cause no label change. Workflow, gate and plain projects use the same hooks; Plan
+reports and plain branches without a PR at review time are skipped. Status remains read-only.
+
+Names come from `labels/base.json` on the source repository's default branch. Set
+`CREW_REVIEW_LABELS_REPO=owner/repository` to choose the source (default
+`timurproko/MyWorkflows`). Each eligible, opted-in hook makes one signed-in GitHub API read
+with a two-second timeout, omitting `ref` to select the default branch. The version-1
+manifest's `labels` object supplies `name` and optional `previousNames` for stable keys
+`under-review`, `review-approved` and `review-changes-needed`; missing history means an
+empty list. Other metadata is ignored. Future names need not have a robot prefix. A failed
+or invalid read uses built-in `🤖 Review`, `🤖 Approved` and `🤖 Rework`, with the two old
+names above as aliases, and includes the fallback diagnostic in the hook's one warning line.
+There is no disk cache; the next hook reads the source again.
 
 All three definitions belong to the shared workflow; crew never creates or redefines them.
 It uses signed-in `gh`, repository-variable read access and sufficient label-write access.
-`DELIVERY_LABELS_ENABLED=false` opts out (case-insensitive, no whitespace trimming). Any
-failure prints one warning line without changing task state or exit status. A missing verdict
-definition skips that addition but still removes Under review. Each write is attempted once;
-there are no retries, locks, label-state files, overlap tracking or lifecycle cleanup.
+`DELIVERY_LABELS_ENABLED=false` opts out (case-insensitive, no whitespace trimming), before
+any manifest read or label write. Any failure prints one warning line without changing task
+state or exit status. A missing current definition skips that addition but still permits
+removals; crew never adds a historical name instead. Each write is attempted once; a start
+hook stops writing once the reviewer is no longer working. There are no retries, locks,
+label-state files, overlap tracking or lifecycle cleanup.
 
-A crashed/stopped reviewer or failed removal leaves Under review until the shared workflow
-clears it on merge/close or a person removes it. With two reviewers, the first verdict removes
-Under review while the other may still be running. Swaps are best effort, not atomic; verdict
-labels remain as a record after merge/close. Labels never gate delivery or imply GitHub approval.
+A crashed/stopped reviewer or failed removal leaves activity labels until the shared workflow
+clears them on merge/close or a person removes them. With two reviewers, the first verdict
+removes activity labels while the other may still be running. Swaps are best effort, not atomic;
+verdict labels remain as a record after merge/close. Labels never gate delivery or imply GitHub approval.
 
 ## Companion tools
 
