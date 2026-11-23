@@ -6,7 +6,7 @@
 // short process talking to Core through `hc`; there is no watcher, no hook and no
 // background service. See README.md for the design and its limits.
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -58,8 +58,10 @@ const now = () => new Date().toISOString();
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
 function writeJson(file, value) {
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+    fs.renameSync(tmp, file);
+  } finally { fs.rmSync(tmp, { force: true }); }
 }
 function run(command, args, options = {}) {
   const r = spawnSync(command, args, { encoding: 'utf8', windowsHide: true, ...options });
@@ -154,8 +156,7 @@ function cmdHome(args) {
 function home() {
   const dir = findHome();
   if (!dir || !fs.existsSync(path.join(dir, 'crew.json'))) refuse('No crew home yet. Run `crew init` once (it creates ~/.crew), or `crew init <folder>` for a home elsewhere.');
-  const config = readJson(path.join(dir, 'crew.json'));
-  if (!config || config.version !== 1) refuse(`${path.join(dir, 'crew.json')} is not a version 1 crew home.`);
+  const config = readRegistry(dir);
   // A home from before 0.7 holds the coordinator's rules itself; a newer one keeps them in
   // coordinator/. Working copies are never under the folder with those rules: agents read
   // instruction files from their folder upwards, so a worker placed there would load the
@@ -166,6 +167,55 @@ function home() {
     : unpacked ? path.join(dir, '.worktrees') : path.join(CREW_DIR, '.worktrees', String(config.tag));
   return { dir, config, coordinator, tasks: path.join(dir, 'tasks'), worktrees, owner: path.join(dir, 'owner.json') };
 }
+function readRegistry(dir) {
+  const config = readJson(path.join(dir, 'crew.json'));
+  if (!config || config.version !== 1 || !config.projects || typeof config.projects !== 'object' || Array.isArray(config.projects)
+      || Object.values(config.projects).some(p => !p || typeof p.path !== 'string' || !p.path)) {
+    refuse(`Crew home ${slash(dir)} has an invalid version 1 registry (crew.json); nothing was changed.`);
+  }
+  return config;
+}
+
+// Atomic rename alone cannot serialize read-modify-write or protect task admission.
+// All registry writers and the first task record share this short critical section.
+// Never steal a lock on age/PID guesses: an abandoned lock needs deliberate recovery.
+function withRegistry(h, action) {
+  const lock = path.join(h.dir, 'projects.lock'), deadline = Date.now() + 2000;
+  let fd;
+  for (;;) {
+    try { fd = fs.openSync(lock, 'wx'); break; }
+    catch (error) {
+      if (error.code !== 'EEXIST') refuse(`Crew home ${slash(h.dir)}: could not lock its project registry (${error.code}). Nothing was changed.`);
+      if (Date.now() >= deadline) refuse(`Crew home ${slash(h.dir)}: project registry is locked at ${slash(lock)} (PID ${readJson(lock)?.pid ?? 'unknown'}). Retry; if abandoned, remove that lock only after confirming no process is using it. Nothing was changed.`, 3);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
+  try {
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token: randomUUID() }));
+    h.config = readRegistry(h.dir); // never write a snapshot read before taking the lock
+    return action();
+  } finally {
+    fs.closeSync(fd);
+    fs.unlinkSync(lock);
+  }
+}
+
+// A malformed/missing task record is not proof that its working copy is gone.
+function requireUnusedProject(h, name) {
+  let tasks;
+  try {
+    tasks = fs.readdirSync(h.tasks).filter(validId).map(id => {
+      const task = readJson(taskFile(h, id));
+      if (!task || task.id !== id || typeof task.project !== 'string' || !['preparing', 'working', 'reported', 'stopped', 'failed', 'closed'].includes(task.state)) throw new Error(`invalid task ${id}`);
+      return task;
+    });
+  } catch (error) { refuse(`Crew home ${slash(h.dir)}: cannot check task references (${error.message}); project ${name} was kept.`); }
+  const users = tasks.filter(t => t.project === name && t.state !== 'closed');
+  if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
+  const waiting = tasks.filter(t => t.project === name && t.copyToReturn);
+  if (waiting.length) refuse(`Project ${name} still has working copies of finished tasks to return: ${waiting.map(t => t.id).join(' ')}. They go back once no terminal holds them (crew status --all).`);
+}
+
 const taskDir = (h, id) => path.join(h.tasks, id);
 const taskFile = (h, id) => path.join(taskDir(h, id), 'task.json');
 function loadTask(h, id) {
@@ -194,11 +244,12 @@ function ownerState(h) {
   const state = probe(owner.terminal).state;
   return { owner, live: state === 'live' || state === 'unknown', mine, unknown: state === 'unknown' };
 }
-function requireOwner(h) {
+const ownershipRefusal = (h, owner, operation) => `Crew home ${slash(h.dir)} is controlled by terminal ${owner.terminal}. Only that coordinator may ${operation}; this does not mean a project folder is in use.`;
+function requireOwner(h, operation = 'control work in this home') {
   const { owner, live, mine } = ownerState(h);
   if (mine) return;
-  if (owner && live) refuse(`Read-only: this home is owned by terminal ${owner.terminal}. Only that session may change it.`, 3);
-  refuse('This session does not hold the home. Run `crew start` first.', 3);
+  if (owner && live) refuse(ownershipRefusal(h, owner, operation), 3);
+  refuse(`This session does not hold crew home ${slash(h.dir)}. Run \`crew start\` first to ${operation}.`, 3);
 }
 
 // --- Claude Code folder trust ---------------------------------------------------
@@ -397,23 +448,14 @@ function cmdProject(args) {
     for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}${p.workflow ? `\tworkflow ${p.workflow}` : ''}`);
     return;
   }
-  // The project list decides which repository a task works in and is cleaned up against, so
-  // while another session holds the home it is that session's to change. Before any session
-  // has started (first setup) there is no owner and changes are allowed.
-  const held = ownerState(h);
-  if (held.owner && held.live && !held.mine) refuse(`Read-only: this home is owned by terminal ${held.owner.terminal}. Only that session may change its projects.`, 3);
   const replace = args.includes('--replace');
   if (verb === 'remove' && validId(name) && !source) {
-    if (!h.config.projects[name]) refuse(`Unknown project: ${name}. See \`crew project list\`.`);
-    // A task that is not closed still has, or may still have, a working copy of this project;
-    // `crew finish` needs the project's path to remove it, so the project stays until then.
-    const users = allTasks(h).filter(t => t.project === name && t.state !== 'closed');
-    if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
-    // A finished task whose copy still waits needs the project to hand it back.
-    const waiting = allTasks(h).filter(t => t.project === name && t.state === 'closed' && t.copyToReturn);
-    if (waiting.length) refuse(`Project ${name} still has working copies of finished tasks to return: ${waiting.map(t => t.id).join(' ')}. They go back once no terminal holds them (crew status --all).`);
-    delete h.config.projects[name];
-    writeJson(path.join(h.dir, 'crew.json'), h.config);
+    withRegistry(h, () => {
+      if (!h.config.projects[name]) refuse(`Unknown project: ${name}. See \`crew project list\`.`);
+      requireUnusedProject(h, name);
+      delete h.config.projects[name];
+      writeJson(path.join(h.dir, 'crew.json'), h.config);
+    });
     console.log(`project ${name} removed (its folder is untouched)`);
     return;
   }
@@ -433,16 +475,15 @@ function cmdProject(args) {
   if (top.code !== 0) refuse(`${folder} is not a git repository.`);
   // Pointing an existing name at another repository is a replacement, not an addition: it has
   // to be asked for, and it waits until no unfinished task still belongs to the old one.
-  const existing = h.config.projects[name];
-  if (existing && existing.path !== slash(folder)) {
-    if (!replace) refuse(`Project ${name} already points at ${existing.path}. Pass --replace to point it at ${slash(folder)} instead.`);
-    const users = allTasks(h).filter(t => t.project === name && t.state !== 'closed');
-    if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
-    const waiting = allTasks(h).filter(t => t.project === name && t.state === 'closed' && t.copyToReturn);
-    if (waiting.length) refuse(`Project ${name} still has working copies of finished tasks to return: ${waiting.map(t => t.id).join(' ')}. They go back once no terminal holds them (crew status --all).`);
-  }
-  h.config.projects[name] = { path: slash(folder), ...(gateSkip ? { gateSkip } : {}), ...(workflow ? { workflow } : {}) };
-  writeJson(path.join(h.dir, 'crew.json'), h.config);
+  withRegistry(h, () => {
+    const existing = h.config.projects[name];
+    if (existing && comparablePath(existing.path) !== comparablePath(folder)) {
+      if (!replace) refuse(`Project ${name} already points at ${existing.path}. Pass --replace to point it at ${slash(folder)} instead.`);
+      requireUnusedProject(h, name);
+    }
+    h.config.projects[name] = { path: slash(folder), ...(gateSkip ? { gateSkip } : {}), ...(workflow ? { workflow } : {}) };
+    writeJson(path.join(h.dir, 'crew.json'), h.config);
+  });
   console.log(`project ${name}: ${slash(folder)}${gateSkip ? ` (gate skips: ${gateSkip.join(', ') || 'nothing'})` : ''}${workflow ? ` (workflow: ${workflow})` : ''}`);
 }
 
@@ -488,8 +529,8 @@ function cmdStart() {
     }
   }
   const { owner, live, unknown } = ownerState(h);
-  if (owner && unknown && owner.terminal !== mine) refuse(`${CORE_SILENT} the owner terminal ${owner.terminal}, so this home was not taken over. Try again.`, 4);
-  if (owner && live && owner.terminal !== mine) refuse(`Read-only: this home is owned by live terminal ${owner.terminal}.`, 3);
+  if (owner && unknown && owner.terminal !== mine) refuse(`${CORE_SILENT} the owner terminal ${owner.terminal}, so crew home ${slash(h.dir)} was not taken over. Try again.`, 4);
+  if (owner && live && owner.terminal !== mine) refuse(ownershipRefusal(h, owner, 'take ownership of this home'), 3);
   writeJson(h.owner, { terminal: mine, since: now(), previous: owner && owner.terminal !== mine ? owner.terminal : undefined });
   // The rules file belongs to the tool: a newer crew may have changed what a coordinator does.
   const rules = path.join(h.coordinator, 'AGENTS.md');
@@ -506,7 +547,7 @@ function cmdStart() {
 function cmdEnd() {
   const h = home();
   const { mine } = ownerState(h);
-  if (!mine) refuse('This session does not hold the home.', 3);
+  if (!mine) refuse(`This session does not hold crew home ${slash(h.dir)}; only its coordinator may release it.`, 3);
   fs.rmSync(h.owner, { force: true });
   console.log('home released');
 }
@@ -951,7 +992,7 @@ const branchOf = task => task.branch ?? `crew/${task.id}`;
 
 function cmdSpawn(args) {
   const h = home();
-  requireOwner(h);
+  requireOwner(h, 'spawn work');
   const { flags, rest } = takeFlags(args, ['project', 'kind', 'type', ...PICK_FLAGS], ['no-fallback']);
   const opts = { kind: flags.kind ?? 'scout', project: flags.project, ...(flags.type !== undefined ? { type: flags.type } : {}) };
   const [id, ...words] = rest;
@@ -1001,17 +1042,23 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // copy and does not know whether that is a reused pool slot or a new folder. Without it,
   // crew makes a plain git worktree itself.
   const delivered = Boolean(toolPath('delivery'));
-  // A project with the no-mistakes gate (its `no-mistakes` remote) is delivered through it.
-  const gated = opts.kind === 'ship' && !extra.selfFix && toolPath('no-mistakes') && run('git', ['-C', project.path, 'remote', 'get-url', 'no-mistakes']).code === 0;
-  const intent = gated ? slash(path.join(dir, 'intent.md')) : null;
-  fs.mkdirSync(dir, { recursive: true });
-  fs.mkdirSync(h.worktrees, { recursive: true });
   let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
     // Keep the original order, even for candidates that cannot work now: hand-over rereads
     // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
     launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks,
-    ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...(gated ? { gate: 'no-mistakes' } : {}), ...extra };
-  saveTask(h, record);
+    ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
+  withRegistry(h, () => {
+    // The project may have been removed/replaced while selection was running.
+    if (!extra.selfFix) project = h.config.projects[opts.project] ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
+    if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
+    fs.mkdirSync(dir, { recursive: true });
+    saveTask(h, record); // reservation prevents removal/replacement before any external work
+  });
+  fs.mkdirSync(h.worktrees, { recursive: true });
+  // Slow tools run outside the transaction; this preparing task now protects the path.
+  const gated = opts.kind === 'ship' && !extra.selfFix && toolPath('no-mistakes') && run('git', ['-C', project.path, 'remote', 'get-url', 'no-mistakes']).code === 0;
+  const intent = gated ? slash(path.join(dir, 'intent.md')) : null;
+  if (gated) { record = { ...record, gate: 'no-mistakes' }; saveTask(h, record); }
 
   const failed = why => { saveTask(h, { ...record, state: 'failed', error: why.slice(0, 400) }); refuse(`Could not create the working copy: ${why}`, 5); };
   if (delivered) {
@@ -1350,7 +1397,7 @@ function stopWorker(task, { force = false, onStop = null } = {}) {
 
 function cmdStop(args) {
   const h = home();
-  requireOwner(h);
+  requireOwner(h, 'stop work');
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   if (!id) refuse('Usage: crew stop <id> [--force]');
   const task = loadTask(h, id);
@@ -1660,7 +1707,7 @@ function returnWaiting(h, task, { force = false } = {}) {
 
 function cmdFinish(args) {
   const h = home();
-  requireOwner(h);
+  requireOwner(h, 'finish work');
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   if (!id) refuse('Usage: crew finish <id> [--force]');
   const task = loadTask(h, id);

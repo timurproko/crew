@@ -1,11 +1,11 @@
 // Runs with plain `node crew.test.mjs`. Core is replaced by a small fake `hc`, so no
 // terminal, agent or machine is touched; the live checks are recorded in README.md.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -299,6 +299,135 @@ function gapFixture(name, extra = {}) {
   const leave = () => { const w = readWorld(); delete w.terminals[`guest-${name}`]; fs.writeFileSync(world, JSON.stringify(w)); };
   return { dir, home, repo, call, task, save, spawn, guest, leave };
 }
+// Concurrent CLIs with test-only filesystem barriers: no timing guesses or production hooks.
+function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), terminal = '', env = {} } = {}) {
+  const child = spawn(process.execPath, [script, ...args], { cwd: f.home, env: {
+    ...process.env, CREW_HOME: f.home, CREW_HC: fake, CREW_TERMINAL: terminal, HC_TERMINAL_ID: '',
+    CREW_TOOL_PATH: path.join(root, 'no-tools'), CREW_WORKTREES: path.join(f.dir, 'copies'),
+    ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...env,
+  }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.on('data', data => { out += data; }); child.stderr.on('data', data => { out += data; });
+  const result = new Promise((resolve, reject) => { child.on('error', reject); child.on('close', code => resolve({ code, out })); });
+  return { child, result };
+}
+const until = async predicate => {
+  const deadline = Date.now() + 15000;
+  while (!predicate()) { assert.ok(Date.now() < deadline, 'Timed out waiting for CLI barrier'); await new Promise(r => setTimeout(r, 10)); }
+};
+function projectBarrier(f, phase, label = phase) {
+  const ready = path.join(f.dir, `ready-${label}`), release = path.join(f.dir, `release-${label}`), script = path.join(f.dir, `barrier-${label}.mjs`);
+  fs.writeFileSync(script, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const ready = ${JSON.stringify(ready)}, release = ${JSON.stringify(release)};
+const method = ${JSON.stringify(phase === 'before' ? 'openSync' : 'unlinkSync')}, original = fs[method]; let paused = false;
+fs[method] = function(file, ...args) {
+  if (paused || !String(file).endsWith('projects.lock')) return original.call(fs, file, ...args);
+  paused = true;
+  const result = method === 'unlinkSync' ? original.call(fs, file, ...args) : undefined;
+  fs.writeFileSync(ready, 'ready'); const deadline = Date.now() + 15000;
+  while (!fs.existsSync(release)) { if (Date.now() > deadline) throw Error('Barrier timeout'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+  return method === 'openSync' ? original.call(fs, file, ...args) : result;
+}; main(process.argv.slice(2));`);
+  return { ready, release, script };
+}
+gapTests['project-registry'] = async () => {
+  const f = gapFixture('project-registry'), file = path.join(f.home, 'crew.json'), lock = path.join(f.home, 'projects.lock');
+  const settings = args => crew(args, { cwd: f.home }), read = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+  const owner = fs.readFileSync(path.join(f.home, 'owner.json'), 'utf8');
+  const initial = { ...read(), future: { keep: ['metadata'] } }; fs.writeFileSync(file, JSON.stringify(initial));
+  for (const terminal of ['', 'another-terminal', 'owner-project-registry']) {
+    const call = args => crew(args, { cwd: f.home, terminal });
+    assert.equal(call(['project', 'add', 'extra', f.repo, '--workflow', 'plain']).code, 0);
+    assert.equal(call(['project', 'add', 'extra', f.repo]).code, 0);
+    assert.equal(read().projects.extra.workflow, undefined, 'Re-adding drops omitted options');
+    assert.equal(call(['project', 'remove', 'extra']).code, 0);
+  }
+  for (const verb of ['spawn', 'stop', 'finish']) {
+    const r = settings([verb, 'nothing']); assert.equal(r.code, 3, r.out);
+    assert.ok(r.out.includes(`Crew home ${slash(f.home)}`), r.out);
+    assert.match(r.out, new RegExp(`terminal owner-project-registry.*Only that coordinator may ${verb} work`));
+    assert.match(r.out, /does not mean a project folder is in use/);
+  }
+  const w = readWorld(); w.silent = true; fs.writeFileSync(world, JSON.stringify(w));
+  assert.equal(settings(['project', 'add', 'silent', f.repo]).code, 0, 'Registration needs no Core query');
+  let r = crew(['start'], { cwd: f.home, terminal: 'other' }); assert.equal(r.code, 4, r.out); assert.ok(r.out.includes(slash(f.home)));
+  delete w.silent; fs.writeFileSync(world, JSON.stringify(w));
+  assert.equal(settings(['project', 'remove', 'silent']).code, 0);
+  assert.equal(settings(['project', 'add', 'new', f.repo]).code, 0);
+  r = f.call(['spawn', 'new-task', '--project', 'new', 'Count lines.']); assert.equal(r.code, 0, r.out);
+  r = settings(['project', 'remove', 'new']); assert.equal(r.code, 2); assert.match(r.out, /unfinished tasks: new-task/);
+  const t = f.task('new-task'); f.save({ ...t, state: 'closed', copyToReturn: { since: 'now' } });
+  r = settings(['project', 'remove', 'new']); assert.equal(r.code, 2); assert.match(r.out, /copies of finished tasks.*new-task/);
+  const other = path.join(f.dir, 'other'); fs.mkdirSync(other); git('-C', other, 'init', '-q');
+  r = settings(['project', 'add', 'new', other]); assert.match(r.out, /Pass --replace/);
+  r = settings(['project', 'add', 'new', other, '--replace']); assert.match(r.out, /copies of finished tasks.*new-task/);
+  f.save({ ...t, state: 'failed' });
+  r = settings(['project', 'add', 'new', other, '--replace']); assert.match(r.out, /unfinished tasks: new-task/);
+  f.save({ ...t, state: 'closed' });
+  assert.equal(settings(['project', 'add', 'new', other, '--replace']).code, 0);
+  assert.equal(settings(['project', 'remove', 'new']).code, 0);
+  fs.writeFileSync(path.join(f.home, 'tasks', t.id, 'task.json'), '{broken');
+  r = settings(['project', 'remove', 'demo']); assert.equal(r.code, 2); assert.match(r.out, /cannot check task references/);
+  f.save({ ...t, state: 'closed' });
+  r = settings(['project', 'remove', 'unknown']); assert.equal(r.code, 2); assert.ok(!fs.existsSync(lock), 'Refusal releases lock');
+  fs.writeFileSync(lock, JSON.stringify({ pid: 99999999, token: 'abandoned' }));
+  const before = fs.readFileSync(file, 'utf8');
+  r = settings(['project', 'add', 'locked', f.repo]); assert.equal(r.code, 3); assert.match(r.out, /projects.lock.*PID 99999999.*confirming no process/);
+  assert.equal(fs.readFileSync(file, 'utf8'), before); assert.ok(fs.existsSync(lock)); fs.unlinkSync(lock);
+  fs.writeFileSync(file, JSON.stringify({ version: 1, projects: [] }));
+  r = settings(['project', 'add', 'broken', f.repo]); assert.equal(r.code, 2); assert.match(r.out, /invalid.*registry/);
+  fs.writeFileSync(file, before);
+  const writers = Array.from({ length: 6 }, (_, i) => projectProcess(f, ['project', 'add', `p${i}`, f.repo], { terminal: i ? '' : 'owner-project-registry' }));
+  let done = false; const all = Promise.all(writers.map(p => p.result)).then(results => { done = true; return results; });
+  while (!done) { assert.equal(read().version, 1); await new Promise(r => setTimeout(r, 5)); }
+  for (const result of await all) assert.equal(result.code, 0, result.out);
+  for (let i = 0; i < 6; i++) assert.ok(read().projects[`p${i}`]);
+  const edits = [projectProcess(f, ['project', 'remove', 'p0']), projectProcess(f, ['project', 'add', 'p6', f.repo])];
+  for (const result of await Promise.all(edits.map(p => p.result))) assert.equal(result.code, 0, result.out);
+  assert.equal(read().projects.p0, undefined); assert.ok(read().projects.p6); assert.deepEqual(read().future, initial.future); assert.equal(read().tag, initial.tag);
+  assert.equal(fs.readFileSync(path.join(f.home, 'owner.json'), 'utf8'), owner);
+  // Force an owner to hold a stale initial snapshot while Settings commits a new entry.
+  const stale = projectBarrier(f, 'before', 'stale');
+  const owning = projectProcess(f, ['project', 'add', 'owner-edit', f.repo], { script: stale.script, terminal: 'owner-project-registry' });
+  try {
+    await until(() => fs.existsSync(stale.ready));
+    assert.equal(settings(['project', 'add', 'settings-edit', f.repo]).code, 0);
+    fs.writeFileSync(stale.release, 'go'); assert.equal((await owning.result).code, 0);
+    assert.ok(read().projects['owner-edit']); assert.ok(read().projects['settings-edit']);
+  } finally { fs.writeFileSync(stale.release, 'go'); await owning.result; }
+  // Corruption after the command's initial read is still caught inside the transaction.
+  const gate = projectBarrier(f, 'before');
+  const pending = projectProcess(f, ['project', 'remove', 'demo'], { script: gate.script });
+  try {
+    await until(() => fs.existsSync(gate.ready)); fs.writeFileSync(file, '{broken'); fs.writeFileSync(gate.release, 'go');
+    const result = await pending.result; assert.equal(result.code, 2, result.out); assert.match(result.out, /invalid.*registry/);
+    assert.equal(fs.readFileSync(file, 'utf8'), '{broken'); assert.ok(!fs.existsSync(lock));
+  } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; fs.writeFileSync(file, before); }
+  const failing = path.join(f.dir, 'failed-write.mjs');
+  fs.writeFileSync(failing, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const original = fs.renameSync; fs.renameSync = (from, to) => { if (String(to).endsWith('crew.json')) throw Error('injected write failure'); return original(from, to); }; main(process.argv.slice(2));`);
+  const failure = await projectProcess(f, ['project', 'add', 'unwritten', f.repo], { script: failing }).result;
+  assert.equal(failure.code, 70); assert.equal(fs.readFileSync(file, 'utf8'), before); assert.ok(!fs.existsSync(lock));
+  assert.ok(!fs.readdirSync(f.home).some(name => name.endsWith('.tmp')), 'Failed writes clean their temporary files');
+};
+gapTests['project-admission'] = async () => {
+  for (const phase of ['before', 'after']) for (const edit of ['remove', 'replace']) {
+    const f = gapFixture(`admit-${phase}-${edit}`), gate = projectBarrier(f, phase);
+    const other = path.join(f.dir, 'other'); fs.mkdirSync(other); git('-C', other, 'init', '-q'); commit(other, { 'README.md': 'replacement\n' }, 'init');
+    const p = projectProcess(f, ['spawn', 'race', '--project', 'demo', 'Count lines.'], { script: gate.script, terminal: `owner-admit-${phase}-${edit}` });
+    try {
+      await until(() => fs.existsSync(gate.ready));
+      const r = crew(edit === 'remove' ? ['project', 'remove', 'demo'] : ['project', 'add', 'demo', other, '--replace'], { cwd: f.home });
+      assert.equal(r.code, phase === 'before' ? 0 : 2, r.out);
+      if (phase === 'after') assert.match(r.out, /unfinished tasks: race\[preparing\]/);
+      fs.writeFileSync(gate.release, 'go'); const result = await p.result;
+      assert.equal(result.code, phase === 'before' && edit === 'remove' ? 2 : 0, result.out);
+      if (phase === 'before' && edit === 'remove') { assert.match(result.out, /Unknown project/); assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'race'))); }
+      else assert.equal(fs.readFileSync(path.join(f.task('race').worktree, 'README.md'), 'utf8').trim(), phase === 'before' ? 'replacement' : 'baseline');
+    } finally { if (!fs.existsSync(gate.release)) fs.writeFileSync(gate.release, 'go'); await p.result; }
+  }
+};
+
 gapTests['platform-paths'] = () => {
   const f = gapFixture('platform-paths');
   for (const [id, variant] of [
@@ -625,7 +754,7 @@ gapTests.status = () => {
 
 try {
   const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
-  for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { test(); console.log(`PASS: gap ${name}`); }
+  for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { await test(); console.log(`PASS: gap ${name}`); }
   if (!onlyGaps) {
   // The focused fixtures have their own homes and copies, but share the fake Core transport.
   fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
@@ -746,13 +875,13 @@ try {
   assert.equal(crew(['project', 'add', 'demo', project]).code, 0);
   assert.equal(crew(['project', 'add', 'bad', root]).code, 2, 'Only git repositories are projects');
 
-  // One owner. Nothing changes the home without holding it; a second live session is read-only.
+  // One owner controls work; another session may inspect or safely register projects.
   assert.equal(crew(['spawn', 't1', '--project', 'demo', 'Count the lines.'], { terminal: 'c1' }).code, 3);
   assert.equal(crew(['start']).code, 3, 'start needs a Herdr terminal');
   let w = readWorld(); w.terminals.c1 = { address: 'c1', state: 'live', labels: {} }; w.terminals.c2 = { address: 'c2', state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
   assert.match(crew(['start'], { terminal: 'c1' }).out, /you hold .* \(terminal c1\)/);
   let r = crew(['start'], { terminal: 'c2' }); assert.equal(r.code, 3); assert.match(r.out, /owned by live terminal c1/);
-  r = crew(['spawn', 't1', '--project', 'demo', 'x'], { terminal: 'c2' }); assert.equal(r.code, 3); assert.match(r.out, /Read-only/);
+  r = crew(['spawn', 't1', '--project', 'demo', 'x'], { terminal: 'c2' }); assert.equal(r.code, 3); assert.match(r.out, /Crew home .*controlled by terminal c1/);
 
   // Missing task ids give command-specific usage, including when only --force is passed.
   for (const [args, usage] of [
@@ -861,10 +990,9 @@ try {
   const setWorld = patch => { const w = readWorld(); Object.assign(w, patch); fs.writeFileSync(world, JSON.stringify(w)); };
   const other = path.join(root, 'other'); fs.mkdirSync(other); git('-C', other, 'init', '-q');
   assert.equal(crew(['project', 'add', 'demo', project], { terminal: 'c2' }).code, 0);
-  // (4) The project list belongs to the session that holds the home, and a name is only
-  // pointed elsewhere on request and never under an unfinished task.
-  r = crew(['project', 'add', 'demo', other], { terminal: 'c1' }); assert.equal(r.code, 3); assert.match(r.out, /Only that session may change its projects/);
-  r = crew(['project', 'remove', 'demo'], { terminal: 'c1' }); assert.equal(r.code, 3);
+  // (4) Registration is shared, but a path replacement still requires explicit consent.
+  r = crew(['project', 'add', 'demo', other], { terminal: 'c1' }); assert.equal(r.code, 2); assert.match(r.out, /Pass --replace/);
+  r = crew(['project', 'remove', 'not-registered'], { terminal: 'c1' }); assert.equal(r.code, 2); assert.match(r.out, /Unknown project/);
   r = crew(['project', 'add', 'demo', other], { terminal: 'c2' }); assert.equal(r.code, 2); assert.match(r.out, /Pass --replace/);
   assert.equal(crew(['project', 'add', 'demo', project], { terminal: 'c2' }).code, 0, 'Adding the same folder again is not a replacement');
   assert.equal(crew(['spawn', 'f1', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x'], { terminal: 'c2' }).code, 0);
