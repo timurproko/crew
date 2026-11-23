@@ -87,7 +87,7 @@ fs.mkdirSync(fakeUser);
 const claudeConfig = path.join(root, 'claude.json');
 fs.writeFileSync(claudeConfig, JSON.stringify({ theme: 'dark', projects: { 'C:/mine': { hasTrustDialogAccepted: true, history: [1] } } }));
 function crew(args, { terminal, cwd = homeDir, env: extra = {}, script = path.join(here, 'crew.mjs') } = {}) {
-  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_REVIEW_ATTEMPT: '', CREW_TERMINAL: terminal ?? '',
+  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '',
     // No tool of the machine the suite runs on is seen, unless a test names a fake one.
     CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...extra };
   delete env.CREW_HOME;
@@ -1130,307 +1130,84 @@ gapTests.status = () => {
   assert.equal(f.call(['finish', ship.id]).code, 0); assert.equal(f.call(['finish', scout.id]).code, 0);
 };
 
-// Review-label tests use only local repositories and fake GitHub/Core transports.
-function reviewLabelFixture(name) {
-  const dir = path.join(root, `label-${name}`); fs.mkdirSync(dir);
-  const ghFake = path.join(dir, 'gh.mjs'), hcFake = path.join(dir, 'hc.mjs'), stateFile = path.join(dir, 'github.json'), log = path.join(dir, 'events.jsonl');
-  const label = '\u{1F916} Under review', url = 'https://github.com/acme/demo/pull/42';
-  fs.writeFileSync(log, '');
-  fs.writeFileSync(stateFile, JSON.stringify({ labels: ['unrelated'], defined: true, pr: true }));
-  fs.writeFileSync(ghFake, `import fs from 'node:fs';
-const a=process.argv.slice(2), file=${JSON.stringify(stateFile)}, s=JSON.parse(fs.readFileSync(file,'utf8')), label=${JSON.stringify(label)};
-const method=a.includes('--method') ? a[a.indexOf('--method')+1] : 'GET', endpoint=a.find(x=>x.startsWith('repos/')), input=a.includes('--input') ? fs.readFileSync(0,'utf8') : '';
-fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({kind:'gh',a,method,endpoint,input})+'\\n');
-const fail = text => { console.error(text); process.exit(1); };
-if(a[0]==='auth') { console.log('fake-token'); process.exit(0); }
-if(a[0]==='pr' && a[1]==='view') { if(s.lookupError) fail('network unavailable'); if(!s.pr) fail('no pull requests found for branch'); console.log(${JSON.stringify(url)}); process.exit(0); }
-if(a[0]!=='api') fail('unexpected fake command');
-if(s.slowDelete && method==='DELETE') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,typeof s.slowDelete==='number' ? s.slowDelete : 300);
-if(s.inaccessible) fail('HTTP 404: Not Found');
-if(endpoint.endsWith('/actions/variables')) { if(s.variablesDenied) fail('HTTP 403: variables denied'); if(s.badVariables) { console.log('{}'); process.exit(0); } const variables=s.labelsEnabled===undefined ? [] : [{name:'DELIVERY_LABELS_ENABLED',value:s.labelsEnabled}]; console.log(JSON.stringify([{variables:[]},{variables}])); process.exit(0); }
-if(endpoint.includes('/labels/') && method==='GET') { if(!s.defined) fail('HTTP 404: label missing'); console.log(JSON.stringify({name:label,color:'840479',description:''})); }
-else if(method==='POST') { if(s.addDenied) fail('HTTP 403: denied'); if(!s.defined) fail('must not create missing definition'); if(!s.labels.includes(label)) s.labels.push(label); fs.writeFileSync(file,JSON.stringify(s)); if(s.ambiguousAdd) fail('connection lost after write'); console.log(JSON.stringify(s.labels.map(name=>({name})))); }
-else if(method==='DELETE') { if(s.removeDenied) fail('HTTP 403: denied'); if(!s.labels.includes(label)) fail('HTTP 404: label absent'); s.labels=s.labels.filter(n=>n!==label); fs.writeFileSync(file,JSON.stringify(s)); console.log('{}'); }
-else if(method==='GET' && endpoint.endsWith('/labels')) console.log(JSON.stringify([s.labels.map(name=>({name}))]));
-else fail('unexpected fake endpoint');
-`);
-  fs.writeFileSync(hcFake, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process'; const a=process.argv.slice(2), s=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)},'utf8')); if(a[0]==='run') { fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({kind:'launch'})+'\\n'); if(s.failRun) { console.log('{}'); process.exit(1); } } const r=spawnSync(process.execPath,[${JSON.stringify(fake)},...a],{encoding:'utf8'}); process.stdout.write(r.stdout); process.stderr.write(r.stderr); process.exit(r.status);`);
-  const trust = path.join(dir, 'claude.json'); fs.writeFileSync(trust, '{}');
-  const env = { CREW_GH: ghFake, CREW_HC: hcFake, CREW_CLAUDE_CONFIG: trust, CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', CREW_NO_QUOTA: '1', CREW_AGENT_PATH: '' };
-  const f = gapFixture(`review-${name}`, env), owner = `owner-review-${name}`;
-  const state = patch => { const s = JSON.parse(fs.readFileSync(stateFile, 'utf8')); if (patch) fs.writeFileSync(stateFile, JSON.stringify({ ...s, ...patch })); return patch ? state() : s; };
-  const events = () => fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
-  const calls = () => events().filter(e => e.kind === 'gh');
-  const worker = (task, args = ['done', task.id], extra = {}) => crew(args, { cwd: f.home, terminal: task.terminal, env: { ...env, ...extra } });
-  const parent = (id = 'ship', fields = {}, report = `Implementation: ${url}\n`) => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
-  const start = (id = 'ship', agent = 'pi') => { const r = f.call(['review', id, '--agent', agent]); assert.equal(r.code, 0, r.out); const tasks = fs.readdirSync(path.join(f.home, 'tasks')).filter(n => n.startsWith(`${id}-review`)).map(f.task); return tasks.at(-1); };
-  const records = () => { const folder = path.join(f.home, 'state', 'review-labels'); return fs.existsSync(folder) ? fs.readdirSync(folder).filter(n => n.endsWith('.json')).map(n => JSON.parse(fs.readFileSync(path.join(folder, n), 'utf8'))) : []; };
-  return { ...f, env, owner, label, url, state, events, calls, worker, parent, start, records, log };
+// The reduced label integration has no persistence or lifecycle recovery: fake GitHub
+// records the already-saved task state at every request, including label mutations.
+function reviewLabelsFixture(name) {
+  const dir = path.join(root, `labels-${name}`); fs.mkdirSync(dir);
+  const fakeGh = path.join(dir, 'gh.mjs'), state = path.join(dir, 'github.json'), log = path.join(dir, 'calls.json');
+  const under = '\u{1F916} Under review', approved = '\u{1F916} Approved', changes = '\u{1F916} Changes needed';
+  fs.writeFileSync(state, JSON.stringify({ labels: ['unrelated'], defined: [under, approved, changes] })); fs.writeFileSync(log, '[]');
+  const env = { CREW_GH: fakeGh }, f = gapFixture(`labels-${name}`, env);
+  fs.writeFileSync(fakeGh, `import fs from 'node:fs';
+const a=process.argv.slice(2), file=${JSON.stringify(state)}, s=JSON.parse(fs.readFileSync(file,'utf8')), log=${JSON.stringify(log)};
+let task; try { task=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json','utf8')); } catch {}
+const method=a[a.indexOf('--method')+1], endpoint=a.find(x=>x.startsWith('repos/')), input=a.includes('--input') ? JSON.parse(fs.readFileSync(0,'utf8')) : null;
+fs.writeFileSync(log,JSON.stringify([...JSON.parse(fs.readFileSync(log,'utf8')),{a,method,endpoint,input,saved:task?.state}]));
+const fail = msg => { console.error(msg+'\\nsecond diagnostic line'); process.exit(1); };
+if(s.network) fail('network unavailable');
+if(a[0]==='pr') { if(s.noPr) fail('no pull requests found for branch'); console.log('https://github.com/acme/demo/pull/42'); process.exit(0); }
+if(endpoint.endsWith('/actions/variables')) { if(s.variablesDenied) fail('variables unreadable'); console.log(JSON.stringify([{variables:s.enabled===undefined ? [] : [{name:'DELIVERY_LABELS_ENABLED',value:s.enabled}]}])); }
+else if(method==='GET' && endpoint.includes('/issues/')) console.log(JSON.stringify([s.labels.map(name=>({name}))]));
+else if(method==='GET') { const name=decodeURIComponent(endpoint.split('/').at(-1)); if(!s.defined.includes(name)) fail('shared label not defined'); console.log(JSON.stringify({name})); }
+else if(method==='DELETE') { if(s.removeDenied) fail('removal denied'); const name=decodeURIComponent(endpoint.split('/').at(-1)); s.labels=s.labels.filter(n=>n!==name); fs.writeFileSync(file,JSON.stringify(s)); console.log('{}'); }
+else if(method==='POST') { if(s.addDenied) fail('addition denied'); if(input.labels.some(n=>!s.defined.includes(n))) fail('must never create a label'); s.labels=[...new Set([...s.labels,...input.labels])]; fs.writeFileSync(file,JSON.stringify(s)); console.log('[]'); }
+else fail('unexpected fake request');`);
+  const control = patch => { const s = JSON.parse(fs.readFileSync(state, 'utf8')); if (patch) fs.writeFileSync(state, JSON.stringify({ ...s, ...patch })); return patch ? control() : s; };
+  const calls = () => JSON.parse(fs.readFileSync(log, 'utf8'));
+  const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
+  const start = (id = 'ship', suffix = '') => { const review = `${id}-review${suffix}`; control({ watch: review }); const r = f.call(['review', id, '--agent', 'pi']); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
+  const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
+  const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
+  const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
+  return { ...f, under, approved, changes, control, calls, parent, start, done, writes, warnings };
 }
-gapTests['review-label-launch'] = () => {
-  const f = reviewLabelFixture('launch');
-  for (const [id, fields, report] of [
-    ['workflow', { workflow: 'delivery', stage: 'implementation' }, `Implementation: ${f.url}\n`],
-    ['gate', { gate: 'no-mistakes' }, `${f.url}\n`],
-    ['plain', {}, 'Done.\nSee unrelated https://github.com/else/other/pull/9\n'],
-  ]) {
-    f.parent(id, fields, report); const t = f.start(id);
-    const events = f.events(), launch = events.findLastIndex(e => e.kind === 'launch'), added = events.findLastIndex(e => e.method === 'POST');
-    assert.ok(added >= 0 && added < launch, 'Label is added before the reviewer launches');
-    assert.deepEqual(JSON.parse(events[added].input), { labels: [f.label] });
-    assert.equal(events[added].endpoint, 'repos/acme/demo/issues/42/labels');
-    assert.ok(t.reviewAttempt && f.state().labels.includes(f.label));
-    assert.ok(f.state().labels.includes('unrelated'));
+gapTests['review-label-swaps'] = () => {
+  const f = reviewLabelsFixture('swaps');
+  for (const [id, fields, report] of [['workflow', { workflow: 'delivery', stage: 'implementation' }, 'Implementation: https://github.com/acme/demo/pull/42'], ['gate', { gate: 'no-mistakes' }, 'https://github.com/acme/demo/pull/42'], ['plain', {}, 'Done.']]) {
+    f.parent(id, fields, report); f.control({ labels: ['unrelated', f.approved, f.changes] }); const before = f.calls().length;
+    const { task, result } = f.start(id); assert.equal(f.warnings(result).length, 0);
+    assert.deepEqual(f.control().labels, ['unrelated', f.under]); assert.ok(f.calls().slice(before).every(c => c.saved === 'working'), 'All start requests follow the saved launch state');
+    assert.ok(!('reviewAttempt' in task) && !('reviewSessionAttempt' in task));
+    const verdict = id === 'gate' ? 'CHANGES NEEDED' : 'APPROVE', at = f.calls().length;
+    const r = f.done(task, verdict+'\nDetails.'); assert.equal(r.code, 0, r.out); assert.equal(f.task(task.id).state, 'reported');
+    assert.deepEqual(f.control().labels, ['unrelated', verdict === 'APPROVE' ? f.approved : f.changes]);
+    assert.ok(f.calls().slice(at).every(c => c.saved === 'reported'), 'All verdict requests follow saved completion');
+    assert.ok(f.writes().every(c => c.method !== 'POST' || c.input.labels.length === 1));
   }
-  f.parent('plan', { workflow: 'delivery', stage: 'plan' }, `Plan: ${f.url}`);
-  let n = f.events().length, r = f.call(['review', 'plan']); assert.equal(r.code, 2, r.out); assert.equal(f.events().length, n);
-  f.parent('no-pr', {}, 'Done.'); f.state({ pr: false }); r = f.call(['review', 'no-pr']); assert.equal(r.code, 0, r.out); assert.match(r.out, /nothing to label/);
-  for (const [id, patch, match] of [
-    ['missing', { pr: true, defined: false }, /definition missing or inaccessible/],
-    ['denied', { defined: true, addDenied: true }, /add failed/],
-    ['lookup', { addDenied: false, lookupError: true }, /could not resolve/],
-  ]) {
-    f.parent(id, {}, 'Done.'); f.state(patch); n = f.calls().length; r = f.call(['review', id]); assert.equal(r.code, 0, r.out); assert.match(r.out, match); assert.ok(f.records().some(s => s.task === `${id}-review` && s.pending));
-    if (id === 'missing') assert.ok(!f.calls().slice(n).some(c => c.method === 'POST'));
+  f.parent('malformed'); let t = f.start('malformed').task, n = f.calls().length;
+  assert.equal(f.done(t, 'APPROVE extra').code, 0); assert.equal(f.calls().length, n); assert.ok(f.control().labels.includes(f.under));
+  f.parent('missing'); t = f.start('missing').task; n = f.calls().length; assert.equal(f.done(t).code, 2); assert.equal(f.calls().length, n); assert.equal(f.task(t.id).state, 'working');
+  f.parent('no-pr', {}, 'Done.'); f.control({ noPr: true }); n = f.writes().length; const skipped = f.start('no-pr').task; assert.equal(f.done(skipped, 'APPROVE').code, 0); assert.equal(f.writes().length, n); f.control({ noPr: false });
+  f.parent('plan', { workflow: 'delivery', stage: 'plan' }, 'Plan: https://github.com/acme/demo/pull/42'); n = f.calls().length; f.start('plan'); assert.equal(f.calls().length, n);
+  // Accepted overlap limitation: the first verdict clears activity while the other runs.
+  f.parent('overlap'); const a = f.start('overlap').task, b = f.start('overlap', '-2').task;
+  assert.equal(f.done(a, 'APPROVE').code, 0); assert.ok(!f.control().labels.includes(f.under)); assert.equal(f.task(b.id).state, 'working');
+  n = f.calls().length; assert.equal(f.call(['start']).code, 0); assert.equal(f.call(['stop', b.id]).code, 0); assert.equal(f.call(['finish', b.id]).code, 0); assert.equal(f.calls().length, n, 'Other lifecycle commands never reconcile labels');
+  assert.ok(!fs.existsSync(path.join(f.home, 'state', 'review-labels')));
+  assert.ok(JSON.parse(f.call(['status', '--json']).out).tasks.every(t => !('reviewLabel' in t)));
+};
+gapTests['review-label-failures'] = () => {
+  const f = reviewLabelsFixture('failures');
+  for (const [id, patch] of [['permission', { addDenied: true }], ['network', { addDenied: false, network: true }], ['opt-out', { network: false, enabled: 'FaLsE' }], ['variables', { enabled: 'true', variablesDenied: true }], ['definition', { variablesDenied: false, defined: [] }]]) {
+    f.parent(id); f.control({ labels: ['unrelated'], ...patch }); const n = f.calls().length, { task, result } = f.start(id);
+    assert.equal(task.state, 'working'); assert.equal(f.warnings(result).length, 1, result.out);
+    assert.ok(f.calls().slice(n).every(c => c.saved === 'working'));
+    const r = f.done(task, 'APPROVE'); assert.equal(r.code, 0, r.out); assert.equal(f.task(task.id).state, 'reported'); assert.equal(f.warnings(r).length, 1, r.out);
+    if (id === 'opt-out' || id === 'variables') assert.ok(!f.calls().slice(n).some(c => ['POST', 'DELETE'].includes(c.method)));
+    if (id === 'definition') assert.ok(!f.calls().slice(n).some(c => c.method === 'POST'), 'Missing definitions are never created');
   }
-  f.parent('failed'); f.state({ lookupError: false, failRun: true, ambiguousAdd: true }); n = f.calls().length;
-  r = f.call(['review', 'failed']); assert.equal(r.code, 5, r.out);
-  // Other reviewers share this PR, so failure cleanup must retain their label.
-  assert.ok(f.calls().slice(n).some(c => c.method === 'POST'));
-  const record = f.records().find(s => s.task === 'failed-review');
-  assert.ok(fs.existsSync(path.join(f.home, 'state', 'review-labels', `${record.attempt}.ended`)));
-  assert.ok(!f.calls().some(c => c.a.includes('create') || c.method === 'PUT'));
-};
-
-gapTests['review-label-endings'] = () => {
-  const f = reviewLabelFixture('endings'); f.parent();
-  const first = f.start(), second = f.start();
-  fs.writeFileSync(first.report, 'APPROVE\n'); let r = f.worker(first); assert.equal(r.code, 0, r.out);
-  assert.ok(f.state().labels.includes(f.label)); assert.ok(!f.calls().some(e => e.method === 'DELETE'));
-  fs.writeFileSync(second.report, 'CHANGES NEEDED\n'); r = f.worker(second); assert.equal(r.code, 0, r.out);
-  assert.deepEqual(f.state().labels, ['unrelated']);
-  assert.ok(f.calls().some(e => e.method === 'DELETE' && e.endpoint.endsWith('/%F0%9F%A4%96%20Under%20review')));
-  r = f.worker(second); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Repeated absent removal is success');
-  for (const [id, report] of [['malformed', 'not a verdict'], ['empty', '']]) {
-    f.parent(id); const t = f.start(id); fs.writeFileSync(t.report, report); r = f.worker(t); assert.equal(r.code, report ? 0 : 2, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  }
-  f.parent('stop'); const stopped = f.start('stop'); r = f.call(['stop', stopped.id]); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.parent('finish'); const finished = f.start('finish'); setTerminal(finished.terminal, { status: { state: 'working', app: 'pi' } });
-  r = f.call(['finish', finished.id]); assert.equal(r.code, 6, r.out); assert.ok(f.state().labels.includes(f.label), 'Refused finish leaves live review labeled');
-  r = f.call(['finish', finished.id, '--force']); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.parent('silent'); const silent = f.start('silent'); const w = readWorld(); w.silent = true; fs.writeFileSync(world, JSON.stringify(w));
-  r = f.call(['stop', silent.id]); assert.equal(r.code, 4, r.out); assert.ok(f.state().labels.includes(f.label));
-  w.silent = false; fs.writeFileSync(world, JSON.stringify(w)); assert.equal(f.call(['stop', silent.id]).code, 0);
-  f.parent('failed'); f.state({ failRun: true, ambiguousAdd: true }); r = f.call(['review', 'failed']); assert.equal(r.code, 5, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.state({ failRun: false, ambiguousAdd: false });
-  f.parent('copy'); const badDelivery = path.join(f.dir, 'bad-delivery.mjs'); fs.writeFileSync(badDelivery, "console.error('no working copy'); process.exit(1);");
-  r = f.call(['review', 'copy'], { CREW_TOOL_DELIVERY: badDelivery }); assert.equal(r.code, 5, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.parent('retry'); let t = f.start('retry'); fs.writeFileSync(t.report, 'APPROVE'); f.state({ removeDenied: true });
-  r = f.worker(t); assert.equal(r.code, 0, r.out); assert.match(r.out, /cleanup failed/); assert.ok(f.records().find(s => s.attempt === t.reviewAttempt).pending);
-  f.state({ removeDenied: false, inaccessible: true }); r = f.worker(t); assert.equal(r.code, 0, r.out); assert.match(r.out, /cleanup failed/); assert.ok(f.records().find(s => s.attempt === t.reviewAttempt).pending);
-  f.state({ inaccessible: false }); const newer = f.start('retry'), before = f.calls().length;
-  r = f.worker(t); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
-  assert.ok(!f.calls().slice(before).some(c => c.method === 'DELETE'), 'Stale failed cleanup must not delete a newer review label');
-  fs.writeFileSync(newer.report, 'APPROVE'); r = f.worker(newer); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  r = f.call(['tell', t.id, 'Review again.']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
-  r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewAttempt }); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-};
-gapTests['review-label-storage-failures'] = () => {
-  // Files/directories at the wrong level exercise deterministic read/write failures on
-  // Windows and POSIX, without relying on chmod (which is ineffective under some users).
-  for (const mode of ['blocked-at-launch', 'missing', 'invalid-json', 'corrupt-session', 'corrupt-identity', 'unwritable-record']) {
-    const f = reviewLabelFixture(`storage-${mode}`), parent = f.parent(), dir = path.join(f.home, 'state', 'review-labels');
-    if (mode === 'blocked-at-launch') { fs.mkdirSync(path.dirname(dir), { recursive: true }); fs.writeFileSync(dir, 'not a directory'); }
-    const t = f.start(), record = path.join(dir, `${t.reviewAttempt}.json`), victim = path.join(f.home, 'metadata-victim.json');
-    fs.writeFileSync(victim, 'must remain untouched');
-    assert.equal(t.reviewSessionAttempt, t.reviewAttempt, 'Authoritative identity is saved despite advisory storage failure');
-    assert.ok(readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1).includes(`CREW_REVIEW_ATTEMPT='${t.reviewSessionAttempt}'`));
-    if (mode === 'missing') fs.rmSync(dir, { recursive: true });
-    if (mode === 'invalid-json') fs.writeFileSync(record, '{broken');
-    if (mode === 'corrupt-session') fs.writeFileSync(record, JSON.stringify({ ...JSON.parse(fs.readFileSync(record, 'utf8')), sessionAttempt: 'not-the-current-session' }));
-    if (mode === 'corrupt-identity') fs.writeFileSync(record, JSON.stringify({ ...JSON.parse(fs.readFileSync(record, 'utf8')), attempt: '../../metadata-victim' }));
-    if (mode === 'unwritable-record') { fs.unlinkSync(record); fs.mkdirSync(record); }
-    setTerminal(t.terminal, { status: { app: 'pi', state: 'working' } });
-    let r = f.call(['finish', t.id]); assert.equal(r.code, 6, `${mode}: busy-worker protection is unchanged: ${r.out}`);
-    r = f.call(['wait', t.id, '--timeout', '0.05']); assert.equal(r.code, 124, `${mode}: a live worker still waits: ${r.out}`);
-    assert.equal(f.task(t.id).state, 'working');
-    setTerminal(t.terminal, { status: { app: 'pi', state: 'idle' } });
-    r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewSessionAttempt });
-    assert.equal(r.code, 2, `${mode}: ordinary missing-report refusal is unchanged: ${r.out}`);
-    assert.equal(f.task(t.id).state, 'working');
-    fs.writeFileSync(t.report, 'APPROVE');
-    r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: 'a-stale-session' }); assert.equal(r.code, 3, r.out);
-    r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewSessionAttempt }); assert.equal(r.code, 0, `${mode}: ${r.out}`);
-    assert.equal(f.task(t.id).state, 'reported');
-    r = f.call(['wait', t.id, '--timeout', '1']); assert.equal(r.code, 0, `${mode}: ${r.out}`);
-    r = f.call(['stop', t.id]); assert.equal(r.code, 0, `${mode}: ${r.out}`);
-    r = f.call(['finish', t.id]); assert.equal(r.code, 0, `${mode}: ${r.out}`); assert.equal(f.task(t.id).state, 'closed');
-    f.save({ ...f.task(parent.id), pr: f.url, landed: new Date().toISOString() });
-    r = f.call(['land', parent.id]); assert.equal(r.code, 0, `${mode}: ${r.out}`); assert.match(r.out, /already has a pull request/);
-    const n = f.calls().length;
-    for (const flags of [[], ['--discover-prs']]) {
-      const status = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), 'status', '--all', '--json', ...flags], { cwd: f.home, encoding: 'utf8', env: { ...process.env, ...f.env, CREW_HOME: f.home, CREW_TERMINAL: f.owner } });
-      assert.equal(status.status, 0, status.stderr); const result = JSON.parse(status.stdout);
-      assert.equal(result.prDiscovery?.version, flags.length ? 1 : undefined);
-      assert.equal(f.calls().length, n, 'Damaged label metadata cannot trigger label recovery in either status mode');
-    }
-    assert.equal(fs.readFileSync(victim, 'utf8'), 'must remain untouched', 'Corrupt metadata cannot redirect signaling writes');
-  }
-  // Records created by the previous version have no authoritative session field. The
-  // current terminal remains able to report even after its advisory metadata is lost.
-  const legacy = reviewLabelFixture('storage-legacy'); legacy.parent(); const t = legacy.start();
-  const { reviewSessionAttempt, ...old } = t; legacy.save(old);
-  fs.rmSync(path.join(legacy.home, 'state', 'review-labels'), { recursive: true }); fs.writeFileSync(t.report, 'CHANGES NEEDED');
-  const r = legacy.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: reviewSessionAttempt }); assert.equal(r.code, 0, r.out);
-};
-gapTests['review-label-replacement'] = () => {
-  const f = reviewLabelFixture('replacement'); f.parent(); const old = f.start();
-  let n = f.calls().length, r = f.call(['relaunch', old.id, '--agent', 'claude']); assert.equal(r.code, 0, r.out);
-  const next = f.task(old.id); assert.notEqual(next.reviewAttempt, old.reviewAttempt);
-  const actions = f.calls().slice(n).filter(c => ['DELETE', 'POST'].includes(c.method)); assert.deepEqual(actions.map(c => c.method), ['DELETE', 'POST']);
-  fs.writeFileSync(next.report, 'APPROVE'); r = f.worker(old, ['done', old.id], { CREW_REVIEW_ATTEMPT: old.reviewAttempt }); assert.equal(r.code, 3, r.out); assert.ok(f.state().labels.includes(f.label));
-  const oldMarker = path.join(f.home, 'state', 'review-labels', `${old.reviewAttempt}.ended`); assert.ok(fs.existsSync(oldMarker));
-  r = f.worker(next, ['done', next.id], { CREW_REVIEW_ATTEMPT: next.reviewAttempt }); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.parent('failure'); const fail = f.start('failure'); f.state({ failRun: true });
-  r = f.call(['relaunch', fail.id, '--agent', 'claude']); assert.equal(r.code, 5, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.state({ failRun: false }); f.parent('dead'); const dead = f.start('dead', 'a1');
-  r = f.call(['wait', dead.id, '--timeout', '1']); assert.equal(r.code, 7, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'No-candidate agent death releases ownership');
-};
-gapTests['review-label-recovery'] = () => {
-  const f = reviewLabelFixture('recovery'); const parent = f.parent(); f.state({ addDenied: true }); const t = f.start();
-  const snapshot = () => {
-    const dir = path.join(f.home, 'state', 'review-labels');
-    return fs.readdirSync(dir).map(name => [name, fs.readFileSync(path.join(dir, name), 'utf8'), fs.statSync(path.join(dir, name)).mtimeMs]);
-  };
-  let saved = snapshot(), n = f.calls().length;
-  let status = JSON.parse(f.call(['status', '--json']).out); assert.equal(status.tasks.find(x => x.id === t.id).reviewLabel.operation, 'add');
-  assert.deepEqual(snapshot(), saved); assert.equal(f.calls().length, n, 'Owner status performs no GitHub request');
-  const discovery = JSON.parse(f.call(['status', '--json', '--discover-prs']).out);
-  assert.equal(discovery.prDiscovery.version, 1); assert.equal(discovery.tasks.find(x => x.id === t.id).reviewLabel.operation, 'add');
-  assert.deepEqual(snapshot(), saved); assert.equal(f.calls().length, n, 'Explicit PR discovery must not retry label signaling');
-  const outsider = crew(['status', '--json'], { cwd: f.home, terminal: 'outsider', env: f.env }); assert.equal(outsider.code, 0, outsider.out); JSON.parse(outsider.out);
-  assert.deepEqual(snapshot(), saved); assert.equal(f.calls().length, n, 'Nonowner status performs no GitHub request');
-  assert.match(f.call(['status']).out, /review label add pending/);
-  f.state({ addDenied: false }); let r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
-  fs.writeFileSync(t.report, 'APPROVE'); f.state({ removeDenied: true }); assert.equal(f.worker(t).code, 0);
-  n = f.calls().length; saved = snapshot(); status = JSON.parse(f.call(['status', '--json']).out);
-  assert.equal(status.tasks.find(x => x.id === t.id).reviewLabel.operation, 'cleanup'); assert.deepEqual(snapshot(), saved); assert.equal(f.calls().length, n);
-  f.state({ removeDenied: false }); r = f.call(['wait', t.id, '--timeout', '1', '--no-fallback']); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Settled wait retries cleanup');
-  f.parent('lookup', {}, 'Done.'); f.state({ lookupError: true }); const unresolved = f.start('lookup'); f.state({ lookupError: false });
-  r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label)); assert.ok(f.records().find(s => s.attempt === unresolved.reviewAttempt).target);
-  setTerminal(unresolved.terminal, { state: 'finished' }); r = f.call(['wait', unresolved.id, '--timeout', '1']); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.parent('closed'); const closed = f.start('closed'); f.state({ removeDenied: true });
-  r = f.call(['finish', closed.id, '--force']); assert.equal(r.code, 0, r.out); assert.equal(f.task(closed.id).state, 'closed'); assert.ok(f.state().labels.includes(f.label));
-  f.state({ removeDenied: false }); r = f.call(['finish', closed.id]); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Already-closed finish retries');
-  // Parent land and finish reconcile leftovers, including their early-return paths, but
-  // parent lifecycle alone must not clear a live reviewer's assignment.
-  f.save({ ...f.task(parent.id), pr: f.url, landed: new Date().toISOString() }); const live = f.start();
-  setTerminal(live.terminal, { status: { app: 'pi', state: 'working' } });
-  r = f.call(['land', parent.id]); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
-  r = f.call(['finish', parent.id]); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
-  setTerminal(live.terminal, { state: 'finished' }); r = f.call(['land', parent.id]); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.parent('parent-finish'); const child = f.start('parent-finish'); setTerminal(child.terminal, { state: 'finished' });
-  r = f.call(['finish', 'parent-finish']); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  // Dead-process lock recovery is conservative; a busy live owner yields a pending add,
-  // not a failed review, and the next acting command retries it.
-  const lock = path.join(f.home, 'state', 'review-labels', 'lock'); fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, `${process.pid}-aaaa`), '');
-  f.parent('locked'); n = f.calls().length; r = f.call(['review', 'locked']); assert.equal(r.code, 0, r.out); assert.match(r.out, /signaling is busy/); assert.equal(f.calls().length, n);
-  fs.unlinkSync(path.join(lock, `${process.pid}-aaaa`)); fs.writeFileSync(path.join(lock, '2147483647-aaaa'), '');
-  r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label)); assert.ok(!fs.existsSync(lock));
-};
-gapTests['review-label-observations'] = () => {
-  const f = reviewLabelFixture('observations'); f.parent();
-  let t = f.start('ship', 'a1');
-  // Simulate an interrupted launch that never saved its terminal address. A live terminal
-  // in the copy still counts; only the existing age/two-observation rule proves agent death.
-  f.save({ ...t, state: 'preparing', terminal: null });
-  const recordFile = path.join(f.home, 'state', 'review-labels', `${t.reviewAttempt}.json`);
-  fs.writeFileSync(recordFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(recordFile, 'utf8')), launcher: 2147483647 }));
-  for (let i = 0; i < 2; i++) { const r = f.call(['start'], { CREW_DEAD_SECONDS: '3600' }); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label)); }
-  let r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
-  r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.parent('preparing'); t = f.start('preparing'); setTerminal(t.terminal, { state: 'finished' }); f.save({ ...t, state: 'preparing', terminal: null });
-  const preparing = path.join(f.home, 'state', 'review-labels', `${t.reviewAttempt}.json`); fs.writeFileSync(preparing, JSON.stringify({ ...JSON.parse(fs.readFileSync(preparing, 'utf8')), launcher: 2147483647 }));
-  const w = readWorld(); w.silentLs = true; fs.writeFileSync(world, JSON.stringify(w));
-  r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label), 'Unknown Core listing cannot prove an abandoned preparation');
-  const back = readWorld(); back.silentLs = false; fs.writeFileSync(world, JSON.stringify(back));
-  r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.parent('unknown'); t = f.start('unknown', 'a1');
-  const silent = readWorld(); silent.silent = true; fs.writeFileSync(world, JSON.stringify(silent));
-  r = f.call(['wait', t.id, '--timeout', '0.1']); assert.equal(r.code, 124, r.out); assert.ok(f.state().labels.includes(f.label));
-  const clear = readWorld(); clear.silent = false; fs.writeFileSync(world, JSON.stringify(clear));
-  r = f.call(['wait', t.id, '--timeout', '2', '--no-fallback']); assert.equal(r.code, 124, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Death cleanup does not depend on worker fallback');
-  f.parent('idle'); t = f.start('idle'); setTerminal(t.terminal, { status: { state: 'idle', app: 'pi' } });
-  r = f.call(['wait', t.id, '--timeout', '1']); assert.equal(r.code, 7, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Abandoned idle review ends after its existing reminder');
-  assert.equal(f.task(t.id).state, 'working');
-  setTerminal(t.terminal, { sendError: true });
-  r = f.call(['tell', t.id, 'Continue reviewing']); assert.equal(r.code, 4, r.out);
-  assert.equal(f.task(t.id).reviewAttempt, t.reviewAttempt); assert.deepEqual(f.state().labels, ['unrelated'], 'Failed follow-up restores abandoned ownership');
-  setTerminal(t.terminal, { sendError: false });
-  r = f.call(['tell', t.id, 'Continue reviewing']); assert.equal(r.code, 0, r.out);
-  const resumed = f.task(t.id); assert.notEqual(resumed.reviewAttempt, t.reviewAttempt); assert.equal(resumed.reviewSessionAttempt, t.reviewSessionAttempt);
-  assert.equal(resumed.recovery, undefined, 'A resumed reviewer must not inherit the expired abandonment timer');
-  r = f.call(['wait', t.id, '--timeout', '1.2'], { CREW_RECOVERY_SECONDS: '1' }); assert.equal(r.code, 124, r.out);
-  assert.equal(f.task(t.id).recovery?.idleNudged, undefined, 'A fresh idle interval must precede a new reminder');
-  assert.ok(f.state().labels.includes(f.label), 'Tell followed by wait keeps the resumed review labeled during its fresh interval');
-  r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label), 'Successful tell resumes abandoned activity before recovery');
-  r = f.call(['tell', t.id, 'Keep reviewing']); assert.equal(r.code, 0, r.out); assert.equal(f.task(t.id).reviewAttempt, resumed.reviewAttempt, 'An active reviewer keeps its attempt');
-  fs.writeFileSync(t.report, 'APPROVE'); r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewSessionAttempt }); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
-  f.parent('fallback'); t = f.start('fallback', 'a1'); f.save({ ...t, candidates: [{ harness: 'a1' }, { harness: 'pi' }], chain: [{ harness: 'pi' }] });
-  r = f.call(['wait', t.id, '--timeout', '1']); assert.equal(r.code, 124, r.out); const replacement = f.task(t.id);
-  assert.notEqual(replacement.reviewAttempt, t.reviewAttempt); assert.equal(replacement.agent, 'pi'); assert.ok(f.state().labels.includes(f.label));
-  fs.writeFileSync(replacement.report, 'APPROVE'); assert.equal(f.worker(replacement).code, 0); assert.deepEqual(f.state().labels, ['unrelated']);
-};
-
-gapTests['review-label-opt-out'] = () => {
-  const f = reviewLabelFixture('opt-out'); f.parent(); f.state({ labelsEnabled: 'FaLsE' });
-  const t = f.start(); assert.deepEqual(f.state().labels, ['unrelated']);
-  assert.ok(!f.calls().some(c => ['POST', 'DELETE'].includes(c.method)), 'Existing definitions do not override opt-out');
-  let r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.match(r.out, /opted out/);
-  assert.ok(f.records().find(s => s.attempt === t.reviewAttempt).pending);
-  f.state({ labelsEnabled: 'true' }); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
-  f.state({ labelsEnabled: 'false' }); const n = f.calls().length; fs.writeFileSync(t.report, 'APPROVE');
-  r = f.worker(t); assert.equal(r.code, 0, r.out); assert.match(r.out, /opted out/); assert.ok(f.state().labels.includes(f.label));
-  r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out);
-  r = f.call(['land', 'ship']); assert.equal(r.code, 6, r.out); // ordinary plain-project missing-origin refusal
-  assert.ok(!f.calls().slice(n).some(c => ['POST', 'DELETE'].includes(c.method)), 'Cleanup and parent recovery also honor opt-out');
-  f.state({ labelsEnabled: '' }); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Empty value re-enables pending cleanup');
-  for (const [id, setting] of [['unset', undefined], ['space', ' false '], ['other', 'anything']]) {
-    f.parent(id); f.state({ labelsEnabled: setting }); const review = f.start(id); assert.ok(f.state().labels.includes(f.label));
-    fs.writeFileSync(review.report, 'APPROVE'); assert.equal(f.worker(review).code, 0); assert.deepEqual(f.state().labels, ['unrelated']);
-  }
-  for (const [id, patch] of [['denied', { variablesDenied: true }], ['malformed', { variablesDenied: false, badVariables: true }]]) {
-    f.parent(id); f.state(patch); const before = f.calls().length; const review = f.start(id);
-    assert.ok(!f.calls().slice(before).some(c => ['POST', 'DELETE'].includes(c.method)), 'Unreadable enablement warns and defers writes, not review');
-    fs.writeFileSync(review.report, 'CHANGES NEEDED'); assert.equal(f.worker(review).code, 0);
-  }
-};
-gapTests['review-label-done-relaunch'] = async () => {
-  const f = reviewLabelFixture('done-relaunch'); f.parent(); const old = f.start(); fs.writeFileSync(old.report, 'APPROVE'); f.state({ slowDelete: 5000 });
-  const child = spawn(process.execPath, [path.join(here, 'crew.mjs'), 'done', old.id], { cwd: f.home, env: { ...process.env, ...f.env, CREW_HOME: f.home, CREW_TERMINAL: old.terminal, CREW_REVIEW_ATTEMPT: old.reviewSessionAttempt } });
-  let output = ''; child.stdout.on('data', b => output += b); child.stderr.on('data', b => output += b);
-  const ended = new Promise(resolve => child.on('close', code => resolve(code)));
-  const deadline = Date.now() + 10000;
-  while (!f.calls().some(c => c.method === 'DELETE') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
-  assert.ok(f.calls().some(c => c.method === 'DELETE'), 'Wait until old done is inside delayed cleanup');
-  assert.equal(f.task(old.id).state, 'reported', 'Completion is committed before five-second advisory I/O');
-  const r = f.call(['relaunch', old.id, '--agent', 'claude']); assert.equal(r.code, 2, r.out);
-  assert.equal(await ended, 0, output);
-  assert.equal(f.task(old.id).reviewAttempt, old.reviewAttempt); assert.equal(f.task(old.id).terminal, old.terminal);
-  assert.equal(f.task(old.id).state, 'reported', 'Relaunch cannot replace a completion already committed before cleanup');
-  f.state({ slowDelete: false }); const next = f.start();
-  assert.equal(f.call(['start']).code, 0); assert.ok(f.state().labels.includes(f.label)); assert.equal(f.task(next.id).state, 'working');
-};
-gapTests['review-label-concurrent'] = async () => {
-  const f = reviewLabelFixture('concurrent'); f.parent(); const old = f.start(); fs.writeFileSync(old.report, 'APPROVE'); f.state({ slowDelete: true });
-  const child = spawn(process.execPath, [path.join(here, 'crew.mjs'), 'done', old.id], { cwd: f.home, env: { ...process.env, ...f.env, CREW_HOME: f.home, CREW_TERMINAL: old.terminal } });
-  let output = ''; child.stdout.on('data', b => output += b); child.stderr.on('data', b => output += b);
-  const ended = new Promise(resolve => child.on('close', code => resolve(code)));
-  const deadline = Date.now() + 10000;
-  while (!f.calls().some(c => c.method === 'DELETE') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
-  const next = f.start(); assert.equal(await ended, 0, output);
-  assert.ok(f.state().labels.includes(f.label), 'Old cleanup cannot run after a newer successful add');
-  fs.writeFileSync(next.report, 'CHANGES NEEDED'); assert.equal(f.worker(next).code, 0); assert.deepEqual(f.state().labels, ['unrelated']);
+  f.control({ enabled: '', variablesDenied: false, defined: [f.under, f.approved, f.changes] }); f.parent('late-opt-out'); const opted = f.start('late-opt-out').task;
+  f.control({ enabled: 'false' }); const at = f.writes().length; const optedResult = f.done(opted, 'APPROVE'); assert.equal(optedResult.code, 0); assert.equal(f.warnings(optedResult).length, 1); assert.equal(f.writes().length, at); assert.ok(f.control().labels.includes(f.under));
+  f.control({ enabled: '' }); f.parent('partial'); const t = f.start('partial').task;
+  f.control({ defined: [f.under] }); let n = f.calls().length, r = f.done(t, 'CHANGES NEEDED'); assert.equal(r.code, 0, r.out); assert.equal(f.warnings(r).length, 1);
+  assert.deepEqual(f.control().labels, ['unrelated'], 'Under review is removed even if the verdict definition is missing');
+  assert.deepEqual(f.calls().slice(n).filter(c => c.method === 'POST'), []);
+  f.control({ defined: [f.under, f.approved, f.changes] }); f.parent('remove'); const review = f.start('remove').task;
+  f.control({ removeDenied: true, addDenied: true }); n = f.calls().length; r = f.done(review, 'APPROVE'); assert.equal(r.code, 0, r.out); assert.equal(f.warnings(r).length, 1, 'Multiple errors produce one warning line');
+  assert.equal(f.task(review.id).state, 'reported'); assert.ok(f.control().labels.includes(f.under));
+  assert.equal(f.calls().slice(n).filter(c => c.method === 'DELETE').length, 1); assert.equal(f.calls().slice(n).filter(c => c.method === 'POST').length, 1);
+  f.control({ addDenied: false, enabled: 'true', labels: ['unrelated', f.approved, f.changes] }); f.parent('old-verdict'); const failedSwap = f.start('old-verdict'); assert.equal(f.warnings(failedSwap.result).length, 1); assert.equal(failedSwap.task.state, 'working');
+  f.control({ removeDenied: false }); n = f.calls().length; assert.equal(f.call(['start']).code, 0); assert.equal(f.calls().length, n, 'No retry after failure');
 };
 
 try {
@@ -1864,11 +1641,6 @@ const a = process.argv.slice(2), file = ${JSON.stringify(ghLog)}, log = JSON.par
 log.push({ a, body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : null }); fs.writeFileSync(file, JSON.stringify(log));
 if (a[0] === 'auth') process.exit(1);
 if (fs.existsSync(${JSON.stringify(ghDown)})) { console.error('gh: not signed in'); process.exit(1); }
-if (a[0] === 'api') {
-  const endpoint = a.find(v => v.startsWith('repos/'));
-  console.log(endpoint.endsWith('/actions/variables') ? JSON.stringify([{ variables: [] }]) : a[a.indexOf('--method') + 1] === 'GET' ? JSON.stringify({ name: '\\u{1F916} Under review' }) : '[]');
-  process.exit(0);
-}
 if (a[0] === 'pr' && a[1] === 'list') { console.log(fs.existsSync(${JSON.stringify(ghMerged)}) ? fs.readFileSync(${JSON.stringify(ghMerged)}, 'utf8') : ''); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'view' && a.includes('isDraft,body')) { console.log(JSON.stringify({ isDraft: true, body: '## Proposal\\n\\nWhy.\\n\\n## Implementation\\n\\n- [x] The first outcome is delivered.\\n- [ ] The second outcome is delivered.\\n\\n## Acceptance\\n\\n- [ ] not an outcome\\n' })); process.exit(0); }
 console.log('https://example.invalid/acme/demo/pull/7');

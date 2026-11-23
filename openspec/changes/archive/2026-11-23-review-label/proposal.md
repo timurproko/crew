@@ -2,15 +2,15 @@
 
 ## Why
 
-GitHub does not show when crew is actively reviewing a pull request. Crew should own the shared advisory review label from review launch through every observed end of that review, without making labeling a delivery gate.
+GitHub should show that an agent review started and retain its reported result without making advisory signaling part of crew's lifecycle machinery. The maintainer explicitly replaced the earlier retry/ownership design with two best-effort hooks and three shared labels.
 
 ## What Changes
 
-- Resolve an implementation pull request for every project kind at review time, excluding a workflow `Plan:` report, and add the exact shared `🤖 Under review` label before launching its reviewer.
-- Remove only that assignment when review activity ends, including either verdict, malformed reports, stop, finish, launch failure, handover gaps, observed death or abandonment, and parent finish/land reconciliation.
-- Retain the label until the last local reviewer ends; serialize local decisions and reject stale reviewer-attempt cleanup so a newer review is not cleared.
-- Surface nonblocking GitHub failures and persist pending signaling work for retry through acting review, wait, done, stop, finish, land, relaunch and start commands. Missing definitions are reported, never created by crew.
-- Document signed-in credential permissions, shared-definition rollout prerequisites, plain projects without a PR until land, advisory semantics and the absence of cross-runner coordination or expiry guarantees.
+- After `crew review` saves its launched reviewer, swap previous verdict labels for `🤖 Under review` on an existing implementation PR.
+- After `crew done` saves a report beginning with `APPROVE` or `CHANGES NEEDED`, remove Under review and add the corresponding `🤖 Approved` or `🤖 Changes needed` label.
+- Keep every label operation advisory, attempted once, with at most one warning line per hook. Never create definitions; respect repository opt-out and unreadable variables. A missing verdict definition does not prevent removal of Under review.
+- Remove the earlier retries, reconciliation, liveness cleanup, attempt records, label lock, signaling session identity, overlap ownership and pending-label status output.
+- Document intentional limitations: stopped/crashed reviewers and failed removals can leave Under review until shared close/merge cleanup or manual removal; the first overlapping verdict removes activity while another reviewer may still run. Verdict labels survive close/merge.
 
 ## Capabilities
 
@@ -20,9 +20,8 @@ None.
 
 ### Modified Capabilities
 
-- `task-orchestration`: Add runner-owned advisory pull-request review-label lifecycle, local overlap protection and durable nonblocking retries.
-- `worker-dispatch`: Preserve strictly read-only status while exposing pending advisory-label cleanup without triggering retries.
+- `task-orchestration`: Minimal post-save advisory review-start and verdict-label swaps, with explicit failure and lifecycle limitations.
 
 ## Impact
 
-Implementation is scoped to review-related helpers and lifecycle hooks in `crew.mjs`, fake GitHub/Core coverage in `crew.test.mjs`, README guidance and the corresponding OpenSpec deltas. Reuse the existing `gh`/`CREW_GH` adapter and signed-in credential; introduce no dependency, App key, workflow change, timer, heartbeat, dispatch protocol or required check. The shared definition is owned by MyWorkflows PR 25 and is not edited here. Avoid project registry/name code from PR 5 and PR-discovery code from the parallel task; rebase and integrate only passive status display additions. The plan is approved for implementation with status explicitly free of side effects.
+Only two hook sites and a small helper in `crew.mjs`, focused fake-GitHub tests and README guidance change against main. Project registration from PR 5 and read-only PR discovery from PR 6 remain untouched. The shared workflow owns all three definitions and external Under review cleanup; this change does not modify that repository or perform live label operations. This approved reduced scope supersedes every earlier lifecycle/ownership requirement in this change.

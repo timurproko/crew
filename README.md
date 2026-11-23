@@ -298,54 +298,26 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
 For every kind, first land requires a reported worker, an existing copy, and clean tracked
 and untracked files, even when it only records a link. An already-landed PR can return early.
 
-### Advisory review activity on GitHub
+### Advisory review labels
 
-When an implementation PR already exists, `crew review` adds `🤖 Under review` before
-launching its reviewer, including on a draft or pending-CI PR. This works for workflow,
-gate and plain projects alike. A `Plan:` report is not an implementation review target.
-For a plain project whose PR opens only at `crew land`, there is no PR to label at review
-time; crew says so and still reviews the branch.
+After saving a launched reviewer, `crew review` best-effort adds `🤖 Under review` to its
+implementation PR and removes existing `🤖 Approved` / `🤖 Changes needed` labels. After
+saving `crew done`, an exact first-line `APPROVE` or `CHANGES NEEDED` removes Under review
+and adds the matching verdict label. Malformed or missing reports cause no label change.
+Workflow, gate and plain projects use the same hooks; Plan reports and plain branches
+without a PR at review time are skipped. Status remains read-only.
 
-The exact label is U+1F916, one space, then `Under review`, color `840479`, with an empty
-description. Its definition belongs to the shared delivery workflow, which syncs the base
-palette by default. Crew never creates or redefines it. `DELIVERY_LABELS_ENABLED=false` on
-the repository opts out of both add and removal (case-insensitive, without trimming spaces);
-unset, empty and other values remain enabled. Crew checks the repository variables before
-label writes; unreadable enablement warns and defers signaling without blocking review.
-Crew uses the ordinary signed-in `gh` credential, with repository-variable read access and
-Pull requests write or another sufficient existing label-write grant, never an App key. Missing definitions,
-permissions or network errors produce visible warnings without preventing review. This is
-activity only, not a GitHub approval or a readiness/merge gate; absence proves nothing.
+All three definitions belong to the shared workflow; crew never creates or redefines them.
+It uses signed-in `gh`, repository-variable read access and sufficient label-write access.
+`DELIVERY_LABELS_ENABLED=false` opts out (case-insensitive, no whitespace trimming). Any
+failure prints one warning line without changing task state or exit status. A missing verdict
+definition skips that addition but still removes Under review. Each write is attempted once;
+there are no retries, locks, label-state files, overlap tracking or lifecycle cleanup.
 
-Either review verdict ends the activity label, as does a malformed completion, a confirmed
-stop/finish or a failed launch. Relaunch hands ownership to a fresh attempt; telling a
-reported or abandoned reviewer to review again resumes signaling. With two local reviewers on one PR,
-the label stays until the last ends. Old cleanup cannot clear a newer local review's label.
-These guarantees cover one crew home only: independent runners must avoid overlapping
-ownership on the same PR. Unrelated labels are never replaced or removed.
-
-Acting commands (`review`, `wait`, `done`, `stop`, `finish`, `land`, `relaunch`, and `start`
-reconciliation) retry pending signaling and clean up observed dead or abandoned reviews.
-An unavailable Core answer is not proof of death; missing recognized agents retain the
-existing age guard and consecutive-observation requirement. Failed cleanup remains pending,
-even if the reviewer is already closed or the parent already landed. Confirmed absence of
-the assignment is success; an inaccessible PR is not. `crew status` only displays stored
-pending state (`reviewLabel.operation` and `error` in JSON; use `--all` for closed tasks):
-it performs no label recovery, GitHub label requests or metadata writes, even for the owner.
-
-There is no background watcher or expiry. If the entire runner is offline, an open PR's
-label can remain until an acting command observes recovery or a person removes it. The
-shared workflow's independent enabled close-event cleanup is an external fallback, not
-crew's liveness detector. Rolling back to an older crew can likewise leave an assignment
-until resumed recovery or external cleanup. Interrupted local signaling is retried only
-when its process is proved dead; an uncertain local lock is reported, never stolen.
-Missing, corrupt or unwritable local signaling metadata is reported but cannot prevent a
-reviewer's completion or alter wait, stop, finish or land outcomes. Completion identity lives
-in the task record independently of advisory metadata; older tasks retain terminal ownership
-checks. A follow-up to an ended attempt starts fresh signaling in the same reviewer session
-with a fresh recovery interval, rather than inheriting an expired abandonment reminder.
-Completion and closure are saved before label cleanup, so slow signaling cannot overwrite
-a replacement's task state.
+A crashed/stopped reviewer or failed removal leaves Under review until the shared workflow
+clears it on merge/close or a person removes it. With two reviewers, the first verdict removes
+Under review while the other may still be running. Swaps are best effort, not atomic; verdict
+labels remain as a record after merge/close. Labels never gate delivery or imply GitHub approval.
 
 ## Companion tools
 
@@ -354,7 +326,7 @@ with their versions; the Herdr plugin installs them (Settings > Plugins > Crew).
 
 | Tool | What crew does with it |
 | --- | --- |
-| `gh` | `crew land` opens the pull request; review lifecycle commands signal advisory activity on existing PRs. |
+| `gh` | Opens pull requests at land; swaps advisory labels after review launch and verdict reporting. |
 | `gh-axi`, `chrome-devtools-axi`, `jq` | A worker's brief names the ones on the machine (GitHub, browser, JSON). |
 | `lavish-axi` | The coordinator's rules say when to use it: showing a decision or long report as a page. |
 | `quota-axi` | Crew reads it, unchanged, when it chooses who works (see "Who does the work"): one ordinary reading for the machine's own logins, and one `--profile-only` reading per saved Claude account. |
