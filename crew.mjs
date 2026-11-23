@@ -1892,7 +1892,8 @@ function reviewSignalNeedsResume(h, task) {
   // Ended ownership is independent of task state: wait can abandon an otherwise working
   // reviewer. Missing/corrupt storage also warrants a fresh best-effort signaling attempt.
   try {
-    if (!task.reviewAttempt || !validReviewSignal(readJson(signalFile(h, task.reviewAttempt)))) return true;
+    const s = readJson(signalFile(h, task.reviewAttempt));
+    if (!task.reviewAttempt || !validReviewSignal(s) || s.attempt !== task.reviewAttempt) return true;
     return fs.existsSync(signalEnded(h, task.reviewAttempt));
   } catch (error) { reviewWarning(error.message); return true; }
 }
@@ -1980,7 +1981,7 @@ function syncReviewSignal(h, attempt) {
   try {
     withReviewSignalLock(h, () => {
       const s = readJson(signalFile(h, attempt));
-      if (!validReviewSignal(s)) { reviewWarning(`missing or invalid signaling metadata for ${attempt}`); return; }
+      if (!validReviewSignal(s) || s.attempt !== attempt) { reviewWarning(`missing or invalid signaling metadata for ${attempt}`); return; }
       try { if (s.target) syncReviewTarget(h, s.target); }
       catch (error) {
         for (const item of reviewSignals(h).filter(item => item.target?.key === s.target?.key)) writeJson(signalFile(h, item.attempt), { ...item, pending: true, error: error.message });
@@ -2007,7 +2008,7 @@ function endReviewSignal(h, task) {
   try {
     fs.writeFileSync(signalEnded(h, task.reviewAttempt), '');
     const s = readJson(signalFile(h, task.reviewAttempt));
-    if (s) writeJson(signalFile(h, s.attempt), { ...s, pending: Boolean(s.target), error: null });
+    if (validReviewSignal(s) && s.attempt === task.reviewAttempt) writeJson(signalFile(h, task.reviewAttempt), { ...s, pending: Boolean(s.target), error: null });
     syncReviewSignal(h, task.reviewAttempt);
   }
   catch (error) { reviewWarning(error.message); }

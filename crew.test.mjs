@@ -1237,15 +1237,17 @@ gapTests['review-label-endings'] = () => {
 gapTests['review-label-storage-failures'] = () => {
   // Files/directories at the wrong level exercise deterministic read/write failures on
   // Windows and POSIX, without relying on chmod (which is ineffective under some users).
-  for (const mode of ['blocked-at-launch', 'missing', 'invalid-json', 'corrupt-session', 'unwritable-record']) {
+  for (const mode of ['blocked-at-launch', 'missing', 'invalid-json', 'corrupt-session', 'corrupt-identity', 'unwritable-record']) {
     const f = reviewLabelFixture(`storage-${mode}`), parent = f.parent(), dir = path.join(f.home, 'state', 'review-labels');
     if (mode === 'blocked-at-launch') { fs.mkdirSync(path.dirname(dir), { recursive: true }); fs.writeFileSync(dir, 'not a directory'); }
-    const t = f.start(), record = path.join(dir, `${t.reviewAttempt}.json`);
+    const t = f.start(), record = path.join(dir, `${t.reviewAttempt}.json`), victim = path.join(f.home, 'metadata-victim.json');
+    fs.writeFileSync(victim, 'must remain untouched');
     assert.equal(t.reviewSessionAttempt, t.reviewAttempt, 'Authoritative identity is saved despite advisory storage failure');
     assert.ok(readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1).includes(`CREW_REVIEW_ATTEMPT='${t.reviewSessionAttempt}'`));
     if (mode === 'missing') fs.rmSync(dir, { recursive: true });
     if (mode === 'invalid-json') fs.writeFileSync(record, '{broken');
     if (mode === 'corrupt-session') fs.writeFileSync(record, JSON.stringify({ ...JSON.parse(fs.readFileSync(record, 'utf8')), sessionAttempt: 'not-the-current-session' }));
+    if (mode === 'corrupt-identity') fs.writeFileSync(record, JSON.stringify({ ...JSON.parse(fs.readFileSync(record, 'utf8')), attempt: '../../metadata-victim' }));
     if (mode === 'unwritable-record') { fs.unlinkSync(record); fs.mkdirSync(record); }
     setTerminal(t.terminal, { status: { app: 'pi', state: 'working' } });
     let r = f.call(['finish', t.id]); assert.equal(r.code, 6, `${mode}: busy-worker protection is unchanged: ${r.out}`);
@@ -1271,6 +1273,7 @@ gapTests['review-label-storage-failures'] = () => {
       assert.equal(result.prDiscovery?.version, flags.length ? 1 : undefined);
       assert.equal(f.calls().length, n, 'Damaged label metadata cannot trigger label recovery in either status mode');
     }
+    assert.equal(fs.readFileSync(victim, 'utf8'), 'must remain untouched', 'Corrupt metadata cannot redirect signaling writes');
   }
   // Records created by the previous version have no authoritative session field. The
   // current terminal remains able to report even after its advisory metadata is lost.
