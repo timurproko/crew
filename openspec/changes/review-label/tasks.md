@@ -17,8 +17,8 @@
 
 ## 3. Existing lifecycle commands recover advisory signaling and explain its limits
 
-- [ ] 3.1 Reconcile pending signaling and observed ended/abandoned attempts during wait and start, including leftover preparing, failed and closed tasks; fake cases preserve existing death thresholds and avoid treating unknown Core responses as death.
-- [ ] 3.2 Display persisted pending label state in status without any side effects or PR-discovery changes; fake owner/nonowner and JSON cases prove no GitHub requests, no metadata writes and parseable stdout.
-- [ ] 3.3 Reconcile reviewer activity during parent finish/land and their already-closed or already-landed paths; fake cases retry stale cleanup while preserving a still-live reviewer's label and normal parent delivery behavior.
-- [ ] 3.4 Document recovery retry paths, runner-offline limits, external closed-PR fallback and rollback implications in README; fake retry cases demonstrate pending add recovery, pending removal recovery and idempotency without live GitHub calls.
+- [x] 3.1 Reconcile pending signaling and observed ended/abandoned attempts during wait and start, including leftover preparing, failed and closed tasks; fake cases preserve existing death thresholds and avoid treating unknown Core responses as death.
+- [x] 3.2 Display persisted pending label state in status without any side effects or PR-discovery changes; fake owner/nonowner and JSON cases prove no GitHub requests, no metadata writes and parseable stdout.
+- [x] 3.3 Reconcile reviewer activity during parent finish/land and their already-closed or already-landed paths; fake cases retry stale cleanup while preserving a still-live reviewer's label and normal parent delivery behavior.
+- [x] 3.4 Document recovery retry paths, runner-offline limits, external closed-PR fallback and rollback implications in README; fake retry cases demonstrate pending add recovery, pending removal recovery and idempotency without live GitHub calls.
 - [ ] 3.5 Integrate any intervening default-branch changes without editing registry/name or parallel PR-discovery behavior, validate the OpenSpec change and run the whole `node crew.test.mjs` main suite with fakes; record results and any remaining gaps before the implementation report.

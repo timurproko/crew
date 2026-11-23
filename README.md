@@ -278,6 +278,22 @@ the label stays until the last ends. Old cleanup cannot clear a newer local revi
 These guarantees cover one crew home only: independent runners must avoid overlapping
 ownership on the same PR. Unrelated labels are never replaced or removed.
 
+Acting commands (`review`, `wait`, `done`, `stop`, `finish`, `land`, `relaunch`, and `start`
+reconciliation) retry pending signaling and clean up observed dead or abandoned reviews.
+An unavailable Core answer is not proof of death; missing recognized agents retain the
+existing age guard and consecutive-observation requirement. Failed cleanup remains pending,
+even if the reviewer is already closed or the parent already landed. Confirmed absence of
+the assignment is success; an inaccessible PR is not. `crew status` only displays stored
+pending state (`reviewLabel.operation` and `error` in JSON; use `--all` for closed tasks):
+it performs no label recovery, GitHub requests or metadata writes, even for the owner.
+
+There is no background watcher or expiry. If the entire runner is offline, an open PR's
+label can remain until an acting command observes recovery or a person removes it. The
+shared workflow's independent enabled close-event cleanup is an external fallback, not
+crew's liveness detector. Rolling back to an older crew can likewise leave an assignment
+until resumed recovery or external cleanup. Interrupted local signaling is retried only
+when its process is proved dead; an uncertain local lock is reported, never stolen.
+
 ## Companion tools
 
 crew runs without any of them and uses each one that is installed. `crew tools` lists them
@@ -285,7 +301,7 @@ with their versions; the Herdr plugin installs them (Settings > Plugins > Crew).
 
 | Tool | What crew does with it |
 | --- | --- |
-| `gh` | `crew land` opens the pull request with it. |
+| `gh` | `crew land` opens the pull request; review lifecycle commands signal advisory activity on existing PRs. |
 | `gh-axi`, `chrome-devtools-axi`, `jq` | A worker's brief names the ones on the machine (GitHub, browser, JSON). |
 | `lavish-axi` | The coordinator's rules say when to use it: showing a decision or long report as a page. |
 | `quota-axi` | Crew reads it, unchanged, when it chooses who works (see "Who does the work"): one ordinary reading for the machine's own logins, and one `--profile-only` reading per saved Claude account. |
