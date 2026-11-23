@@ -33,7 +33,7 @@ Crew SHALL attempt to add only `🤖 Under review` to an existing implementation
 
 ### Requirement: Review activity ends release the advisory assignment
 
-Crew SHALL release a review's label ownership on either verdict, malformed or failed completion, confirmed stop or finish, failed launch, a handover gap without a live reviewer, or observed death or abandonment. Existing wait, start, status recovery, and parent finish or land observations SHALL reconcile leftover reviews. An unknown Core response SHALL NOT alone prove death.
+Crew SHALL release a review's label ownership on either verdict, malformed or failed completion, confirmed stop or finish, failed launch, a handover gap without a live reviewer, or observed death or abandonment. Existing acting review, wait, done, stop, finish, land, relaunch and start observations SHALL reconcile leftover reviews. An unknown Core response SHALL NOT alone prove death.
 
 #### Scenario: Either review verdict arrives
 
@@ -62,7 +62,7 @@ Crew SHALL release a review's label ownership on either verdict, malformed or fa
 
 #### Scenario: Lifecycle command observes death or abandonment
 
-- **WHEN** wait, owner status recovery, start, or parent finish or land confirms a reviewer is dead or abandoned under crew's liveness rules
+- **WHEN** wait, start, or parent finish or land confirms a reviewer is dead or abandoned under crew's liveness rules
 - **THEN** crew releases its ownership and retries any required label removal
 
 #### Scenario: Core does not answer
