@@ -10,7 +10,7 @@
 
 ## 2. Dotted project names retain their identity throughout crew, and invalid names receive actionable diagnostics
 
-- [ ] 2.1 Separate project validation from unchanged task-ID validation and use safe own-property registry lookups; cover dotted names, the naming boundaries, inherited-property names and specific non-usage errors for invalid explicit project names at add/remove and project-selection entry points.
-- [ ] 2.2 Preserve dotted project identity through registry replacement/removal, spawn selection, project-specific dispatch and text/JSON status; cover an owner spawning scout and ship tasks from a dotted repository with valid task-based branch and plain-copy names.
-- [ ] 2.3 Cover dotted project names forwarded through backlog commands and delivery-managed copies, including a fake pooled allocation; assert exact project strings, delivery cwd/arguments, recorded returned paths and no unwanted task-ID grammar changes.
-- [ ] 2.4 Document the accepted project grammar and the separate Herdr follow-up for dot-preserving folder derivation, list parsing and naming/error text; include a dotted folder example and explicitly state that no Herdr files change in this PR.
+- [x] 2.1 Separate project validation from unchanged task-ID validation and use safe own-property registry lookups; cover dotted names, the naming boundaries, inherited-property names and specific non-usage errors for invalid explicit project names at add/remove and project-selection entry points.
+- [x] 2.2 Preserve dotted project identity through registry replacement/removal, spawn selection, project-specific dispatch and text/JSON status; cover an owner spawning scout and ship tasks from a dotted repository with valid task-based branch and plain-copy names.
+- [x] 2.3 Cover dotted project names forwarded through backlog commands and delivery-managed copies, including a fake pooled allocation; assert exact project strings, delivery cwd/arguments, recorded returned paths and no unwanted task-ID grammar changes.
+- [x] 2.4 Document the accepted project grammar and the separate Herdr follow-up for dot-preserving folder derivation, list parsing and naming/error text; include a dotted folder example and explicitly state that no Herdr files change in this PR.

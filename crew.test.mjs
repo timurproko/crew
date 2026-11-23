@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -348,6 +348,7 @@ gapTests['project-registry'] = async () => {
     assert.match(r.out, new RegExp(`terminal owner-project-registry.*Only that coordinator may ${verb} work`));
     assert.match(r.out, /does not mean a project folder is in use/);
   }
+  const release = settings(['end']); assert.equal(release.code, 3); assert.match(release.out, /terminal owner-project-registry.*release this home/);
   const w = readWorld(); w.silent = true; fs.writeFileSync(world, JSON.stringify(w));
   assert.equal(settings(['project', 'add', 'silent', f.repo]).code, 0, 'Registration needs no Core query');
   let r = crew(['start'], { cwd: f.home, terminal: 'other' }); assert.equal(r.code, 4, r.out); assert.ok(r.out.includes(slash(f.home)));
@@ -426,6 +427,80 @@ gapTests['project-admission'] = async () => {
       else assert.equal(fs.readFileSync(path.join(f.task('race').worktree, 'README.md'), 'utf8').trim(), phase === 'before' ? 'replacement' : 'baseline');
     } finally { if (!fs.existsSync(gate.release)) fs.writeFileSync(gate.release, 'go'); await p.result; }
   }
+};
+
+gapTests['project-names'] = () => {
+  const f = gapFixture('project-names'), name = 'agentnumberone.dev', repo = path.join(f.dir, name);
+  git('clone', '-q', f.repo, repo);
+  const settings = args => crew(args, { cwd: f.home });
+  for (const good of ['a', '0', 'a-', 'a.b', 'constructor', 'a'.repeat(38) + '.x', name]) assert.equal(projectNameError(good), null, good);
+  const invalid = [['', /required/], ['a'.repeat(41), /at most 40/], ['Bad', /start with/], ['-bad', /start with/], ['.bad', /start with/], ['a/b', /only lowercase/], ['a_b', /only lowercase/], ['a b', /only lowercase/], ['aé', /ASCII/], ['a..b', /consecutive dots/], ['a.', /trailing dot/]];
+  for (const [bad, reason] of invalid) {
+    assert.match(projectNameError(bad), reason);
+    for (const args of [['project', 'add', bad, repo], ['project', 'remove', bad], ['spawn', 'invalid-name', '--project', bad, 'Task'], ['agents', '--project', bad, '--json']]) {
+      const r = f.call(args); assert.equal(r.code, 2, `${JSON.stringify(args)}: ${r.out}`);
+      assert.match(r.out, /Invalid project name/); assert.match(r.out, reason); assert.ok(!r.out.includes('Usage:'), r.out);
+    }
+  }
+  let r = f.call(['spawn', 'unknown', '--project', 'constructor', 'Task']); assert.equal(r.code, 2); assert.match(r.out, /Unknown project: constructor/);
+  assert.equal(settings(['project', 'add', 'constructor', repo]).code, 0, 'An inherited property is not an existing registration');
+  r = f.call(['agents', '--project', 'constructor', '--json']); assert.equal(r.code, 0, r.out);
+  assert.equal(settings(['project', 'remove', 'constructor']).code, 0);
+  assert.equal(settings(['project', 'add', name, repo, '--workflow', 'plain']).code, 0);
+  assert.equal(settings(['project', 'add', 'agentnumberone-dev', f.repo]).code, 0, 'Dots and dashes remain distinct');
+  assert.ok(settings(['project', 'list']).out.includes(`${name}\t${slash(repo)}\tworkflow plain`));
+  const config = path.join(f.home, 'config'); fs.mkdirSync(config);
+  fs.writeFileSync(path.join(config, 'crew-dispatch.json'), JSON.stringify({ default: [{ harness: 'a1' }], projects: { [name]: [{ harness: 'pi', model: 'openai/example' }] } }));
+  r = f.call(['agents', '--project', name, '--json']); assert.equal(r.code, 0, r.out); assert.equal(JSON.parse(r.out).source, `projects.${name}`);
+  const tasks = [];
+  for (const [id, kind] of [['dot-scout', 'scout'], ['dot-ship', 'ship']]) {
+    r = f.call(['spawn', id, '--project', name, '--kind', kind, 'Task']); assert.equal(r.code, 0, r.out);
+    const t = f.task(id); tasks.push(t); assert.equal(t.project, name); assert.equal(t.agent, 'pi'); assert.equal(t.launch.source, `projects.${name}`);
+    assert.equal(path.basename(t.worktree), id); assert.ok(fs.readFileSync(t.brief, 'utf8').includes(`project \`${name}\``));
+    if (kind === 'ship') { assert.equal(t.branch, `feature/${id}`); assert.equal(git('-C', t.worktree, 'branch', '--show-current').trim(), t.branch); }
+    else assert.equal(git('-C', t.worktree, 'rev-parse', '--abbrev-ref', 'HEAD').trim(), 'HEAD');
+  }
+  r = f.call(['spawn', 'dot.task', '--project', name, 'Task']); assert.equal(r.code, 2); assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'dot.task')));
+  assert.ok(!validId(name), 'Dotted project names do not relax task IDs');
+  assert.ok(f.call(['status']).out.includes(`\t${name}\t`));
+  for (const t of JSON.parse(f.call(['status', '--json']).out).tasks) assert.equal(t.project, name);
+  const backlog = path.join(f.dir, 'backlog.mjs'), log = path.join(f.dir, 'backlog-args.json');
+  fs.writeFileSync(backlog, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2))); console.log('ok');`);
+  r = f.call(['backlog', 'add', 'queued', 'Task', '--project', name], { CREW_TOOL_TASKS_AXI: backlog }); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(JSON.parse(fs.readFileSync(log, 'utf8')), ['add', 'queued', 'Task', '--project', name, '--file', path.join(f.home, 'backlog.md')]);
+  r = settings(['project', 'remove', name]); assert.equal(r.code, 2); assert.match(r.out, /unfinished tasks/);
+  for (const t of tasks) { setTerminal(t.terminal, { status: { app: 'pi', state: 'idle' } }); r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out); }
+  assert.equal(settings(['project', 'add', name, f.repo, '--replace']).code, 0);
+  assert.equal(settings(['project', 'remove', name]).code, 0); assert.ok(fs.existsSync(repo));
+  assert.ok(settings(['project', 'list']).out.includes('agentnumberone-dev\t'));
+};
+gapTests['project-pool'] = () => {
+  const f = gapFixture('project-pool'), name = 'agentnumberone.dev', repo = path.join(f.dir, name);
+  git('clone', '-q', f.repo, repo);
+  const delivery = path.join(f.dir, 'delivery.mjs'), log = path.join(f.dir, 'delivery-log.json'), pool = path.join(f.dir, 'pool.folder');
+  fs.writeFileSync(log, '[]');
+  fs.writeFileSync(delivery, `import fs from 'node:fs'; import path from 'node:path'; import { spawnSync } from 'node:child_process';
+const a = process.argv.slice(2), log = ${JSON.stringify(log)};
+fs.writeFileSync(log, JSON.stringify([...JSON.parse(fs.readFileSync(log, 'utf8')), { args: a, cwd: process.cwd() }]));
+if (a[0] === 'start') {
+  const branch = a[1] === '--detach' ? null : a[1], id = branch ? branch.split('/').at(-1) : a[2];
+  const slot = path.join(${JSON.stringify(pool)}, id, 'agentnumberone.dev'); fs.mkdirSync(path.dirname(slot), { recursive: true });
+  const r = spawnSync('git', ['worktree', 'add', ...(branch ? ['-b', branch] : ['--detach']), slot, 'HEAD'], { encoding: 'utf8' });
+  if (r.status !== 0) { console.error(r.stderr); process.exit(1); }
+  console.log(JSON.stringify({ path: slot, created: true, pooled: true }));
+} else if (a[0] === '--version') console.log('1.0.0'); else process.exit(1);`);
+  const call = args => f.call(args, { CREW_TOOL_DELIVERY: delivery });
+  assert.equal(call(['project', 'add', name, repo, '--workflow', 'plain']).code, 0);
+  for (const [id, kind] of [['pool-scout', 'scout'], ['pool-ship', 'ship']]) {
+    const r = call(['spawn', id, '--project', name, '--kind', kind, 'Task']); assert.equal(r.code, 0, r.out);
+    const t = f.task(id); assert.equal(t.project, name); assert.equal(t.via, 'delivery'); assert.equal(t.pooled, true);
+    assert.equal(t.worktree, slash(path.join(pool, id, name))); assert.ok(fs.existsSync(path.join(t.worktree, 'README.md')));
+    if (kind === 'ship') assert.equal(t.branch, 'feature/pool-ship');
+  }
+  const starts = JSON.parse(fs.readFileSync(log, 'utf8')).filter(c => c.args[0] === 'start');
+  assert.deepEqual(starts.map(c => c.args), [['start', '--detach', 'pool-scout', '--json'], ['start', 'feature/pool-ship', '--json']]);
+  for (const c of starts) assert.equal(slash(c.cwd), slash(repo));
+  for (const t of JSON.parse(call(['status', '--json']).out).tasks) assert.equal(t.project, name);
 };
 
 gapTests['platform-paths'] = () => {

@@ -110,6 +110,26 @@ cannot lose unrelated registrations or remove/repoint a project between lookup a
 Removal and `--replace` still refuse unfinished tasks and finished tasks with copies waiting
 to return; changing a path also requires `--replace`. Unreadable task references fail closed.
 
+Project names use 1–40 lowercase ASCII letters, digits, dashes and dots, starting with a
+letter or digit, with no consecutive dots or trailing dot. For example:
+
+```bash
+crew project add agentnumberone.dev D:/Git/agentnumberone.dev
+crew spawn inspect-site --project agentnumberone.dev "Inspect the site."
+```
+
+Invalid names explain the violated rule instead of printing only usage. Project names are
+not task IDs: branches and plain working copies still use task IDs (`feature/inspect-site`,
+for example), and delivery chooses its own copy or pool folder. Dots are never changed to dashes.
+
+The separate Herdr plugin needs a follow-up to preserve dots when deriving a name from a
+folder, accept dotted names in its `project list` parser, and update its naming text/tests.
+Its quoted `node <tool>/crew.mjs project add <name> <folder>` and remove-by-ID calls need no
+ownership workaround. It already displays crew's errors (sometimes prefixed with the chosen
+folder). Until that app update, Settings may derive `agentnumberone-dev` or hide a CLI-added
+`agentnumberone.dev`. Existing registrations are not automatically renamed. No Herdr files
+are changed by this crew update.
+
 All participating commands must use the updated tool; legacy binaries or direct file edits
 cannot honor this protocol. Lock contention waits up to two seconds and names
 `<crew home>/projects.lock` on refusal. An interrupted transaction can leave that lock behind:

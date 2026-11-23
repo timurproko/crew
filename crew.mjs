@@ -43,6 +43,21 @@ export const AGENTS = {
 class Refusal extends Error { constructor(message, code = 2) { super(message); this.exitCode = code; } }
 const refuse = (message, code) => { throw new Refusal(message, code); };
 export const validId = id => typeof id === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(id);
+export function projectNameError(name) {
+  if (typeof name !== 'string' || !name.length) return 'a project name is required (1 to 40 characters)';
+  if (name.length > 40) return 'use at most 40 characters';
+  if (!/^[a-z0-9]/.test(name)) return 'start with a lowercase ASCII letter or digit';
+  if (/[^a-z0-9.-]/.test(name)) return 'use only lowercase ASCII letters, digits, dashes and dots';
+  if (name.includes('..')) return 'consecutive dots are not allowed';
+  if (name.endsWith('.')) return 'a trailing dot is not allowed';
+  return null;
+}
+function requireProjectName(name) {
+  const error = projectNameError(name);
+  if (error) refuse(`Invalid project name ${JSON.stringify(name ?? '')}: ${error}.`);
+}
+const ownEntry = (object, key) => Object.hasOwn(object, key) ? object[key] : undefined;
+const registeredProject = (h, name) => ownEntry(h.config.projects, name);
 const slash = p => String(p).replace(/\\/g, '/');
 // Windows accepts either slash and ignores case; POSIX paths do neither.
 const comparablePath = p => {
@@ -448,10 +463,11 @@ function cmdProject(args) {
     for (const [key, p] of Object.entries(h.config.projects)) console.log(`${key}\t${p.path}${p.workflow ? `\tworkflow ${p.workflow}` : ''}`);
     return;
   }
+  if (verb === 'add' || verb === 'remove') requireProjectName(name);
   const replace = args.includes('--replace');
-  if (verb === 'remove' && validId(name) && !source) {
+  if (verb === 'remove' && !source) {
     withRegistry(h, () => {
-      if (!h.config.projects[name]) refuse(`Unknown project: ${name}. See \`crew project list\`.`);
+      if (!registeredProject(h, name)) refuse(`Unknown project: ${name}. See \`crew project list\`.`);
       requireUnusedProject(h, name);
       delete h.config.projects[name];
       writeJson(path.join(h.dir, 'crew.json'), h.config);
@@ -459,7 +475,7 @@ function cmdProject(args) {
     console.log(`project ${name} removed (its folder is untouched)`);
     return;
   }
-  if (verb !== 'add' || !validId(name) || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] [--gate-skip <steps>|none] [--workflow delivery|plain] | crew project remove <name> | crew project list');
+  if (verb !== 'add' || !source || source.startsWith('--')) refuse('Usage: crew project add <name> <git folder> [--replace] [--gate-skip <steps>|none] [--workflow delivery|plain] | crew project remove <name> | crew project list');
   // Compatibility: pooled copies were a choice per project until 0.8. They are now the machine's one setting.
   if (args.includes('--treehouse')) console.error('crew: --treehouse is no longer a project choice and was ignored. Pooled copies are one setting of the machine: `delivery pool`.');
   // Which steps of the no-mistakes gate are left out for this project (see gateSkipOf).
@@ -476,7 +492,7 @@ function cmdProject(args) {
   // Pointing an existing name at another repository is a replacement, not an addition: it has
   // to be asked for, and it waits until no unfinished task still belongs to the old one.
   withRegistry(h, () => {
-    const existing = h.config.projects[name];
+    const existing = registeredProject(h, name);
     if (existing && comparablePath(existing.path) !== comparablePath(folder)) {
       if (!replace) refuse(`Project ${name} already points at ${existing.path}. Pass --replace to point it at ${slash(folder)} instead.`);
       requireUnusedProject(h, name);
@@ -546,8 +562,8 @@ function cmdStart() {
 
 function cmdEnd() {
   const h = home();
-  const { mine } = ownerState(h);
-  if (!mine) refuse(`This session does not hold crew home ${slash(h.dir)}; only its coordinator may release it.`, 3);
+  const { mine, owner } = ownerState(h);
+  if (!mine) refuse(owner ? ownershipRefusal(h, owner, 'release this home') : `This session does not hold crew home ${slash(h.dir)}; only its coordinator may release it.`, 3);
   fs.rmSync(h.owner, { force: true });
   console.log('home released');
 }
@@ -689,7 +705,7 @@ function claudeAccounts(env = process.env) {
 // the configured chain follows it as its fallback; `--no-fallback` keeps only the first.
 // `legacy` is the agent crew used before there was any configuration.
 function workChain(h, role, flags, legacy, project = null, env = process.env) {
-  const config = dispatchConfig(h), own = config.projects[project] ?? null;
+  const config = dispatchConfig(h), own = ownEntry(config.projects, project) ?? null;
   // The project's own list comes before the general one, a role's list before a default.
   const [configured, from] = own?.roles[role]?.length ? [own.roles[role], `projects.${project}.roles.${role}`] : own?.default.length ? [own.default, `projects.${project}`]
     : config.roles[role]?.length ? [config.roles[role], `roles.${role}`] : [config.default, config.default.length ? 'default' : 'built-in'];
@@ -832,6 +848,7 @@ function cmdAgents(args) {
   const h = home();
   const { flags } = takeFlags(args, ['role', 'project', ...PICK_FLAGS], ['json', 'no-fallback']);
   if (flags.role !== undefined && !ROLES.includes(flags.role)) refuse(`Unknown role: ${flags.role}. Roles: ${ROLES.join(', ')}`);
+  if (flags.project !== undefined && flags.project !== SELF_PROJECT) requireProjectName(flags.project);
   const role = flags.role ?? 'scout', { candidates, config, source } = workChain(h, role, flags, 'a1', flags.project ?? null);
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true });
   const first = usable[0] ? pickKey(usable[0]) : null;
@@ -997,12 +1014,13 @@ function cmdSpawn(args) {
   const opts = { kind: flags.kind ?? 'scout', project: flags.project, ...(flags.type !== undefined ? { type: flags.type } : {}) };
   const [id, ...words] = rest;
   const task = words.join(' ').trim();
+  requireProjectName(opts.project);
   if (!validId(id) || !task) refuse(`Usage: crew spawn <id> --project <name> [--kind scout|ship] [--type feature|fix|...] ${PICK_USAGE} "<task>"`);
   if (!['scout', 'ship'].includes(opts.kind)) refuse(`Unknown kind: ${opts.kind}`);
   if (opts.type !== undefined && (opts.kind !== 'ship' || !BRANCH_TYPES.includes(opts.type))) refuse(opts.kind !== 'ship' ? 'Only a ship task has a branch, so only it takes --type.' : `Unknown type: ${opts.type}. Known: ${BRANCH_TYPES.join(', ')}`);
   // Checked before anything is created: an unknown agent or a bad profile makes no task.
   if (flags.agent !== undefined && !AGENTS[flags.agent]) refuse(`Unknown agent: ${flags.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
-  const project = h.config.projects[opts.project] ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
+  const project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
   if (fs.existsSync(taskDir(h, id))) refuse(`Task ${id} already exists.`);
   launchWorker(h, { id, opts, chosen: chooseWorker(h, opts.kind, flags, 'a1', opts.project), project, task });
 }
@@ -1049,7 +1067,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
   withRegistry(h, () => {
     // The project may have been removed/replaced while selection was running.
-    if (!extra.selfFix) project = h.config.projects[opts.project] ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
+    if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
     if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
     fs.mkdirSync(dir, { recursive: true });
     saveTask(h, record); // reservation prevents removal/replacement before any external work
@@ -1500,7 +1518,7 @@ function returnCopy(task, project, { force = false } = {}) {
   }
   return { ok: true, said: '', leftover: '', released: true };
 }
-const projectOf = (h, task) => (task.projectPath ? { path: task.projectPath } : h.config.projects[task.project]);
+const projectOf = (h, task) => (task.projectPath ? { path: task.projectPath } : registeredProject(h, task.project));
 
 // Work in a copy that its removal would lose: a ship task's uncommitted or untracked files
 // (its branch keeps only commits) and the shared delivery workflow's keep marker. A scout is
@@ -1813,7 +1831,7 @@ function cmdReview(args) {
   const task = loadTask(h, id);
   if (task.kind !== 'ship' || task.selfFix) refuse(`Task ${id} is not a ship task of a project; only those have a branch to review.`);
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; review it after its worker reported.`);
-  const project = h.config.projects[task.project] ?? refuse(`Unknown project: ${task.project}.`);
+  const project = registeredProject(h, task.project) ?? refuse(`Unknown project: ${task.project}.`);
   const opts = { kind: 'scout', project: task.project };
   // Without a choice and without a review chain in the configuration: CREW_REVIEW_AGENT, else the author's agent.
   const legacy = process.env.CREW_REVIEW_AGENT ?? task.agent;
@@ -1876,7 +1894,7 @@ function cmdLand(args) {
   // A workflow task's link is recorded already when its worker reports; it lands only once.
   if (task.pr && (task.landed || !task.workflow)) { console.log(`${id} already has a pull request: ${task.pr}`); return; }
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; it is delivered only after its worker reported.`);
-  const project = h.config.projects[task.project] ?? refuse(`Unknown project: ${task.project}.`);
+  const project = registeredProject(h, task.project) ?? refuse(`Unknown project: ${task.project}.`);
   const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
   const no = (why, code = 6) => refuse(`Task ${id} was not delivered: ${why}`, code);
   if (!fs.existsSync(path.join(wt, '.git'))) no(`its working copy ${wt} is gone. Its commits are still on branch ${branchOf(task)} in ${project.path}.`);
