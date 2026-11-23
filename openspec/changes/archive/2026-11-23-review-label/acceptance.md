@@ -3,12 +3,12 @@
 Verdict: accepted only when an authorized human directly merges the containing exact pull-request head after required current-head validation, explicitly asks the active agent to execute that protected exact-head merge while it is currently eligible, or personally enables native auto-merge for the unchanged head and GitHub integrates it after validation succeeds.
 
 The maintainer integration decision accepts these scenarios:
-- Existing implementation PRs receive the exact shared review label before reviewer launch, without creating definitions or replacing unrelated labels.
-- Either verdict and every observed review ending release activity ownership while overlapping local reviewers and newer attempts keep the label.
-- GitHub signaling failures remain visible and nonblocking, with idempotent retries in acting lifecycle commands and no App key or new background process.
-- Status only displays persisted pending label state and performs no label recovery, GitHub requests or metadata writes for either owners or other sessions.
-- Workflow, gate and plain projects share the integration; a plain project without a PR at review time continues its branch review without labeling.
-- The complete fake-Core and fake-GitHub main suite passes with merged safe project registration changes preserved.
+- Review launch and verdict label requests run only after the ordinary task state is saved and never modify task records.
+- New reviews replace prior verdict labels with Under review; APPROVE and CHANGES NEEDED replace activity with their matching result label.
+- Opt-out, unreadable variables and request failures print one warning without changing command outcomes; missing verdict definitions still allow activity removal.
+- Malformed or missing reports and branches without implementation PRs cause no label changes, and crew never creates definitions or replaces unrelated labels.
+- No retries, locks, signaling records, overlap tracking or pending-status output remain; stopped reviewers can leave activity assigned and the first overlapping verdict removes it.
+- Shared merge or close cleanup removes only activity while verdict labels remain a record, and existing registry and read-only discovery behavior is preserved.
 
 ```openspec-delivery
 {
@@ -21,16 +21,16 @@ The maintainer integration decision accepts these scenarios:
   "finalizedDate": "2026-11-23",
   "specBaseSha": "f625c5d252d152326ece77e65eb552f8a9c174fa",
   "acceptanceScenarios": [
-    "Existing implementation PRs receive the exact shared review label before reviewer launch, without creating definitions or replacing unrelated labels.",
-    "Either verdict and every observed review ending release activity ownership while overlapping local reviewers and newer attempts keep the label.",
-    "GitHub signaling failures remain visible and nonblocking, with idempotent retries in acting lifecycle commands and no App key or new background process.",
-    "Status only displays persisted pending label state and performs no label recovery, GitHub requests or metadata writes for either owners or other sessions.",
-    "Workflow, gate and plain projects share the integration; a plain project without a PR at review time continues its branch review without labeling.",
-    "The complete fake-Core and fake-GitHub main suite passes with merged safe project registration changes preserved."
+    "Review launch and verdict label requests run only after the ordinary task state is saved and never modify task records.",
+    "New reviews replace prior verdict labels with Under review; APPROVE and CHANGES NEEDED replace activity with their matching result label.",
+    "Opt-out, unreadable variables and request failures print one warning without changing command outcomes; missing verdict definitions still allow activity removal.",
+    "Malformed or missing reports and branches without implementation PRs cause no label changes, and crew never creates definitions or replaces unrelated labels.",
+    "No retries, locks, signaling records, overlap tracking or pending-status output remain; stopped reviewers can leave activity assigned and the first overlapping verdict removes it.",
+    "Shared merge or close cleanup removes only activity while verdict labels remain a record, and existing registry and read-only discovery behavior is preserved."
   ],
-  "archiveDigest": "43ff65a81cb115299c9802dce1ea9f19c45f03dcdd2cbc26ba20c98a481de2a9",
-  "specDigest": "136503a1011bfe28a5a8219868bb175af96e2f90ca94dfbb1dae799087e6dac4",
-  "tasksDigest": "9a219825df7f6ae53a53081453aca920b1ca7cef814da16287bc2c12583bd58b",
+  "archiveDigest": "da6138b76a9ff1230a2c4ecf6dc216245dfebaaacb5cbb7dea40697f05e2a984",
+  "specDigest": "922a9b89236d9ed827c6834474ac388f4db207684d777671272bb159fbc6d7e9",
+  "tasksDigest": "c65ecd11a3b103048c43f7647898be1c6809610b2ab3c2bf68d2fc37aaaa2e55",
   "evidenceDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "knownGaps": []
 }
