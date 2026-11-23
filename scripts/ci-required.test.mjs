@@ -34,6 +34,17 @@ test('aggregate command returns nonzero on a skipped suite', () => {
   assert.equal(r.status, 1, r.stderr); assert.match(r.stderr, /tests: expected success, got skipped/);
 });
 
+test('workflow ignores label events and preserves code-change supersession', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/tests.yml', import.meta.url), 'utf8');
+  const types = workflow.match(/pull_request:\s*\n\s*branches: \[main\]\s*\n\s*types: \[([^\]]+)\]/);
+  assert.ok(types, 'pull request trigger types are declared');
+  assert.deepEqual(types[1].split(',').map(type => type.trim()), [
+    'opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft', 'edited',
+  ]);
+  assert.match(workflow, /group: \$\{\{ github\.event_name == 'pull_request' && format\('ci-pr-\{0\}', github\.event\.pull_request\.number\) \|\| format\('ci-run-\{0\}', github\.run_id\) \}\}/);
+  assert.match(workflow, /cancel-in-progress: true/);
+});
+
 test('workflow keeps draft suites and aggregate disabled and checks both platforms', () => {
   const workflow = readFileSync(new URL('../.github/workflows/tests.yml', import.meta.url), 'utf8');
   assert.match(workflow, /if: needs\.readiness\.outputs\.ready == 'true'/);
