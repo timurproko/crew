@@ -1274,6 +1274,7 @@ function cmdDone(args) {
   if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
   if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
   saveTask(h, { ...task, state: 'reported', reported: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
+  if (task.reviews) reviewLabels(h, id, true);
   console.log(`reported ${id}. You are finished; stop here.`);
 }
 
@@ -1857,6 +1858,7 @@ function cmdReview(args) {
     '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
   ].join('\n');
   launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id } });
+  reviewLabels(h, reviewId);
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }
 
@@ -1864,6 +1866,53 @@ function cmdReview(args) {
 export const githubOwner = url => /github\.com[:/]+([^/]+)\/[^/]+?(?:\.git)?\/?$/.exec(String(url).trim())?.[1] ?? null;
 const GH = process.env.CREW_GH || 'gh';
 const gh = (args, options) => (GH.endsWith('.mjs') ? run(process.execPath, [GH, ...args], options) : run(GH, args, options));
+// Two advisory hooks only, after review/done saved their task state. No task writes,
+// retries, ownership tracking or lifecycle cleanup; each requested label write is tried once.
+function reviewLabels(h, id, completed = false) {
+  const errors = [], under = '\u{1F916} Under review', approved = '\u{1F916} Approved', changes = '\u{1F916} Changes needed';
+  try {
+    const reviewer = loadTask(h, id), verdict = completed ? fs.readFileSync(reviewer.report, 'utf8').split(/\r?\n/)[0].trim() : null;
+    if (completed && verdict !== 'APPROVE' && verdict !== 'CHANGES NEEDED') return;
+    const task = loadTask(h, reviewer.reviews), first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
+    if (task.stage === 'plan' || /^Plan:/i.test(first)) return;
+    let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr;
+    if (!url) {
+      const found = gh(['pr', 'view', branchOf(task), '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 10000 });
+      if (found.code !== 0 && /no pull requests? found|no pull request associated/i.test(found.stderr)) return;
+      if (found.code !== 0) throw new Error(found.stderr || 'PR lookup failed');
+      url = found.stdout.trim();
+    }
+    const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(url);
+    if (!m) throw new Error('invalid implementation PR URL');
+    const repo = `repos/${m[2]}/${m[3]}`, issue = `${repo}/issues/${m[4]}/labels`;
+    const api = (method, endpoint, extra = [], input) => {
+      const r = gh(['api', '--hostname', m[1], '--method', method, endpoint, ...extra], { timeout: 10000, ...(input ? { input: JSON.stringify(input) } : {}) });
+      if (r.code !== 0) throw new Error(r.stderr || `${method} ${endpoint} failed`);
+      return r.stdout;
+    };
+    const pages = JSON.parse(api('GET', `${repo}/actions/variables`, ['--paginate', '--slurp']));
+    if (!Array.isArray(pages) || !pages.length || pages.some(p => !Array.isArray(p?.variables) || p.variables.some(v => typeof v.name !== 'string' || typeof v.value !== 'string'))) throw new Error('repository variables unreadable');
+    if (pages.flatMap(p => p.variables).some(v => v.name === 'DELIVERY_LABELS_ENABLED' && v.value.toLowerCase() === 'false')) throw new Error('repository opted out with DELIVERY_LABELS_ENABLED=false');
+    const current = JSON.parse(api('GET', issue, ['--paginate', '--slurp'])).flat();
+    if (!Array.isArray(current) || current.some(l => typeof l?.name !== 'string')) throw new Error('PR labels unreadable');
+    for (const name of completed ? [under] : [approved, changes]) {
+      if (current.some(l => l.name === name)) {
+        // Completion during a lookup cancels the rest of this start hook, not the verdict.
+        if (!completed && loadTask(h, id).state !== 'working') return;
+        try { api('DELETE', `${issue}/${encodeURIComponent(name)}`); }
+        catch (error) { errors.push(error.message); }
+      }
+    }
+    const desired = completed ? verdict === 'APPROVE' ? approved : changes : under;
+    try {
+      if (JSON.parse(api('GET', `${repo}/labels/${encodeURIComponent(desired)}`)).name !== desired) throw new Error(`shared label not defined: ${desired}`);
+      if (!completed && loadTask(h, id).state !== 'working') return;
+      api('POST', issue, ['--input', '-'], { labels: [desired] });
+    } catch (error) { errors.push(error.message); }
+  } catch (error) { errors.push(error.message); }
+  finally { if (errors.length) console.error(`crew: review labels: ${errors.join('; ').replace(/\s+/g, ' ')}; advisory only`); }
+}
+
 // The pull request a worker (or its gate) opened: a link in its report, else what GitHub has
 // for its branch. A workflow worker puts its own link on the first line, and a link further
 // down may be another pull request it mentions, so for it only the first line is read.

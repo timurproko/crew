@@ -1130,6 +1130,106 @@ gapTests.status = () => {
   assert.equal(f.call(['finish', ship.id]).code, 0); assert.equal(f.call(['finish', scout.id]).code, 0);
 };
 
+// The reduced label integration has no persistence or lifecycle recovery: fake GitHub
+// records the already-saved task state at every request, including label mutations.
+function reviewLabelsFixture(name) {
+  const dir = path.join(root, `labels-${name}`); fs.mkdirSync(dir);
+  const fakeGh = path.join(dir, 'gh.mjs'), state = path.join(dir, 'github.json'), log = path.join(dir, 'calls.json');
+  const under = '\u{1F916} Under review', approved = '\u{1F916} Approved', changes = '\u{1F916} Changes needed';
+  fs.writeFileSync(state, JSON.stringify({ labels: ['unrelated'], defined: [under, approved, changes] })); fs.writeFileSync(log, '[]');
+  const env = { CREW_GH: fakeGh }, f = gapFixture(`labels-${name}`, env);
+  fs.writeFileSync(fakeGh, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process';
+const a=process.argv.slice(2), file=${JSON.stringify(state)}, s=JSON.parse(fs.readFileSync(file,'utf8')), log=${JSON.stringify(log)};
+let task; try { task=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json','utf8')); } catch {}
+const method=a[a.indexOf('--method')+1], endpoint=a.find(x=>x.startsWith('repos/')), input=a.includes('--input') ? JSON.parse(fs.readFileSync(0,'utf8')) : null;
+fs.writeFileSync(log,JSON.stringify([...JSON.parse(fs.readFileSync(log,'utf8')),{a,method,endpoint,input,saved:task?.state}]));
+const fail = msg => { console.error(msg+'\\nsecond diagnostic line'); process.exit(1); };
+if(s.network) fail('network unavailable');
+if(a[0]==='pr') { if(s.noPr) fail('no pull requests found for branch'); console.log('https://github.com/acme/demo/pull/42'); process.exit(0); }
+// Hold a start lookup until real done has saved its verdict and finished its requests.
+if(s.duringVerdict && task?.state==='working' && (s.duringAt==='definition' ? endpoint.endsWith('/labels/'+encodeURIComponent(${JSON.stringify(under)})) : endpoint.endsWith('/actions/variables'))) {
+  const verdict=s.duringVerdict; s.duringVerdict=null; fs.writeFileSync(file,JSON.stringify(s)); fs.writeFileSync(task.report,verdict);
+  const done=spawnSync(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},'done',task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TERMINAL:task.terminal},encoding:'utf8'});
+  if(done.status!==0) fail(done.stdout+done.stderr);
+}
+if(endpoint.endsWith('/actions/variables')) { if(s.variablesDenied) fail('variables unreadable'); console.log(JSON.stringify([{variables:s.enabled===undefined ? [] : [{name:'DELIVERY_LABELS_ENABLED',value:s.enabled}]}])); }
+else if(method==='GET' && endpoint.includes('/issues/')) console.log(JSON.stringify([s.labels.map(name=>({name}))]));
+else if(method==='GET') { const name=decodeURIComponent(endpoint.split('/').at(-1)); if(!s.defined.includes(name)) fail('shared label not defined'); console.log(JSON.stringify({name})); }
+else if(method==='DELETE') { if(s.removeDenied) fail('removal denied'); const name=decodeURIComponent(endpoint.split('/').at(-1)); s.labels=s.labels.filter(n=>n!==name); fs.writeFileSync(file,JSON.stringify(s)); console.log('{}'); }
+else if(method==='POST') { if(s.addDenied) fail('addition denied'); if(input.labels.some(n=>!s.defined.includes(n))) fail('must never create a label'); s.labels=[...new Set([...s.labels,...input.labels])]; fs.writeFileSync(file,JSON.stringify(s)); console.log('[]'); }
+else fail('unexpected fake request');`);
+  const control = patch => { const s = JSON.parse(fs.readFileSync(state, 'utf8')); if (patch) fs.writeFileSync(state, JSON.stringify({ ...s, ...patch })); return patch ? control() : s; };
+  const calls = () => JSON.parse(fs.readFileSync(log, 'utf8'));
+  const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
+  const start = (id = 'ship', suffix = '') => { const review = `${id}-review${suffix}`; control({ watch: review }); const r = f.call(['review', id, '--agent', 'pi']); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
+  const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
+  const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
+  const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
+  return { ...f, under, approved, changes, control, calls, parent, start, done, writes, warnings };
+}
+gapTests['review-label-swaps'] = () => {
+  const f = reviewLabelsFixture('swaps');
+  for (const [id, fields, report] of [['workflow', { workflow: 'delivery', stage: 'implementation' }, 'Implementation: https://github.com/acme/demo/pull/42'], ['gate', { gate: 'no-mistakes' }, 'https://github.com/acme/demo/pull/42'], ['plain', {}, 'Done.']]) {
+    f.parent(id, fields, report); f.control({ labels: ['unrelated', f.approved, f.changes] }); const before = f.calls().length;
+    const { task, result } = f.start(id); assert.equal(f.warnings(result).length, 0);
+    assert.deepEqual(f.control().labels, ['unrelated', f.under]); assert.ok(f.calls().slice(before).every(c => c.saved === 'working'), 'All start requests follow the saved launch state');
+    assert.ok(!('reviewAttempt' in task) && !('reviewSessionAttempt' in task));
+    const verdict = id === 'gate' ? 'CHANGES NEEDED' : 'APPROVE', at = f.calls().length;
+    const r = f.done(task, verdict+'\nDetails.'); assert.equal(r.code, 0, r.out); assert.equal(f.task(task.id).state, 'reported');
+    assert.deepEqual(f.control().labels, ['unrelated', verdict === 'APPROVE' ? f.approved : f.changes]);
+    assert.ok(f.calls().slice(at).every(c => c.saved === 'reported'), 'All verdict requests follow saved completion');
+    assert.ok(f.writes().every(c => c.method !== 'POST' || c.input.labels.length === 1));
+  }
+  f.parent('malformed'); let t = f.start('malformed').task, n = f.calls().length;
+  assert.equal(f.done(t, 'APPROVE extra').code, 0); assert.equal(f.calls().length, n); assert.ok(f.control().labels.includes(f.under));
+  f.parent('missing'); t = f.start('missing').task; n = f.calls().length; assert.equal(f.done(t).code, 2); assert.equal(f.calls().length, n); assert.equal(f.task(t.id).state, 'working');
+  f.parent('no-pr', {}, 'Done.'); f.control({ noPr: true }); n = f.writes().length; const skipped = f.start('no-pr').task; assert.equal(f.done(skipped, 'APPROVE').code, 0); assert.equal(f.writes().length, n); f.control({ noPr: false });
+  f.parent('plan', { workflow: 'delivery', stage: 'plan' }, 'Plan: https://github.com/acme/demo/pull/42'); n = f.calls().length; f.start('plan'); assert.equal(f.calls().length, n);
+  // Accepted overlap limitation: the first verdict clears activity while the other runs.
+  f.parent('overlap'); const a = f.start('overlap').task, b = f.start('overlap', '-2').task;
+  assert.equal(f.done(a, 'APPROVE').code, 0); assert.ok(!f.control().labels.includes(f.under)); assert.equal(f.task(b.id).state, 'working');
+  n = f.calls().length; assert.equal(f.call(['start']).code, 0); assert.equal(f.call(['stop', b.id]).code, 0); assert.equal(f.call(['finish', b.id]).code, 0); assert.equal(f.calls().length, n, 'Other lifecycle commands never reconcile labels');
+  assert.ok(!fs.existsSync(path.join(f.home, 'state', 'review-labels')));
+  assert.ok(JSON.parse(f.call(['status', '--json']).out).tasks.every(t => !('reviewLabel' in t)));
+};
+gapTests['review-label-start-done'] = () => {
+  const f = reviewLabelsFixture('start-done');
+  for (const [id, verdict, label, duringAt] of [['approve', 'APPROVE', f.approved, 'variables'], ['changes', 'CHANGES NEEDED', f.changes, 'variables'], ['approve-post', 'APPROVE', f.approved, 'definition'], ['changes-post', 'CHANGES NEEDED', f.changes, 'definition']]) {
+    f.parent(id); f.control({ labels: ['unrelated'], duringVerdict: verdict, duringAt }); const before = f.calls().length;
+    const { task, result } = f.start(id); assert.equal(f.warnings(result).length, 0, result.out);
+    assert.equal(task.state, 'reported'); assert.equal(f.control().duringVerdict, null);
+    assert.deepEqual(f.control().labels, ['unrelated', label], 'The delayed start must preserve its completed verdict');
+    const calls = f.calls().slice(before), writes = calls.filter(c => ['POST', 'DELETE'].includes(c.method));
+    const completedAt = calls.findIndex(c => c.saved === 'reported');
+    assert.ok(completedAt > 0 && calls.slice(0, completedAt).every(c => c.saved === 'working'), 'Start lookup begins before completion');
+    assert.ok(calls.slice(completedAt).every(c => c.saved === 'reported'));
+    assert.deepEqual(writes.map(c => c.input?.labels), [[label]], 'No stale verdict DELETE or Under review POST follows done');
+  }
+};
+gapTests['review-label-failures'] = () => {
+  const f = reviewLabelsFixture('failures');
+  for (const [id, patch] of [['permission', { addDenied: true }], ['network', { addDenied: false, network: true }], ['opt-out', { network: false, enabled: 'FaLsE' }], ['variables', { enabled: 'true', variablesDenied: true }], ['definition', { variablesDenied: false, defined: [] }]]) {
+    f.parent(id); f.control({ labels: ['unrelated'], ...patch }); const n = f.calls().length, { task, result } = f.start(id);
+    assert.equal(task.state, 'working'); assert.equal(f.warnings(result).length, 1, result.out);
+    assert.ok(f.calls().slice(n).every(c => c.saved === 'working'));
+    const r = f.done(task, 'APPROVE'); assert.equal(r.code, 0, r.out); assert.equal(f.task(task.id).state, 'reported'); assert.equal(f.warnings(r).length, 1, r.out);
+    if (id === 'opt-out' || id === 'variables') assert.ok(!f.calls().slice(n).some(c => ['POST', 'DELETE'].includes(c.method)));
+    if (id === 'definition') assert.ok(!f.calls().slice(n).some(c => c.method === 'POST'), 'Missing definitions are never created');
+  }
+  f.control({ enabled: '', variablesDenied: false, defined: [f.under, f.approved, f.changes] }); f.parent('late-opt-out'); const opted = f.start('late-opt-out').task;
+  f.control({ enabled: 'false' }); const at = f.writes().length; const optedResult = f.done(opted, 'APPROVE'); assert.equal(optedResult.code, 0); assert.equal(f.warnings(optedResult).length, 1); assert.equal(f.writes().length, at); assert.ok(f.control().labels.includes(f.under));
+  f.control({ enabled: '' }); f.parent('partial'); const t = f.start('partial').task;
+  f.control({ defined: [f.under] }); let n = f.calls().length, r = f.done(t, 'CHANGES NEEDED'); assert.equal(r.code, 0, r.out); assert.equal(f.warnings(r).length, 1);
+  assert.deepEqual(f.control().labels, ['unrelated'], 'Under review is removed even if the verdict definition is missing');
+  assert.deepEqual(f.calls().slice(n).filter(c => c.method === 'POST'), []);
+  f.control({ defined: [f.under, f.approved, f.changes] }); f.parent('remove'); const review = f.start('remove').task;
+  f.control({ removeDenied: true, addDenied: true }); n = f.calls().length; r = f.done(review, 'APPROVE'); assert.equal(r.code, 0, r.out); assert.equal(f.warnings(r).length, 1, 'Multiple errors produce one warning line');
+  assert.equal(f.task(review.id).state, 'reported'); assert.ok(f.control().labels.includes(f.under));
+  assert.equal(f.calls().slice(n).filter(c => c.method === 'DELETE').length, 1); assert.equal(f.calls().slice(n).filter(c => c.method === 'POST').length, 1);
+  f.control({ addDenied: false, enabled: 'true', labels: ['unrelated', f.approved, f.changes] }); f.parent('old-verdict'); const failedSwap = f.start('old-verdict'); assert.equal(f.warnings(failedSwap.result).length, 1); assert.equal(failedSwap.task.state, 'working');
+  f.control({ removeDenied: false }); n = f.calls().length; assert.equal(f.call(['start']).code, 0); assert.equal(f.calls().length, n, 'No retry after failure');
+};
+
 try {
   const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
   for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { await test(); console.log(`PASS: gap ${name}`); }

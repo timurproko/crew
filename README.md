@@ -298,6 +298,27 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
 For every kind, first land requires a reported worker, an existing copy, and clean tracked
 and untracked files, even when it only records a link. An already-landed PR can return early.
 
+### Advisory review labels
+
+After saving a launched reviewer, `crew review` best-effort adds `🤖 Under review` to its
+implementation PR and removes existing `🤖 Approved` / `🤖 Changes needed` labels. After
+saving `crew done`, an exact first-line `APPROVE` or `CHANGES NEEDED` removes Under review
+and adds the matching verdict label. Malformed or missing reports cause no label change.
+Workflow, gate and plain projects use the same hooks; Plan reports and plain branches
+without a PR at review time are skipped. Status remains read-only.
+
+All three definitions belong to the shared workflow; crew never creates or redefines them.
+It uses signed-in `gh`, repository-variable read access and sufficient label-write access.
+`DELIVERY_LABELS_ENABLED=false` opts out (case-insensitive, no whitespace trimming). Any
+failure prints one warning line without changing task state or exit status. A missing verdict
+definition skips that addition but still removes Under review. Each write is attempted once;
+there are no retries, locks, label-state files, overlap tracking or lifecycle cleanup.
+
+A crashed/stopped reviewer or failed removal leaves Under review until the shared workflow
+clears it on merge/close or a person removes it. With two reviewers, the first verdict removes
+Under review while the other may still be running. Swaps are best effort, not atomic; verdict
+labels remain as a record after merge/close. Labels never gate delivery or imply GitHub approval.
+
 ## Companion tools
 
 crew runs without any of them and uses each one that is installed. `crew tools` lists them
@@ -305,7 +326,7 @@ with their versions; the Herdr plugin installs them (Settings > Plugins > Crew).
 
 | Tool | What crew does with it |
 | --- | --- |
-| `gh` | `crew land` opens the pull request with it. |
+| `gh` | Opens pull requests at land; swaps advisory labels after review launch and verdict reporting. |
 | `gh-axi`, `chrome-devtools-axi`, `jq` | A worker's brief names the ones on the machine (GitHub, browser, JSON). |
 | `lavish-axi` | The coordinator's rules say when to use it: showing a decision or long report as a page. |
 | `quota-axi` | Crew reads it, unchanged, when it chooses who works (see "Who does the work"): one ordinary reading for the machine's own logins, and one `--profile-only` reading per saved Claude account. |
