@@ -81,8 +81,9 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
 ## How it works
 
 - **Owner.** `crew start` records the calling Core terminal as the home's owner. Another
-  session is refused and may only read while Core says that terminal is live; when it is
-  gone, the next `start` takes over and is told which tasks were left unfinished.
+  session cannot control work while Core says that terminal is live, but may inspect or
+  register projects. When it is gone, the next `start` takes over and is told which tasks
+  were left unfinished. Refusals identify the crew home and its terminal, not a busy project folder.
 - **Spawn.** Where the shared delivery workflow is installed, `delivery start` makes the copy and decides between a reused pool slot and a new folder (`<project>/.worktrees/<id>`); crew does not know which. Otherwise `git worktree add` (detached for `scout`, a new branch `<type>/<id>` for `ship`, where `--type` is `feature` (default), `fix`, `refactor`, `docs`, `test`, `chore` or `style`, as the shared delivery workflow names branches),
   a brief file, then one `hc run` with labels `crew.task`, `crew.home` and the Herdr
   space/tab labels. The agent starts with one instruction as its command-line argument
@@ -95,6 +96,47 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
   its integration API (`session.exit`, proven by `session-unavailable`); other agents are
   closed once idle. The terminal is removed; the copy's return can be postponed. The report
   stays, as do ship branches not proved merged.
+
+## Project registration
+
+`crew project add` and `crew project remove` work from Settings or any local session,
+without a coordinator terminal or home ownership. They never transfer ownership: spawning,
+stopping, finishing and backlog changes still belong to the owning coordinator. The owner
+sees a successful registration on its next command, without restarting its agent.
+
+Registry edits use a short per-home transaction, rereading `crew.json` before atomic
+replacement. On Windows, transient replacement/sharing errors retry for up to one second
+while retaining the lock and temporary file; the destination is never deleted first.
+The first `preparing` task record uses the same lock, so concurrent edits
+cannot lose unrelated registrations or remove/repoint a project between lookup and spawn.
+Removal and `--replace` still refuse unfinished tasks and finished tasks with copies waiting
+to return; changing a path also requires `--replace`. Unreadable task references fail closed.
+
+Project names use 1–40 lowercase ASCII letters, digits, dashes and dots, starting with a
+letter or digit, with no consecutive dots or trailing dot. For example:
+
+```bash
+crew project add agentnumberone.dev D:/Git/agentnumberone.dev
+crew spawn inspect-site --project agentnumberone.dev "Inspect the site."
+```
+
+Invalid names explain the violated rule instead of printing only usage. Project names are
+not task IDs: branches and plain working copies still use task IDs (`feature/inspect-site`,
+for example), and delivery chooses its own copy or pool folder. Dots are never changed to dashes.
+
+The separate Herdr plugin needs a follow-up to preserve dots when deriving a name from a
+folder, accept dotted names in its `project list` parser, and update its naming text/tests.
+Its quoted `node <tool>/crew.mjs project add <name> <folder>` and remove-by-ID calls need no
+ownership workaround. It already displays crew's errors (sometimes prefixed with the chosen
+folder). Until that app update, Settings may derive `agentnumberone-dev` or hide a CLI-added
+`agentnumberone.dev`. Existing registrations are not automatically renamed. No Herdr files
+are changed by this crew update.
+
+All participating commands must use the updated tool; legacy binaries or direct file edits
+cannot honor this protocol. Lock contention waits up to two seconds and names
+`<crew home>/projects.lock` on refusal. An interrupted transaction can leave that lock behind:
+retry first, and remove it only after confirming that no process is still using it. Crew
+never steals a lock based on its age or a guessed-dead PID. Registry format stays version 1.
 
 ## Agents
 
