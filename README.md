@@ -307,10 +307,13 @@ For a plain project whose PR opens only at `crew land`, there is no PR to label 
 time; crew says so and still reviews the branch.
 
 The exact label is U+1F916, one space, then `Under review`, color `840479`, with an empty
-description. Its definition belongs to the shared delivery workflow: the person enables
-shared labels and syncs the definition before rollout. Crew never creates or redefines it.
-Crew uses the ordinary signed-in `gh` credential, with repository access and Pull requests
-write or another sufficient existing label-write grant, never an App key. Missing definitions,
+description. Its definition belongs to the shared delivery workflow, which syncs the base
+palette by default. Crew never creates or redefines it. `DELIVERY_LABELS_ENABLED=false` on
+the repository opts out of both add and removal (case-insensitive, without trimming spaces);
+unset, empty and other values remain enabled. Crew checks the repository variables before
+label writes; unreadable enablement warns and defers signaling without blocking review.
+Crew uses the ordinary signed-in `gh` credential, with repository-variable read access and
+Pull requests write or another sufficient existing label-write grant, never an App key. Missing definitions,
 permissions or network errors produce visible warnings without preventing review. This is
 activity only, not a GitHub approval or a readiness/merge gate; absence proves nothing.
 
@@ -339,7 +342,10 @@ when its process is proved dead; an uncertain local lock is reported, never stol
 Missing, corrupt or unwritable local signaling metadata is reported but cannot prevent a
 reviewer's completion or alter wait, stop, finish or land outcomes. Completion identity lives
 in the task record independently of advisory metadata; older tasks retain terminal ownership
-checks. A follow-up to an ended attempt starts fresh signaling in the same reviewer session.
+checks. A follow-up to an ended attempt starts fresh signaling in the same reviewer session
+with a fresh recovery interval, rather than inheriting an expired abandonment reminder.
+Completion and closure are saved before label cleanup, so slow signaling cannot overwrite
+a replacement's task state.
 
 ## Companion tools
 

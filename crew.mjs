@@ -1137,6 +1137,8 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
 // the next candidate of its chain, which is told to go on from what is already there.
 // Returns the new pick, or null with `why` when nobody else can take the task.
 function relaunch(h, task, reason, flags = null) {
+  task = loadTask(h, task.id);
+  if (!['working', 'stopped', 'failed'].includes(task.state)) return { pick: null, why: `task is now ${task.state}` };
   const before = task.launch ?? { harness: task.agent }, tried = new Set([...(task.tried ?? []), pickKey(before)]);
   const role = roleOf(task), named = flags && [...PICK_FLAGS, 'no-fallback'].some(key => flags[key] !== undefined);
   const config = dispatchConfig(h);
@@ -1159,9 +1161,14 @@ function relaunch(h, task, reason, flags = null) {
   }
   if (task.reviews) {
     endReviewSignal(h, task);
-    const attempt = beginReviewSignal(h, task);
-    task = { ...task, reviewAttempt: attempt, reviewSessionAttempt: attempt, terminal: null, state: 'preparing' };
+    const latest = loadTask(h, task.id);
+    if (latest.reviewAttempt !== task.reviewAttempt || latest.terminal !== task.terminal || !['working', 'stopped', 'failed'].includes(latest.state)) return { pick: null, why: `task changed during review cleanup (${latest.state})` };
+    const attempt = randomUUID();
+    task = { ...latest, reviewAttempt: attempt, reviewSessionAttempt: attempt, terminal: null, state: 'preparing' };
     saveTask(h, task);
+    beginReviewSignal(h, task, null, attempt, attempt);
+    const prepared = loadTask(h, task.id);
+    if (prepared.reviewAttempt !== attempt || prepared.state !== 'preparing') return { pick: null, why: 'task changed before replacement launch' };
   }
   const instruction = `Read the brief at ${task.brief} and carry it out exactly. Another worker (${pickLabel(before)}) began this task and had to stop: ${reason}. What it did is already in this working copy: look at \`git status\` and \`git log\`, and at ${task.report} if it exists, then continue from there instead of starting again.`;
   let started;
@@ -1169,8 +1176,8 @@ function relaunch(h, task, reason, flags = null) {
   catch (error) { endReviewSignal(h, task); throw error; }
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
+    saveTask(h, { ...loadTask(h, task.id), state: 'failed', terminal: null, error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
     endReviewSignal(h, task);
-    saveTask(h, { ...task, state: 'failed', terminal: null, error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
     refuse(`Core did not start the next worker for ${task.id}: ${JSON.stringify(started.value)}. Its working copy is kept: ${task.worktree}`, 5);
   }
   const current = loadTask(h, task.id);
@@ -1267,10 +1274,10 @@ function cmdRelaunch(args) {
   const { flags, rest } = takeFlags(args, PICK_FLAGS, ['no-fallback']);
   const [id, ...words] = rest;
   if (!id) refuse(`Usage: crew relaunch <id> ${PICK_USAGE} ["<why>"]`);
+  reconcileReviewSignals(h);
   const task = loadTask(h, id);
   if (!['working', 'stopped', 'failed'].includes(task.state)) refuse(`Task ${id} is ${task.state}; only unfinished work is handed to another agent.`);
   if (!fs.existsSync(task.worktree)) refuse(`Task ${id} has no working copy any more (${task.worktree}); spawn a new task instead.`, 6);
-  reconcileReviewSignals(h);
   const moved = relaunch(h, task, words.join(' ').trim() || 'the coordinator handed the task over', flags);
   if (!moved.pick) refuse(`Task ${id} was not handed over: ${moved.why}`, 8);
   console.log(`relaunched ${id}: ${pickLabel(moved.pick)} in terminal ${moved.address}${moved.rest.length ? `, ${moved.rest.length} more can take over` : ''}; next: crew wait ${id}`);
@@ -1287,10 +1294,14 @@ function cmdDone(args) {
   // without this field retain the terminal check above; absent/corrupt signals never gate done.
   if (task.reviews && task.reviewSessionAttempt && process.env.CREW_REVIEW_ATTEMPT && process.env.CREW_REVIEW_ATTEMPT !== task.reviewSessionAttempt) refuse(`Task ${id} has a newer review attempt; this report belongs to the old reviewer.`, 3);
   if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
-  // A completion attempt ends reviewing activity even if its report is malformed or absent.
-  endReviewSignal(h, task);
-  if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
+  // Commit completion before advisory I/O: a slow cleanup must never write an old task
+  // snapshot over a replacement. Failed reports still release activity without a later save.
+  if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) {
+    endReviewSignal(h, task);
+    refuse(`Write your result to ${task.report} first.`);
+  }
   saveTask(h, { ...task, state: 'reported', reported: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
+  endReviewSignal(h, task);
   console.log(`reported ${id}. You are finished; stop here.`);
 }
 
@@ -1455,11 +1466,11 @@ function cmdStop(args) {
   requireOwner(h, 'stop work');
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   if (!id) refuse('Usage: crew stop <id> [--force]');
-  const task = loadTask(h, id);
   reconcileReviewSignals(h);
+  const task = loadTask(h, id);
   const result = stopWorker(task, { force });
-  if (result.stopped) endReviewSignal(h, task);
   if (result.stopped && task.state !== 'closed') saveTask(h, { ...loadTask(h, id), state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now() });
+  if (result.stopped) endReviewSignal(h, task);
   console.log(`${result.stopped ? 'stopped' : 'not stopped'} ${id}: ${result.how}`);
   if (!result.stopped) process.exitCode = 6;
 }
@@ -1721,7 +1732,19 @@ function removeStoppedTerminal(task) {
 // and not over work written or marked in it since finish, unless the person asks for that
 // now (`crew finish <id> --force` on the closed task). A --force given at finish covered only
 // what was there then. { state: returned | gone | held | silent | kept | failed, line }.
-function returnWaiting(h, task, { force = false } = {}) {
+function returnWaiting(h, task, options = {}) {
+  // A preceding copy's advisory cleanup may have yielded to another command.
+  task = loadTask(h, task.id);
+  try {
+    if (!task.copyToReturn) return { state: 'gone', line: `the working copy of ${task.id} was already returned` };
+    return returnWaitingState(h, task, options);
+  }
+  finally {
+    const latest = loadTask(h, task.id);
+    if (latest.state === 'closed' && !latest.copyToReturn?.stopPending) endReviewSignal(h, latest);
+  }
+}
+function returnWaitingState(h, task, { force = false } = {}) {
   const { copyToReturn, ...rest } = task, project = projectOf(h, task);
   // A new explicit force accepts what is here now, not work written during the stop/removal
   // it is about to retry. Keep the original durable baseline if more work appears meanwhile.
@@ -1732,7 +1755,6 @@ function returnWaiting(h, task, { force = false } = {}) {
     try {
       const result = stopWorker(task, { force });
       if (!result.stopped) return { state: 'held', line: `The working copy of ${task.id} is kept: its worker stop is not confirmed (${result.how}). The next crew finish or crew start retries it.` };
-      endReviewSignal(h, task);
       copyToReturn.stopPending = false;
       saveTask(h, task);
     } catch (error) {
@@ -1768,10 +1790,9 @@ function cmdFinish(args) {
   requireOwner(h, 'finish work');
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   if (!id) refuse('Usage: crew finish <id> [--force]');
-  const task = loadTask(h, id);
   reconcileReviewSignals(h);
+  const task = loadTask(h, id);
   if (task.state === 'closed') {
-    if (!task.copyToReturn?.stopPending) endReviewSignal(h, task);
     // A closed task whose copy still waits: --force is the person's word to discard what was
     // found in it and return it now. A terminal in it still keeps it, forced or not.
     if (task.copyToReturn && force) {
@@ -1784,6 +1805,8 @@ function cmdFinish(args) {
       console.log(back.state === 'returned' || back.state === 'gone' ? `${id} is already closed; ${back.line}` : `${id} is already closed; its working copy still waits to be returned: ${back.line}`);
     } else console.log(`${id} is already closed`);
     returnWaitingCopies(h, { skip: id });
+    const latest = loadTask(h, id);
+    if (!latest.copyToReturn?.stopPending) endReviewSignal(h, latest);
     return;
   }
   // Somebody else's terminal in the copy is never ended with it, forced or not: the copy then
@@ -1805,7 +1828,6 @@ function cmdFinish(args) {
     result = { stopped: false, how: error.message };
   }
   if (!result.stopped && !attempted) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
-  if (result.stopped) endReviewSignal(h, task);
   const project = projectOf(h, task);
   const forget = () => (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) && forgetClaudeFolder(task.worktree);
   const closed = { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state };
@@ -1836,6 +1858,7 @@ function cmdFinish(args) {
   // A legacy treehouse task moves its scout's item even after a review, as it always did.
   if (task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews)) backlogMove(h, id, 'done');
   returnWaitingCopies(h, { skip: id });
+  if (result.stopped) endReviewSignal(h, task);
 }
 
 // --- follow-ups, review and delivery ------------------------------------------------
@@ -1854,13 +1877,22 @@ function cmdTell(args) {
   const text = `Message from the coordinator about task ${id}: ${message}\nWhen you have dealt with it, rewrite ${task.report} so it holds the complete, current result, then run \`crew done ${id}\` again and stop.`;
   // The task is open again BEFORE the message goes out, so a fast worker's new report is
   // never overwritten by this command.
-  const attempt = task.reviews && (task.state === 'reported' || reviewSignalNeedsResume(h, task))
-    ? beginReviewSignal(h, task, null, task.reviewSessionAttempt ?? task.reviewAttempt) : task.reviewAttempt;
-  saveTask(h, { ...task, ...(attempt ? { reviewAttempt: attempt } : {}), state: 'working', told: now(), tells: (task.tells ?? 0) + 1 });
-  const sent = hc(['send', task.terminal, text]);
+  const resume = task.reviews && (task.state === 'reported' || reviewSignalNeedsResume(h, task));
+  const attempt = resume ? randomUUID() : task.reviewAttempt, tells = (task.tells ?? 0) + 1;
+  saveTask(h, { ...task, ...(attempt ? { reviewAttempt: attempt } : {}), ...(resume ? { recovery: undefined } : {}), state: 'working', told: now(), tells });
+  if (resume) beginReviewSignal(h, task, null, task.reviewSessionAttempt ?? task.reviewAttempt, attempt);
+  // Label I/O may have allowed completion or replacement. Never send or roll back using
+  // the pre-I/O task snapshot after another generation or follow-up took over.
+  const current = loadTask(h, id);
+  if (current.terminal !== task.terminal || current.reviewAttempt !== attempt || current.tells !== tells || current.state !== 'working') {
+    if (resume) endReviewSignal(h, { reviewAttempt: attempt });
+    refuse(`Task ${id} changed before the follow-up could be sent; inspect its current report and terminal.`, 6);
+  }
+  const sent = hc(['send', current.terminal, text]);
   if (sent.code !== 0) {
-    if (attempt && attempt !== task.reviewAttempt) endReviewSignal(h, { reviewAttempt: attempt });
-    saveTask(h, { ...loadTask(h, id), state: task.state, ...(task.reviews ? { reviewAttempt: task.reviewAttempt } : {}) });
+    const latest = loadTask(h, id);
+    if (latest.terminal === task.terminal && latest.reviewAttempt === attempt && latest.tells === tells && latest.state === 'working') saveTask(h, { ...latest, state: task.state, ...(task.reviews ? { reviewAttempt: task.reviewAttempt, recovery: task.recovery } : {}) });
+    if (resume) endReviewSignal(h, { reviewAttempt: attempt });
     refuse(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
   }
   console.log(`told ${id}; next: crew wait ${id}`);
@@ -1959,6 +1991,13 @@ function syncReviewTarget(h, target) {
   // Every intent is saved before a write. If the command disappears after the HTTP request,
   // recovery repeats it idempotently, deriving the operation from current ownership.
   for (const s of signals) writeJson(signalFile(h, s.attempt), { ...s, pending: true });
+  // Default enabled, explicit case-insensitive false opts out (without trimming). Read
+  // all variable pages so an absent setting is distinct from a failed permission check.
+  const settings = reviewApi(target, 'GET', 'actions/variables', ['--paginate', '--slurp']);
+  let pages; try { pages = JSON.parse(settings.stdout); } catch { /* reported below */ }
+  if (settings.code !== 0 || !Array.isArray(pages) || !pages.length || pages.some(p => !Array.isArray(p?.variables) || p.variables.some(v => typeof v.name !== 'string' || typeof v.value !== 'string'))) throw new Error(`${active ? 'add' : 'cleanup'} failed: cannot read repository label enablement on ${target.repo}; no label writes (${lastLine(settings.stderr) || 'invalid variables response'})`);
+  const setting = pages.flatMap(p => p.variables).find(v => v.name === 'DELIVERY_LABELS_ENABLED');
+  if (setting?.value.toLowerCase() === 'false') throw new Error(`${target.repo} opted out with DELIVERY_LABELS_ENABLED=false; no label writes`);
   let result;
   if (active) {
     const defined = reviewApi(target, 'GET', `labels/${encodeURIComponent(REVIEW_LABEL)}`);
@@ -1990,8 +2029,7 @@ function syncReviewSignal(h, attempt) {
     });
   } catch (error) { reviewWarning(error.message); }
 }
-function beginReviewSignal(h, task, resolved = null, sessionAttempt = null) {
-  const attempt = randomUUID();
+function beginReviewSignal(h, task, resolved = null, sessionAttempt = null, attempt = randomUUID()) {
   try {
     const found = resolved ?? reviewTarget(loadTask(h, task.reviews));
     fs.mkdirSync(reviewSignalsDir(h), { recursive: true });
@@ -2089,10 +2127,10 @@ function cmdReview(args) {
   const id = rest[0];
   if (!id) refuse(`Usage: crew review <id> ${PICK_USAGE}`);
   if (flags.agent !== undefined && !AGENTS[flags.agent]) refuse(`Unknown agent: ${flags.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
+  reconcileReviewSignals(h);
   const task = loadTask(h, id);
   if (task.kind !== 'ship' || task.selfFix) refuse(`Task ${id} is not a ship task of a project; only those have a branch to review.`);
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; review it after its worker reported.`);
-  reconcileReviewSignals(h);
   const project = registeredProject(h, task.project) ?? refuse(`Unknown project: ${task.project}.`);
   const opts = { kind: 'scout', project: task.project };
   // Without a choice and without a review chain in the configuration: CREW_REVIEW_AGENT, else the author's agent.
@@ -2155,10 +2193,10 @@ function cmdLand(args) {
   for (let i = 0; i < args.length; i++) { if (args[i] === '--title') title = args[++i]; else rest.push(args[i]); }
   const id = rest[0];
   if (!id) refuse('Usage: crew land <id> [--title "<pull request title>"]');
+  reconcileReviewSignals(h);
   const task = loadTask(h, id);
   if (task.selfFix) refuse(`Task ${id} repairs crew itself; deliver it with \`crew selfrepair ${id}\`.`);
   if (task.kind !== 'ship') refuse(`Task ${id} is a scout; it has a report, not a branch.`);
-  reconcileReviewSignals(h);
   // A workflow task's link is recorded already when its worker reports; it lands only once.
   if (task.pr && (task.landed || !task.workflow)) { console.log(`${id} already has a pull request: ${task.pr}`); return; }
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; it is delivered only after its worker reported.`);

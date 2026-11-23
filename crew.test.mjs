@@ -1145,8 +1145,9 @@ const fail = text => { console.error(text); process.exit(1); };
 if(a[0]==='auth') { console.log('fake-token'); process.exit(0); }
 if(a[0]==='pr' && a[1]==='view') { if(s.lookupError) fail('network unavailable'); if(!s.pr) fail('no pull requests found for branch'); console.log(${JSON.stringify(url)}); process.exit(0); }
 if(a[0]!=='api') fail('unexpected fake command');
-if(s.slowDelete && method==='DELETE') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,300);
+if(s.slowDelete && method==='DELETE') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,typeof s.slowDelete==='number' ? s.slowDelete : 300);
 if(s.inaccessible) fail('HTTP 404: Not Found');
+if(endpoint.endsWith('/actions/variables')) { if(s.variablesDenied) fail('HTTP 403: variables denied'); if(s.badVariables) { console.log('{}'); process.exit(0); } const variables=s.labelsEnabled===undefined ? [] : [{name:'DELIVERY_LABELS_ENABLED',value:s.labelsEnabled}]; console.log(JSON.stringify([{variables:[]},{variables}])); process.exit(0); }
 if(endpoint.includes('/labels/') && method==='GET') { if(!s.defined) fail('HTTP 404: label missing'); console.log(JSON.stringify({name:label,color:'840479',description:''})); }
 else if(method==='POST') { if(s.addDenied) fail('HTTP 403: denied'); if(!s.defined) fail('must not create missing definition'); if(!s.labels.includes(label)) s.labels.push(label); fs.writeFileSync(file,JSON.stringify(s)); if(s.ambiguousAdd) fail('connection lost after write'); console.log(JSON.stringify(s.labels.map(name=>({name})))); }
 else if(method==='DELETE') { if(s.removeDenied) fail('HTTP 403: denied'); if(!s.labels.includes(label)) fail('HTTP 404: label absent'); s.labels=s.labels.filter(n=>n!==label); fs.writeFileSync(file,JSON.stringify(s)); console.log('{}'); }
@@ -1368,6 +1369,10 @@ gapTests['review-label-observations'] = () => {
   setTerminal(t.terminal, { sendError: false });
   r = f.call(['tell', t.id, 'Continue reviewing']); assert.equal(r.code, 0, r.out);
   const resumed = f.task(t.id); assert.notEqual(resumed.reviewAttempt, t.reviewAttempt); assert.equal(resumed.reviewSessionAttempt, t.reviewSessionAttempt);
+  assert.equal(resumed.recovery, undefined, 'A resumed reviewer must not inherit the expired abandonment timer');
+  r = f.call(['wait', t.id, '--timeout', '1.2'], { CREW_RECOVERY_SECONDS: '1' }); assert.equal(r.code, 124, r.out);
+  assert.equal(f.task(t.id).recovery?.idleNudged, undefined, 'A fresh idle interval must precede a new reminder');
+  assert.ok(f.state().labels.includes(f.label), 'Tell followed by wait keeps the resumed review labeled during its fresh interval');
   r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label), 'Successful tell resumes abandoned activity before recovery');
   r = f.call(['tell', t.id, 'Keep reviewing']); assert.equal(r.code, 0, r.out); assert.equal(f.task(t.id).reviewAttempt, resumed.reviewAttempt, 'An active reviewer keeps its attempt');
   fs.writeFileSync(t.report, 'APPROVE'); r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewSessionAttempt }); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
@@ -1377,6 +1382,45 @@ gapTests['review-label-observations'] = () => {
   fs.writeFileSync(replacement.report, 'APPROVE'); assert.equal(f.worker(replacement).code, 0); assert.deepEqual(f.state().labels, ['unrelated']);
 };
 
+gapTests['review-label-opt-out'] = () => {
+  const f = reviewLabelFixture('opt-out'); f.parent(); f.state({ labelsEnabled: 'FaLsE' });
+  const t = f.start(); assert.deepEqual(f.state().labels, ['unrelated']);
+  assert.ok(!f.calls().some(c => ['POST', 'DELETE'].includes(c.method)), 'Existing definitions do not override opt-out');
+  let r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.match(r.out, /opted out/);
+  assert.ok(f.records().find(s => s.attempt === t.reviewAttempt).pending);
+  f.state({ labelsEnabled: 'true' }); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
+  f.state({ labelsEnabled: 'false' }); const n = f.calls().length; fs.writeFileSync(t.report, 'APPROVE');
+  r = f.worker(t); assert.equal(r.code, 0, r.out); assert.match(r.out, /opted out/); assert.ok(f.state().labels.includes(f.label));
+  r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out);
+  r = f.call(['land', 'ship']); assert.equal(r.code, 6, r.out); // ordinary plain-project missing-origin refusal
+  assert.ok(!f.calls().slice(n).some(c => ['POST', 'DELETE'].includes(c.method)), 'Cleanup and parent recovery also honor opt-out');
+  f.state({ labelsEnabled: '' }); r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Empty value re-enables pending cleanup');
+  for (const [id, setting] of [['unset', undefined], ['space', ' false '], ['other', 'anything']]) {
+    f.parent(id); f.state({ labelsEnabled: setting }); const review = f.start(id); assert.ok(f.state().labels.includes(f.label));
+    fs.writeFileSync(review.report, 'APPROVE'); assert.equal(f.worker(review).code, 0); assert.deepEqual(f.state().labels, ['unrelated']);
+  }
+  for (const [id, patch] of [['denied', { variablesDenied: true }], ['malformed', { variablesDenied: false, badVariables: true }]]) {
+    f.parent(id); f.state(patch); const before = f.calls().length; const review = f.start(id);
+    assert.ok(!f.calls().slice(before).some(c => ['POST', 'DELETE'].includes(c.method)), 'Unreadable enablement warns and defers writes, not review');
+    fs.writeFileSync(review.report, 'CHANGES NEEDED'); assert.equal(f.worker(review).code, 0);
+  }
+};
+gapTests['review-label-done-relaunch'] = async () => {
+  const f = reviewLabelFixture('done-relaunch'); f.parent(); const old = f.start(); fs.writeFileSync(old.report, 'APPROVE'); f.state({ slowDelete: 5000 });
+  const child = spawn(process.execPath, [path.join(here, 'crew.mjs'), 'done', old.id], { cwd: f.home, env: { ...process.env, ...f.env, CREW_HOME: f.home, CREW_TERMINAL: old.terminal, CREW_REVIEW_ATTEMPT: old.reviewSessionAttempt } });
+  let output = ''; child.stdout.on('data', b => output += b); child.stderr.on('data', b => output += b);
+  const ended = new Promise(resolve => child.on('close', code => resolve(code)));
+  const deadline = Date.now() + 10000;
+  while (!f.calls().some(c => c.method === 'DELETE') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(f.calls().some(c => c.method === 'DELETE'), 'Wait until old done is inside delayed cleanup');
+  assert.equal(f.task(old.id).state, 'reported', 'Completion is committed before five-second advisory I/O');
+  const r = f.call(['relaunch', old.id, '--agent', 'claude']); assert.equal(r.code, 2, r.out);
+  assert.equal(await ended, 0, output);
+  assert.equal(f.task(old.id).reviewAttempt, old.reviewAttempt); assert.equal(f.task(old.id).terminal, old.terminal);
+  assert.equal(f.task(old.id).state, 'reported', 'Relaunch cannot replace a completion already committed before cleanup');
+  f.state({ slowDelete: false }); const next = f.start();
+  assert.equal(f.call(['start']).code, 0); assert.ok(f.state().labels.includes(f.label)); assert.equal(f.task(next.id).state, 'working');
+};
 gapTests['review-label-concurrent'] = async () => {
   const f = reviewLabelFixture('concurrent'); f.parent(); const old = f.start(); fs.writeFileSync(old.report, 'APPROVE'); f.state({ slowDelete: true });
   const child = spawn(process.execPath, [path.join(here, 'crew.mjs'), 'done', old.id], { cwd: f.home, env: { ...process.env, ...f.env, CREW_HOME: f.home, CREW_TERMINAL: old.terminal } });
@@ -1820,6 +1864,11 @@ const a = process.argv.slice(2), file = ${JSON.stringify(ghLog)}, log = JSON.par
 log.push({ a, body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : null }); fs.writeFileSync(file, JSON.stringify(log));
 if (a[0] === 'auth') process.exit(1);
 if (fs.existsSync(${JSON.stringify(ghDown)})) { console.error('gh: not signed in'); process.exit(1); }
+if (a[0] === 'api') {
+  const endpoint = a.find(v => v.startsWith('repos/'));
+  console.log(endpoint.endsWith('/actions/variables') ? JSON.stringify([{ variables: [] }]) : a[a.indexOf('--method') + 1] === 'GET' ? JSON.stringify({ name: '\\u{1F916} Under review' }) : '[]');
+  process.exit(0);
+}
 if (a[0] === 'pr' && a[1] === 'list') { console.log(fs.existsSync(${JSON.stringify(ghMerged)}) ? fs.readFileSync(${JSON.stringify(ghMerged)}, 'utf8') : ''); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'view' && a.includes('isDraft,body')) { console.log(JSON.stringify({ isDraft: true, body: '## Proposal\\n\\nWhy.\\n\\n## Implementation\\n\\n- [x] The first outcome is delivered.\\n- [ ] The second outcome is delivered.\\n\\n## Acceptance\\n\\n- [ ] not an outcome\\n' })); process.exit(0); }
 console.log('https://example.invalid/acme/demo/pull/7');
