@@ -1159,7 +1159,8 @@ function relaunch(h, task, reason, flags = null) {
   }
   if (task.reviews) {
     endReviewSignal(h, task);
-    task = { ...task, reviewAttempt: beginReviewSignal(h, task), terminal: null, state: 'preparing' };
+    const attempt = beginReviewSignal(h, task);
+    task = { ...task, reviewAttempt: attempt, reviewSessionAttempt: attempt, terminal: null, state: 'preparing' };
     saveTask(h, task);
   }
   const instruction = `Read the brief at ${task.brief} and carry it out exactly. Another worker (${pickLabel(before)}) began this task and had to stop: ${reason}. What it did is already in this working copy: look at \`git status\` and \`git log\`, and at ${task.report} if it exists, then continue from there instead of starting again.`;
@@ -1282,7 +1283,9 @@ function cmdDone(args) {
   const task = loadTask(h, id);
   const mine = me();
   if (task.terminal && mine && task.terminal !== mine) refuse(`Task ${id} belongs to terminal ${task.terminal}, not this one.`, 3);
-  if (task.reviews && process.env.CREW_REVIEW_ATTEMPT && process.env.CREW_REVIEW_ATTEMPT !== readJson(signalFile(h, task.reviewAttempt))?.sessionAttempt) refuse(`Task ${id} has a newer review attempt; this report belongs to the old reviewer.`, 3);
+  // Completion identity belongs to the task, not best-effort label storage. Legacy tasks
+  // without this field retain the terminal check above; absent/corrupt signals never gate done.
+  if (task.reviews && task.reviewSessionAttempt && process.env.CREW_REVIEW_ATTEMPT && process.env.CREW_REVIEW_ATTEMPT !== task.reviewSessionAttempt) refuse(`Task ${id} has a newer review attempt; this report belongs to the old reviewer.`, 3);
   if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
   // A completion attempt ends reviewing activity even if its report is malformed or absent.
   endReviewSignal(h, task);
@@ -1851,7 +1854,8 @@ function cmdTell(args) {
   const text = `Message from the coordinator about task ${id}: ${message}\nWhen you have dealt with it, rewrite ${task.report} so it holds the complete, current result, then run \`crew done ${id}\` again and stop.`;
   // The task is open again BEFORE the message goes out, so a fast worker's new report is
   // never overwritten by this command.
-  const attempt = task.reviews && task.state === 'reported' ? beginReviewSignal(h, task, null, readJson(signalFile(h, task.reviewAttempt))?.sessionAttempt) : task.reviewAttempt;
+  const attempt = task.reviews && (task.state === 'reported' || reviewSignalNeedsResume(h, task))
+    ? beginReviewSignal(h, task, null, task.reviewSessionAttempt ?? task.reviewAttempt) : task.reviewAttempt;
   saveTask(h, { ...task, ...(attempt ? { reviewAttempt: attempt } : {}), state: 'working', told: now(), tells: (task.tells ?? 0) + 1 });
   const sent = hc(['send', task.terminal, text]);
   if (sent.code !== 0) {
@@ -1868,9 +1872,29 @@ const REVIEW_LABEL = '\u{1F916} Under review';
 const reviewSignalsDir = h => path.join(h.dir, 'state', 'review-labels');
 const signalFile = (h, attempt) => path.join(reviewSignalsDir(h), `${attempt}.json`);
 const signalEnded = (h, attempt) => path.join(reviewSignalsDir(h), `${attempt}.ended`);
+function validReviewSignal(s) {
+  return s && typeof s === 'object' && typeof s.attempt === 'string' && /^[a-f0-9-]{36}$/.test(s.attempt)
+    && validId(s.task) && validId(s.parent) && (!s.target || (typeof s.target.key === 'string' && typeof s.target.host === 'string' && typeof s.target.repo === 'string' && Number.isSafeInteger(s.target.pr) && s.target.pr > 0));
+}
 function reviewSignals(h) {
   const dir = reviewSignalsDir(h);
-  return fs.existsSync(dir) ? fs.readdirSync(dir).filter(n => n.endsWith('.json')).map(n => readJson(path.join(dir, n))).filter(Boolean) : [];
+  try {
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir).filter(n => n.endsWith('.json')).flatMap(n => {
+      const s = readJson(path.join(dir, n));
+      if (validReviewSignal(s) && n === `${s.attempt}.json`) return [s];
+      reviewWarning(`cannot read valid signaling metadata from ${n}`);
+      return [];
+    });
+  } catch (error) { reviewWarning(error.message); return []; }
+}
+function reviewSignalNeedsResume(h, task) {
+  // Ended ownership is independent of task state: wait can abandon an otherwise working
+  // reviewer. Missing/corrupt storage also warrants a fresh best-effort signaling attempt.
+  try {
+    if (!task.reviewAttempt || !validReviewSignal(readJson(signalFile(h, task.reviewAttempt)))) return true;
+    return fs.existsSync(signalEnded(h, task.reviewAttempt));
+  } catch (error) { reviewWarning(error.message); return true; }
 }
 function signalActive(h, s) { return !fs.existsSync(signalEnded(h, s.attempt)); }
 function reviewWarning(message) { console.error(`crew: review label: ${message}; signaling is advisory, a later acting command retries.`); }
@@ -1883,7 +1907,9 @@ function signalTarget(url) {
   } catch { return null; }
 }
 function reviewTarget(task) {
-  const first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').trim().split(/\r?\n/)[0] : '';
+  let first;
+  try { first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').trim().split(/\r?\n/)[0] : ''; }
+  catch (error) { return { error: `could not read the implementation PR report (${error.message})` }; }
   if (/^\W*plan\W*:/i.test(first) || task.stage === 'plan') return { plan: true };
   const reported = /^\W*implementation\W*:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null;
   const known = signalTarget(reported ?? task.pr);
@@ -1954,7 +1980,7 @@ function syncReviewSignal(h, attempt) {
   try {
     withReviewSignalLock(h, () => {
       const s = readJson(signalFile(h, attempt));
-      if (!s) return;
+      if (!validReviewSignal(s)) { reviewWarning(`missing or invalid signaling metadata for ${attempt}`); return; }
       try { if (s.target) syncReviewTarget(h, s.target); }
       catch (error) {
         for (const item of reviewSignals(h).filter(item => item.target?.key === s.target?.key)) writeJson(signalFile(h, item.attempt), { ...item, pending: true, error: error.message });
@@ -2084,7 +2110,7 @@ function cmdReview(args) {
   if (resolved.plan) refuse(`Task ${id} reported a plan, not an implementation; approve and implement it before review.`);
   const reviewer = { id: reviewId, reviews: id };
   reviewer.reviewAttempt = beginReviewSignal(h, reviewer, resolved);
-  try { launchWorker(h, { id: reviewId, opts, chosen, project, task: text, extra: { reviews: id, reviewAttempt: reviewer.reviewAttempt } }); }
+  try { launchWorker(h, { id: reviewId, opts, chosen, project, task: text, extra: { reviews: id, reviewAttempt: reviewer.reviewAttempt, reviewSessionAttempt: reviewer.reviewAttempt } }); }
   catch (error) { endReviewSignal(h, reviewer); throw error; }
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }

@@ -985,6 +985,48 @@ gapTests['review-label-endings'] = () => {
   r = f.call(['tell', t.id, 'Review again.']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label));
   r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewAttempt }); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
 };
+gapTests['review-label-storage-failures'] = () => {
+  // Files/directories at the wrong level exercise deterministic read/write failures on
+  // Windows and POSIX, without relying on chmod (which is ineffective under some users).
+  for (const mode of ['blocked-at-launch', 'missing', 'invalid-json', 'corrupt-session', 'unwritable-record']) {
+    const f = reviewLabelFixture(`storage-${mode}`), parent = f.parent(), dir = path.join(f.home, 'state', 'review-labels');
+    if (mode === 'blocked-at-launch') { fs.mkdirSync(path.dirname(dir), { recursive: true }); fs.writeFileSync(dir, 'not a directory'); }
+    const t = f.start(), record = path.join(dir, `${t.reviewAttempt}.json`);
+    assert.equal(t.reviewSessionAttempt, t.reviewAttempt, 'Authoritative identity is saved despite advisory storage failure');
+    assert.ok(readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1).includes(`CREW_REVIEW_ATTEMPT='${t.reviewSessionAttempt}'`));
+    if (mode === 'missing') fs.rmSync(dir, { recursive: true });
+    if (mode === 'invalid-json') fs.writeFileSync(record, '{broken');
+    if (mode === 'corrupt-session') fs.writeFileSync(record, JSON.stringify({ ...JSON.parse(fs.readFileSync(record, 'utf8')), sessionAttempt: 'not-the-current-session' }));
+    if (mode === 'unwritable-record') { fs.unlinkSync(record); fs.mkdirSync(record); }
+    setTerminal(t.terminal, { status: { app: 'pi', state: 'working' } });
+    let r = f.call(['finish', t.id]); assert.equal(r.code, 6, `${mode}: busy-worker protection is unchanged: ${r.out}`);
+    r = f.call(['wait', t.id, '--timeout', '0.05']); assert.equal(r.code, 124, `${mode}: a live worker still waits: ${r.out}`);
+    assert.equal(f.task(t.id).state, 'working');
+    setTerminal(t.terminal, { status: { app: 'pi', state: 'idle' } });
+    r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewSessionAttempt });
+    assert.equal(r.code, 2, `${mode}: ordinary missing-report refusal is unchanged: ${r.out}`);
+    assert.equal(f.task(t.id).state, 'working');
+    fs.writeFileSync(t.report, 'APPROVE');
+    r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: 'a-stale-session' }); assert.equal(r.code, 3, r.out);
+    r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewSessionAttempt }); assert.equal(r.code, 0, `${mode}: ${r.out}`);
+    assert.equal(f.task(t.id).state, 'reported');
+    r = f.call(['wait', t.id, '--timeout', '1']); assert.equal(r.code, 0, `${mode}: ${r.out}`);
+    r = f.call(['stop', t.id]); assert.equal(r.code, 0, `${mode}: ${r.out}`);
+    r = f.call(['finish', t.id]); assert.equal(r.code, 0, `${mode}: ${r.out}`); assert.equal(f.task(t.id).state, 'closed');
+    f.save({ ...f.task(parent.id), pr: f.url, landed: new Date().toISOString() });
+    r = f.call(['land', parent.id]); assert.equal(r.code, 0, `${mode}: ${r.out}`); assert.match(r.out, /already has a pull request/);
+    const n = f.calls().length;
+    const status = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), 'status', '--all', '--json'], { cwd: f.home, encoding: 'utf8', env: { ...process.env, ...f.env, CREW_HOME: f.home, CREW_TERMINAL: f.owner } });
+    assert.equal(status.status, 0, status.stderr); JSON.parse(status.stdout);
+    assert.equal(f.calls().length, n, 'Even damaged metadata must not make status call GitHub');
+  }
+  // Records created by the previous version have no authoritative session field. The
+  // current terminal remains able to report even after its advisory metadata is lost.
+  const legacy = reviewLabelFixture('storage-legacy'); legacy.parent(); const t = legacy.start();
+  const { reviewSessionAttempt, ...old } = t; legacy.save(old);
+  fs.rmSync(path.join(legacy.home, 'state', 'review-labels'), { recursive: true }); fs.writeFileSync(t.report, 'CHANGES NEEDED');
+  const r = legacy.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: reviewSessionAttempt }); assert.equal(r.code, 0, r.out);
+};
 gapTests['review-label-replacement'] = () => {
   const f = reviewLabelFixture('replacement'); f.parent(); const old = f.start();
   let n = f.calls().length, r = f.call(['relaunch', old.id, '--agent', 'claude']); assert.equal(r.code, 0, r.out);
@@ -1061,6 +1103,16 @@ gapTests['review-label-observations'] = () => {
   r = f.call(['wait', t.id, '--timeout', '2', '--no-fallback']); assert.equal(r.code, 124, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Death cleanup does not depend on worker fallback');
   f.parent('idle'); t = f.start('idle'); setTerminal(t.terminal, { status: { state: 'idle', app: 'pi' } });
   r = f.call(['wait', t.id, '--timeout', '1']); assert.equal(r.code, 7, r.out); assert.deepEqual(f.state().labels, ['unrelated'], 'Abandoned idle review ends after its existing reminder');
+  assert.equal(f.task(t.id).state, 'working');
+  setTerminal(t.terminal, { sendError: true });
+  r = f.call(['tell', t.id, 'Continue reviewing']); assert.equal(r.code, 4, r.out);
+  assert.equal(f.task(t.id).reviewAttempt, t.reviewAttempt); assert.deepEqual(f.state().labels, ['unrelated'], 'Failed follow-up restores abandoned ownership');
+  setTerminal(t.terminal, { sendError: false });
+  r = f.call(['tell', t.id, 'Continue reviewing']); assert.equal(r.code, 0, r.out);
+  const resumed = f.task(t.id); assert.notEqual(resumed.reviewAttempt, t.reviewAttempt); assert.equal(resumed.reviewSessionAttempt, t.reviewSessionAttempt);
+  r = f.call(['start']); assert.equal(r.code, 0, r.out); assert.ok(f.state().labels.includes(f.label), 'Successful tell resumes abandoned activity before recovery');
+  r = f.call(['tell', t.id, 'Keep reviewing']); assert.equal(r.code, 0, r.out); assert.equal(f.task(t.id).reviewAttempt, resumed.reviewAttempt, 'An active reviewer keeps its attempt');
+  fs.writeFileSync(t.report, 'APPROVE'); r = f.worker(t, ['done', t.id], { CREW_REVIEW_ATTEMPT: t.reviewSessionAttempt }); assert.equal(r.code, 0, r.out); assert.deepEqual(f.state().labels, ['unrelated']);
   f.parent('fallback'); t = f.start('fallback', 'a1'); f.save({ ...t, candidates: [{ harness: 'a1' }, { harness: 'pi' }], chain: [{ harness: 'pi' }] });
   r = f.call(['wait', t.id, '--timeout', '1']); assert.equal(r.code, 124, r.out); const replacement = f.task(t.id);
   assert.notEqual(replacement.reviewAttempt, t.reviewAttempt); assert.equal(replacement.agent, 'pi'); assert.ok(f.state().labels.includes(f.label));

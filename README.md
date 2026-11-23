@@ -315,7 +315,7 @@ activity only, not a GitHub approval or a readiness/merge gate; absence proves n
 
 Either review verdict ends the activity label, as does a malformed completion, a confirmed
 stop/finish or a failed launch. Relaunch hands ownership to a fresh attempt; telling a
-reported reviewer to review again resumes signaling. With two local reviewers on one PR,
+reported or abandoned reviewer to review again resumes signaling. With two local reviewers on one PR,
 the label stays until the last ends. Old cleanup cannot clear a newer local review's label.
 These guarantees cover one crew home only: independent runners must avoid overlapping
 ownership on the same PR. Unrelated labels are never replaced or removed.
@@ -327,7 +327,7 @@ existing age guard and consecutive-observation requirement. Failed cleanup remai
 even if the reviewer is already closed or the parent already landed. Confirmed absence of
 the assignment is success; an inaccessible PR is not. `crew status` only displays stored
 pending state (`reviewLabel.operation` and `error` in JSON; use `--all` for closed tasks):
-it performs no label recovery, GitHub requests or metadata writes, even for the owner.
+it performs no label recovery, GitHub label requests or metadata writes, even for the owner.
 
 There is no background watcher or expiry. If the entire runner is offline, an open PR's
 label can remain until an acting command observes recovery or a person removes it. The
@@ -335,6 +335,10 @@ shared workflow's independent enabled close-event cleanup is an external fallbac
 crew's liveness detector. Rolling back to an older crew can likewise leave an assignment
 until resumed recovery or external cleanup. Interrupted local signaling is retried only
 when its process is proved dead; an uncertain local lock is reported, never stolen.
+Missing, corrupt or unwritable local signaling metadata is reported but cannot prevent a
+reviewer's completion or alter wait, stop, finish or land outcomes. Completion identity lives
+in the task record independently of advisory metadata; older tasks retain terminal ownership
+checks. A follow-up to an ended attempt starts fresh signaling in the same reviewer session.
 
 ## Companion tools
 
