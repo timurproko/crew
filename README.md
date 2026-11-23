@@ -255,6 +255,22 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
 For every kind, first land requires a reported worker, an existing copy, and clean tracked
 and untracked files, even when it only records a link. An already-landed PR can return early.
 
+### Advisory review activity on GitHub
+
+When an implementation PR already exists, `crew review` adds `🤖 Under review` before
+launching its reviewer, including on a draft or pending-CI PR. This works for workflow,
+gate and plain projects alike. A `Plan:` report is not an implementation review target.
+For a plain project whose PR opens only at `crew land`, there is no PR to label at review
+time; crew says so and still reviews the branch.
+
+The exact label is U+1F916, one space, then `Under review`, color `840479`, with an empty
+description. Its definition belongs to the shared delivery workflow: the person enables
+shared labels and syncs the definition before rollout. Crew never creates or redefines it.
+Crew uses the ordinary signed-in `gh` credential, with repository access and Pull requests
+write or another sufficient existing label-write grant, never an App key. Missing definitions,
+permissions or network errors produce visible warnings without preventing review. This is
+activity only, not a GitHub approval or a readiness/merge gate; absence proves nothing.
+
 ## Companion tools
 
 crew runs without any of them and uses each one that is installed. `crew tools` lists them

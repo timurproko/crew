@@ -6,7 +6,7 @@
 // short process talking to Core through `hc`; there is no watcher, no hook and no
 // background service. See README.md for the design and its limits.
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1755,6 +1755,124 @@ function cmdTell(args) {
   console.log(`told ${id}; next: crew wait ${id}`);
 }
 
+// Advisory review signaling. Attempt files outlive the copy and are independent of task
+// saves: a slow launch must not overwrite a fast done, or resurrect an ended attempt.
+const REVIEW_LABEL = '\u{1F916} Under review';
+const reviewSignalsDir = h => path.join(h.dir, 'state', 'review-labels');
+const signalFile = (h, attempt) => path.join(reviewSignalsDir(h), `${attempt}.json`);
+const signalEnded = (h, attempt) => path.join(reviewSignalsDir(h), `${attempt}.ended`);
+function reviewSignals(h) {
+  const dir = reviewSignalsDir(h);
+  return fs.existsSync(dir) ? fs.readdirSync(dir).filter(n => n.endsWith('.json')).map(n => readJson(path.join(dir, n))).filter(Boolean) : [];
+}
+function signalActive(h, s) { return !fs.existsSync(signalEnded(h, s.attempt)); }
+function reviewWarning(message) { console.error(`crew: review label: ${message}; signaling is advisory, a later acting command retries.`); }
+function signalTarget(url) {
+  try {
+    const u = new URL(url), m = /^\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(u.pathname);
+    if (u.protocol !== 'https:' || !m || u.username || u.password) return null;
+    const repo = `${m[1]}/${m[2]}`;
+    return { host: u.hostname.toLowerCase(), repo, pr: Number(m[3]), key: `${u.hostname}/${repo}/${Number(m[3])}`.toLowerCase() };
+  } catch { return null; }
+}
+function reviewTarget(task) {
+  const first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').trim().split(/\r?\n/)[0] : '';
+  if (/^\W*plan\W*:/i.test(first) || task.stage === 'plan') return { plan: true };
+  const reported = /^\W*implementation\W*:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null;
+  const known = signalTarget(reported ?? task.pr);
+  if (known) return { target: known };
+  const asked = gh(['pr', 'view', branchOf(task), '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 10000 });
+  const target = asked.code === 0 ? signalTarget(asked.stdout.trim()) : null;
+  if (target) return { target };
+  if (/no pull requests? found|no pull request associated/i.test(asked.stderr)) return { absent: true };
+  return { error: `could not resolve the implementation PR (${lastLine(asked.stderr || asked.stdout) || asked.error?.message || 'invalid GitHub response'})` };
+}
+// The filesystem section serializes API writes, not agent work. Never steal a live or
+// uncertain lock. A uniquely named owner file lets only one contender remove a dead lock.
+function withReviewSignalLock(h, work) {
+  const dir = reviewSignalsDir(h), lock = path.join(dir, 'lock'), owner = `${process.pid}-${randomUUID()}`;
+  fs.mkdirSync(dir, { recursive: true });
+  const deadline = Date.now() + 500;
+  while (true) {
+    try { fs.mkdirSync(lock); break; }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const names = fs.readdirSync(lock);
+      if (names.length === 1 && /^\d+-[a-f0-9-]+$/.test(names[0])) {
+        const pid = Number(names[0].split('-')[0]);
+        let dead = false;
+        try { process.kill(pid, 0); } catch (e) { dead = e.code === 'ESRCH'; }
+        if (dead) {
+          try { fs.unlinkSync(path.join(lock, names[0])); fs.rmdirSync(lock); } catch { /* another contender won; retry */ }
+          continue;
+        }
+      }
+      if (Date.now() >= deadline) throw new Error('local signaling is busy or its owner cannot be verified');
+      sleep(20);
+    }
+  }
+  const own = path.join(lock, owner);
+  try { fs.writeFileSync(own, ''); return work(); }
+  finally { try { fs.unlinkSync(own); fs.rmdirSync(lock); } catch { /* next acting command can recover a proved-dead owner */ } }
+}
+function reviewApi(target, method, suffix, more = [], options = {}) {
+  return gh(['api', '--hostname', target.host, '--method', method, `repos/${target.repo}/${suffix}`, ...more], { timeout: 10000, ...options });
+}
+function syncReviewTarget(h, target) {
+  const signals = reviewSignals(h).filter(s => s.target?.key === target.key);
+  const active = signals.some(s => signalActive(h, s));
+  // Every intent is saved before a write. If the command disappears after the HTTP request,
+  // recovery repeats it idempotently, deriving the operation from current ownership.
+  for (const s of signals) writeJson(signalFile(h, s.attempt), { ...s, pending: true });
+  let result;
+  if (active) {
+    const defined = reviewApi(target, 'GET', `labels/${encodeURIComponent(REVIEW_LABEL)}`);
+    let label; try { label = JSON.parse(defined.stdout); } catch { /* invalid response below */ }
+    if (defined.code !== 0 || label?.name !== REVIEW_LABEL) throw new Error(`cannot add ${REVIEW_LABEL} on ${target.repo}#${target.pr}: shared definition missing or inaccessible (${lastLine(defined.stderr) || 'invalid definition response'}); crew does not create it`);
+    result = reviewApi(target, 'POST', `issues/${target.pr}/labels`, ['--input', '-'], { input: JSON.stringify({ labels: [REVIEW_LABEL] }) });
+  } else {
+    result = reviewApi(target, 'DELETE', `issues/${target.pr}/labels/${encodeURIComponent(REVIEW_LABEL)}`);
+    if (result.code !== 0 && /404/.test(result.stderr)) {
+      const read = reviewApi(target, 'GET', `issues/${target.pr}/labels`, ['--paginate', '--slurp']);
+      let labels; try { labels = JSON.parse(read.stdout).flat(); } catch { /* absence not proved */ }
+      if (read.code === 0 && Array.isArray(labels) && labels.every(l => typeof l.name === 'string') && !labels.some(l => l.name === REVIEW_LABEL)) result = { code: 0 };
+    }
+  }
+  if (result.code !== 0) throw new Error(`${active ? 'add' : 'cleanup'} failed on ${target.repo}#${target.pr} (${lastLine(result.stderr) || result.error?.message || 'GitHub did not answer'})`);
+  for (const s of signals) writeJson(signalFile(h, s.attempt), { ...s, pending: false, error: null });
+}
+function syncReviewSignal(h, attempt) {
+  try {
+    withReviewSignalLock(h, () => {
+      const s = readJson(signalFile(h, attempt));
+      if (!s) return;
+      try { if (s.target) syncReviewTarget(h, s.target); }
+      catch (error) {
+        for (const item of reviewSignals(h).filter(item => item.target?.key === s.target?.key)) writeJson(signalFile(h, item.attempt), { ...item, pending: true, error: error.message });
+        throw error;
+      }
+    });
+  } catch (error) { reviewWarning(error.message); }
+}
+function beginReviewSignal(h, task, resolved = null) {
+  const attempt = randomUUID();
+  try {
+    const found = resolved ?? reviewTarget(loadTask(h, task.reviews));
+    fs.mkdirSync(reviewSignalsDir(h), { recursive: true });
+    const s = { attempt, task: task.id, parent: task.reviews, target: found.target ?? null, pending: Boolean(found.target || found.error), error: found.error ?? null, launcher: process.pid, created: now() };
+    writeJson(signalFile(h, attempt), s);
+    if (found.error) reviewWarning(found.error);
+    else if (!found.target) console.log(`review label: ${task.id} has no implementation PR at review time; nothing to label`);
+    else syncReviewSignal(h, attempt);
+  } catch (error) { reviewWarning(error.message); }
+  return attempt;
+}
+function endReviewSignal(h, task) {
+  if (!task.reviewAttempt) return;
+  try { fs.writeFileSync(signalEnded(h, task.reviewAttempt), ''); syncReviewSignal(h, task.reviewAttempt); }
+  catch (error) { reviewWarning(error.message); }
+}
+
 // review: a second pair of eyes on a ship task's branch, as an ordinary read-only task.
 function cmdReview(args) {
   const h = home();
@@ -1780,7 +1898,12 @@ function cmdReview(args) {
     '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
     '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
   ].join('\n');
-  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id } });
+  const chosen = chooseWorker(h, 'review', flags, legacy, task.project), resolved = reviewTarget(task);
+  if (resolved.plan) refuse(`Task ${id} reported a plan, not an implementation; approve and implement it before review.`);
+  const reviewer = { id: reviewId, reviews: id };
+  reviewer.reviewAttempt = beginReviewSignal(h, reviewer, resolved);
+  try { launchWorker(h, { id: reviewId, opts, chosen, project, task: text, extra: { reviews: id, reviewAttempt: reviewer.reviewAttempt } }); }
+  catch (error) { endReviewSignal(h, reviewer); throw error; }
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }
 

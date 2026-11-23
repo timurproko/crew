@@ -623,6 +623,75 @@ gapTests.status = () => {
   assert.equal(f.call(['finish', ship.id]).code, 0); assert.equal(f.call(['finish', scout.id]).code, 0);
 };
 
+// Review-label tests use only local repositories and fake GitHub/Core transports.
+function reviewLabelFixture(name) {
+  const dir = path.join(root, `label-${name}`); fs.mkdirSync(dir);
+  const ghFake = path.join(dir, 'gh.mjs'), hcFake = path.join(dir, 'hc.mjs'), stateFile = path.join(dir, 'github.json'), log = path.join(dir, 'events.jsonl');
+  const label = '\u{1F916} Under review', url = 'https://github.com/acme/demo/pull/42';
+  fs.writeFileSync(log, '');
+  fs.writeFileSync(stateFile, JSON.stringify({ labels: ['unrelated'], defined: true, pr: true }));
+  fs.writeFileSync(ghFake, `import fs from 'node:fs';
+const a=process.argv.slice(2), file=${JSON.stringify(stateFile)}, s=JSON.parse(fs.readFileSync(file,'utf8')), label=${JSON.stringify(label)};
+const method=a.includes('--method') ? a[a.indexOf('--method')+1] : 'GET', endpoint=a.find(x=>x.startsWith('repos/')), input=a.includes('--input') ? fs.readFileSync(0,'utf8') : '';
+fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({kind:'gh',a,method,endpoint,input})+'\\n');
+const fail = text => { console.error(text); process.exit(1); };
+if(a[0]==='auth') { console.log('fake-token'); process.exit(0); }
+if(a[0]==='pr' && a[1]==='view') { if(s.lookupError) fail('network unavailable'); if(!s.pr) fail('no pull requests found for branch'); console.log(${JSON.stringify(url)}); process.exit(0); }
+if(a[0]!=='api') fail('unexpected fake command');
+if(s.inaccessible) fail('HTTP 404: Not Found');
+if(endpoint.includes('/labels/') && method==='GET') { if(!s.defined) fail('HTTP 404: label missing'); console.log(JSON.stringify({name:label,color:'840479',description:''})); }
+else if(method==='POST') { if(s.addDenied) fail('HTTP 403: denied'); if(!s.defined) fail('must not create missing definition'); if(!s.labels.includes(label)) s.labels.push(label); fs.writeFileSync(file,JSON.stringify(s)); if(s.ambiguousAdd) fail('connection lost after write'); console.log(JSON.stringify(s.labels.map(name=>({name})))); }
+else if(method==='DELETE') { if(s.removeDenied) fail('HTTP 403: denied'); if(!s.labels.includes(label)) fail('HTTP 404: label absent'); s.labels=s.labels.filter(n=>n!==label); fs.writeFileSync(file,JSON.stringify(s)); console.log('{}'); }
+else if(method==='GET' && endpoint.endsWith('/labels')) console.log(JSON.stringify([s.labels.map(name=>({name}))]));
+else fail('unexpected fake endpoint');
+`);
+  fs.writeFileSync(hcFake, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process'; const a=process.argv.slice(2), s=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)},'utf8')); if(a[0]==='run') { fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({kind:'launch'})+'\\n'); if(s.failRun) { console.log('{}'); process.exit(1); } } const r=spawnSync(process.execPath,[${JSON.stringify(fake)},...a],{encoding:'utf8'}); process.stdout.write(r.stdout); process.stderr.write(r.stderr); process.exit(r.status);`);
+  const env = { CREW_GH: ghFake, CREW_HC: hcFake, CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', CREW_NO_QUOTA: '1' };
+  const f = gapFixture(`review-${name}`, env), owner = `owner-review-${name}`;
+  const state = patch => { const s = JSON.parse(fs.readFileSync(stateFile, 'utf8')); if (patch) fs.writeFileSync(stateFile, JSON.stringify({ ...s, ...patch })); return patch ? state() : s; };
+  const events = () => fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+  const calls = () => events().filter(e => e.kind === 'gh');
+  const worker = (task, args = ['done', task.id], extra = {}) => crew(args, { cwd: f.home, terminal: task.terminal, env: { ...env, ...extra } });
+  const parent = (id = 'ship', fields = {}, report = `Implementation: ${url}\n`) => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
+  const start = (id = 'ship', agent = 'pi') => { const r = f.call(['review', id, '--agent', agent]); assert.equal(r.code, 0, r.out); const tasks = fs.readdirSync(path.join(f.home, 'tasks')).filter(n => n.startsWith(`${id}-review`)).map(f.task); return tasks.at(-1); };
+  const records = () => { const folder = path.join(f.home, 'state', 'review-labels'); return fs.existsSync(folder) ? fs.readdirSync(folder).filter(n => n.endsWith('.json')).map(n => JSON.parse(fs.readFileSync(path.join(folder, n), 'utf8'))) : []; };
+  return { ...f, env, owner, label, url, state, events, calls, worker, parent, start, records, log };
+}
+gapTests['review-label-launch'] = () => {
+  const f = reviewLabelFixture('launch');
+  for (const [id, fields, report] of [
+    ['workflow', { workflow: 'delivery', stage: 'implementation' }, `Implementation: ${f.url}\n`],
+    ['gate', { gate: 'no-mistakes' }, `${f.url}\n`],
+    ['plain', {}, 'Done.\nSee unrelated https://github.com/else/other/pull/9\n'],
+  ]) {
+    f.parent(id, fields, report); const t = f.start(id);
+    const events = f.events(), launch = events.findLastIndex(e => e.kind === 'launch'), added = events.findLastIndex(e => e.method === 'POST');
+    assert.ok(added >= 0 && added < launch, 'Label is added before the reviewer launches');
+    assert.deepEqual(JSON.parse(events[added].input), { labels: [f.label] });
+    assert.equal(events[added].endpoint, 'repos/acme/demo/issues/42/labels');
+    assert.ok(t.reviewAttempt && f.state().labels.includes(f.label));
+    assert.ok(f.state().labels.includes('unrelated'));
+  }
+  f.parent('plan', { workflow: 'delivery', stage: 'plan' }, `Plan: ${f.url}`);
+  let n = f.events().length, r = f.call(['review', 'plan']); assert.equal(r.code, 2, r.out); assert.equal(f.events().length, n);
+  f.parent('no-pr', {}, 'Done.'); f.state({ pr: false }); r = f.call(['review', 'no-pr']); assert.equal(r.code, 0, r.out); assert.match(r.out, /nothing to label/);
+  for (const [id, patch, match] of [
+    ['missing', { pr: true, defined: false }, /definition missing or inaccessible/],
+    ['denied', { defined: true, addDenied: true }, /add failed/],
+    ['lookup', { addDenied: false, lookupError: true }, /could not resolve/],
+  ]) {
+    f.parent(id, {}, 'Done.'); f.state(patch); n = f.calls().length; r = f.call(['review', id]); assert.equal(r.code, 0, r.out); assert.match(r.out, match); assert.ok(f.records().some(s => s.task === `${id}-review` && s.pending));
+    if (id === 'missing') assert.ok(!f.calls().slice(n).some(c => c.method === 'POST'));
+  }
+  f.parent('failed'); f.state({ lookupError: false, failRun: true, ambiguousAdd: true }); n = f.calls().length;
+  r = f.call(['review', 'failed']); assert.equal(r.code, 5, r.out);
+  // Other reviewers share this PR, so failure cleanup must retain their label.
+  assert.ok(f.calls().slice(n).some(c => c.method === 'POST'));
+  const record = f.records().find(s => s.task === 'failed-review');
+  assert.ok(fs.existsSync(path.join(f.home, 'state', 'review-labels', `${record.attempt}.ended`)));
+  assert.ok(!f.calls().some(c => c.a.includes('create') || c.method === 'PUT'));
+};
+
 try {
   const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
   for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { test(); console.log(`PASS: gap ${name}`); }

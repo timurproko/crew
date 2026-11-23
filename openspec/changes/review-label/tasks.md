@@ -2,10 +2,10 @@
 
 ## 1. Existing implementation PRs show review activity before reviewer launch
 
-- [ ] 1.1 Resolve review targets from current implementation reports, recorded implementation PRs or the current branch for workflow, gate and plain tasks; fake cases reject Plan reports, ignore unrelated prose links and distinguish no PR from lookup failure.
-- [ ] 1.2 Add direct signed-in gh label operations with exact Unicode name, repository-definition preflight and optional persistent attempt metadata; fake request assertions prove only the selected assignment changes and missing definitions are never created.
-- [ ] 1.3 Persist add intent and attempt signaling before terminal launch, releasing failed preparations and launches; fake Core/GitHub logs prove ordering, nonblocking denied/network errors and cleanup even after ambiguous add results.
-- [ ] 1.4 Document existing-PR scope, plain-project no-PR behavior, shared sync prerequisites and advisory signed-in permissions in README; cross-check statements against the new fake launch cases.
+- [x] 1.1 Resolve review targets from current implementation reports, recorded implementation PRs or the current branch for workflow, gate and plain tasks; fake cases reject Plan reports, ignore unrelated prose links and distinguish no PR from lookup failure.
+- [x] 1.2 Add direct signed-in gh label operations with exact Unicode name, repository-definition preflight and optional persistent attempt metadata; fake request assertions prove only the selected assignment changes and missing definitions are never created.
+- [x] 1.3 Persist add intent and attempt signaling before terminal launch, releasing failed preparations and launches; fake Core/GitHub logs prove ordering, nonblocking denied/network errors and cleanup even after ambiguous add results.
+- [x] 1.4 Document existing-PR scope, plain-project no-PR behavior, shared sync prerequisites and advisory signed-in permissions in README; cross-check statements against the new fake launch cases.
 
 ## 2. Review endings preserve labels until the last local reviewer ends
 
