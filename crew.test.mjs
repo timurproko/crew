@@ -748,6 +748,95 @@ gapTests['pr-discovery'] = () => {
   assert.equal(JSON.parse(f.call(['status', '--json', '--discover-prs']).out).tasks[0].prDiscovery.reason, 'unsupported-remote');
 };
 
+gapTests['pr-discovery-compatibility'] = () => {
+  const f = prDiscoveryFixture('compatibility');
+  const owner = 'discovery-owner', reader = 'discovery-reader';
+  const w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+  fs.writeFileSync(path.join(f.home, 'owner.json'), JSON.stringify({ terminal: owner }));
+  // No elapsed clock noise in exact legacy text/shape assertions.
+  f.save({ ...f.task, created: 'invalid' });
+  f.save({ ...f.task, id: 'closed', state: 'closed', created: 'invalid', pr: 'https://github.com/acme/demo/pull/13', worktree: path.join(f.dir, 'gone') });
+  f.save({ ...f.task, id: 'scout', kind: 'scout', created: 'invalid', worktree: path.join(f.dir, 'gone') });
+  const guard = path.join(f.dir, 'guarded-status.mjs');
+  fs.writeFileSync(guard, `import cp from 'node:child_process'; import {syncBuiltinESMExports} from 'node:module';
+const spawn = cp.spawnSync;
+cp.spawnSync = (command,args,options) => {
+ if (command !== process.execPath || args[0] !== ${JSON.stringify(fake)}) throw Error('legacy status attempted a non-Core subprocess');
+ return spawn(command,args,options);
+}; syncBuiltinESMExports();
+const {main} = await import(${JSON.stringify(new URL('./crew.mjs', import.meta.url).href)}); main(process.argv.slice(2));`);
+  const legacy = args => crew(args, { cwd: f.home, terminal: reader, script: guard, env: { CREW_GH: f.fakeGh } });
+  let r = legacy(['status']); assert.equal(r.code, 0, r.out);
+  assert.equal(r.out.trim(), `home ${slash(f.home)} - owner ${owner} (live, you are read-only)\ndraft\tworking\tship/pi\tdemo\t-\t-\nscout\tworking\tscout/pi\tdemo\t-\t-`);
+  r = legacy(['status', '--json']); assert.equal(r.code, 0, r.out);
+  const original = JSON.parse(r.out);
+  assert.deepEqual(Object.keys(original), ['home', 'owner', 'tasks', 'copiesToReturn']);
+  assert.deepEqual(original.owner, { terminal: owner, live: true, mine: false });
+  assert.deepEqual(original.tasks.map(t => t.id), ['draft', 'scout']);
+  assert.deepEqual(Object.keys(original.tasks[0]), ['id', 'state', 'kind', 'agent', 'launch', 'standby', 'standbyStatus', 'fallbacks', 'project', 'terminal',
+    'core', 'nudges', 'continuations', 'recovery', 'report', 'pr', 'error', 'elapsedSeconds', 'deliveryKind']);
+  assert.equal(original.tasks[0].pr, null);
+  r = legacy(['status', '--all', '--json']); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(JSON.parse(r.out).tasks.map(t => t.id), ['closed', 'draft', 'scout']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.log, 'utf8')), [], 'all ordinary status forms make zero Git/GitHub reads here');
+  r = f.call(['status', '--all', '--json', '--discover-prs'], reader); assert.equal(r.code, 0, r.out);
+  const enhanced = JSON.parse(r.out); assert.deepEqual(enhanced.owner, original.owner);
+  assert.deepEqual(enhanced.tasks.map(t => t.id), ['closed', 'draft', 'scout']);
+  assert.equal(enhanced.tasks[0].prDiscovery.source, 'recorded', 'recorded closed task needs no surviving copy');
+  assert.equal(enhanced.tasks[1].prDiscovery.source, 'github'); assert.equal(enhanced.tasks[2].prDiscovery.status, 'none');
+  assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 2, 'only the unrecorded ship has repo/head requests');
+};
+
+// Capture every byte of the small fixture home and Git directory, not just task.pr.
+function discoveryState(f) {
+  const tree = folder => fs.readdirSync(folder).sort().flatMap(name => {
+    const file = path.join(folder, name);
+    return fs.statSync(file).isDirectory() ? tree(file) : [[file, fs.readFileSync(file).toString('base64')]];
+  });
+  return [tree(f.home), tree(path.join(f.repo, '.git')), tree(f.copy)];
+}
+gapTests['pr-discovery-lifecycle'] = () => {
+  const f = prDiscoveryFixture('lifecycle'), owner = 'pr-owner', worker = 'pr-worker', reader = 'pr-reader';
+  const w = readWorld();
+  for (const address of [owner, worker]) w.terminals[address] = { address, state: 'live', labels: {}, status: { app: 'pi', state: 'working' } };
+  fs.writeFileSync(world, JSON.stringify(w));
+  fs.writeFileSync(path.join(f.home, 'owner.json'), JSON.stringify({ terminal: owner }));
+  f.save({ ...f.task, terminal: worker });
+  const before = discoveryState(f);
+  for (const control of [{}, { fail: true }, { response: [] }, { malformed: true }]) {
+    f.set(control); const r = f.call(['status', '--json', '--discover-prs'], reader); assert.equal(r.code, 0, r.out);
+    const status = JSON.parse(r.out); assert.equal(status.owner.mine, false); assert.equal(status.owner.live, true);
+    assert.equal(status.tasks[0].pr, null); assert.deepEqual(discoveryState(f), before, 'status cannot alter home, reports, ownership or Git state');
+  }
+  f.set({});
+  let r = f.call(['land', 'draft'], owner); assert.equal(r.code, 2, r.out); assert.match(r.out, /only after its worker reported/);
+  r = f.call(['done', 'draft'], worker); assert.equal(r.code, 2, r.out); assert.match(r.out, /Write your result/);
+  fs.writeFileSync(f.task.report, 'Complete. A conversation mention is not this task PR: https://github.com/acme/other/pull/99\n');
+  const mentioned = f.call(['status', '--json', '--discover-prs'], reader);
+  assert.equal(JSON.parse(mentioned.out).tasks[0].prDiscovery.url, 'https://github.com/acme/demo/pull/12', 'reports cannot retarget discovery');
+  r = f.call(['done', 'draft'], worker); assert.equal(r.code, 0, r.out);
+  let task = JSON.parse(fs.readFileSync(path.join(f.home, 'tasks', 'draft', 'task.json'), 'utf8'));
+  assert.equal(task.state, 'reported'); assert.equal(task.pr, undefined, 'discovery never feeds plain done a PR');
+  fs.writeFileSync(path.join(f.copy, 'untracked'), 'keep');
+  r = f.call(['land', 'draft'], owner); assert.equal(r.code, 6, r.out); assert.match(r.out, /uncommitted files/);
+  fs.rmSync(path.join(f.copy, 'untracked'));
+  f.save({ ...task, workflow: 'delivery' });
+  fs.writeFileSync(f.task.report, 'Plan: https://github.com/acme/demo/pull/12\n');
+  r = f.call(['done', 'draft'], worker); assert.equal(r.code, 0, r.out);
+  task = JSON.parse(fs.readFileSync(path.join(f.home, 'tasks', 'draft', 'task.json'), 'utf8'));
+  assert.equal(task.stage, 'plan'); assert.equal(task.pr, 'https://github.com/acme/demo/pull/12');
+  const reads = fs.readFileSync(f.log, 'utf8');
+  r = f.call(['status', '--json', '--discover-prs'], reader); assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(r.out).tasks[0].prDiscovery.source, 'recorded');
+  assert.equal(fs.readFileSync(f.log, 'utf8'), reads, 'recorded plans have no GitHub lookup');
+  r = f.call(['land', 'draft'], owner); assert.equal(r.code, 6, r.out); assert.match(r.out, /plan awaiting approval/);
+  fs.writeFileSync(f.task.report, 'Implementation: https://github.com/acme/demo/pull/12\n');
+  r = f.call(['done', 'draft'], worker); assert.equal(r.code, 0, r.out);
+  fs.writeFileSync(path.join(f.copy, 'untracked'), 'keep');
+  r = f.call(['land', 'draft'], owner); assert.equal(r.code, 6, r.out); assert.match(r.out, /uncommitted files/);
+  assert.equal(fs.readFileSync(f.log, 'utf8'), reads, 'delivery refusals do not open or discover a PR');
+};
+
 gapTests['pr-discovery-bounds'] = () => {
   const f = prDiscoveryFixture('bounds');
   let time = 0;

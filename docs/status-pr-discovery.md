@@ -108,3 +108,43 @@ not raw stderr, credentials, report text or paths:
 Large homes can be incomplete by design. Consumers should preserve unavailable status
 and refresh deliberately through their existing bounded refresh lifecycle, not launch
 unbounded parallel queries or retries to fill gaps.
+
+## Separate Herdr adoption task
+
+This Crew change does not edit or deploy Herdr. Its adapter seam was reviewed in merged
+Herdr PR 14 (`c3d9e4d60744df32130efa2819ea25d3b591219e`), archived
+`connect-fleet-space/design.md` decision 6 and the corresponding Crew plugin source.
+The app must make these separate changes before early PRs appear in its coordinator
+Git overview:
+
+1. In `src/plugins/crew/plugin.js`, change `readFleetStatus` to request
+   `status --json --discover-prs` through the existing bounded, read-only machine
+   transport. Do not change its installed-tool routing or run setup/mutation commands.
+2. In `src/plugins/crew/fleet.js`, replace/extend `recordedSource` with a bounded v1
+   discovery adapter. Validate the top-level version and all four per-task fields;
+   convert known `prDiscovery.url` into the existing sanitized task `pr`. Continue
+   sanitizing home, owner and task id/terminal/state, and validating canonical PR URLs.
+   `owner.mine` is not app authority. Never replace exact live task-terminal/home labels
+   and membership checks with branch or transcript heuristics.
+3. Preserve none/unavailable alongside sanitized links through `bindFleet` and
+   `fleetPullContext` into the generic PR context. Replace the blanket
+   `workers.some(t => t.state === 'working')` incomplete rule: any unavailable eligible
+   task means possibly incomplete; a successful none means no PR was found on this read.
+   Known/none are a current snapshot, not a promise of future completeness. Git/Spaces
+   continue consuming generic links/discovery, not constructing Crew commands or
+   parsing Crew JSON; adjust their completeness wording to reflect this richer signal.
+4. Missing/unknown discovery versions must retain recorded-only compatibility and its
+   existing possibly-incomplete wording. Older Crew versions that ignore the new flag
+   return plain status; that same payload can go through the recorded adapter without
+   another call. If a version explicitly rejects the flag, any recorded-only fallback
+   must be a separate bounded capability fallback, not a retry of an authentication,
+   transport or timeout failure. Never interpret unsupported discovery as none.
+5. Add app adapter/transport fixtures for v1, unknown/missing versions, known/none/
+   unavailable, partial budgets, canonical links, stale generations and unchanged
+   owner/task-terminal binding. Retain the existing 15-second transport failure
+   behavior, refresh coalescing, scope invalidation and payload limits. Do not change
+   polling cadence, enroll webhooks, or expand CI-fix authority.
+
+Until that separate task ships, Herdr continues reading stored `tasks[].pr` and can
+still omit a worker's first draft PR. No app consumer change is implied by upgrading
+Crew alone.

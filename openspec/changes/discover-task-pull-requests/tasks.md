@@ -9,7 +9,7 @@
 
 ## 2. Legacy status and lifecycle compatibility have fake-only integration coverage and a documented app adapter contract
 
-- [ ] 2.1 Add integration fixtures proving plain status and JSON retain existing shapes with zero discovery/network calls; verify --all task inclusion and recorded-only short circuits.
-- [ ] 2.2 Prove non-owner access and unchanged task/home/report/Git state around successful and failed discovery; verify existing done/land report-stage and cleanliness guards still run after discovery and non-ships never trigger lookup.
-- [ ] 2.3 Document the separate Herdr plugin.js command and fleet.js discovery adapter changes, version detection/fallback, known/none/unavailable propagation and unchanged exact-terminal binding in docs/status-pr-discovery.md; verify the checklist against merged app PR 14's source seam without editing that repository.
-- [ ] 2.4 Reconcile the latest default branch while preserving PR 5's project-registration/lock/name behavior, and run the complete node crew.test.mjs suite with fakes only; record the final result and any gaps in the implementation report.
+- [x] 2.1 Add integration fixtures proving plain status and JSON retain existing shapes with zero discovery/network calls; verify --all task inclusion and recorded-only short circuits.
+- [x] 2.2 Prove non-owner access and unchanged task/home/report/Git state around successful and failed discovery; verify existing done/land report-stage and cleanliness guards still run after discovery and non-ships never trigger lookup.
+- [x] 2.3 Document the separate Herdr plugin.js command and fleet.js discovery adapter changes, version detection/fallback, known/none/unavailable propagation and unchanged exact-terminal binding in docs/status-pr-discovery.md; verify the checklist against merged app PR 14's source seam without editing that repository.
+- [x] 2.4 Reconcile the latest default branch while preserving PR 5's project-registration/lock/name behavior, and run the complete node crew.test.mjs suite with fakes only; record the final result and any gaps in the implementation report.
