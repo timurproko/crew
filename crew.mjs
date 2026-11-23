@@ -1897,6 +1897,8 @@ function reviewLabels(h, id, completed = false) {
     if (!Array.isArray(current) || current.some(l => typeof l?.name !== 'string')) throw new Error('PR labels unreadable');
     for (const name of completed ? [under] : [approved, changes]) {
       if (current.some(l => l.name === name)) {
+        // Completion during a lookup cancels the rest of this start hook, not the verdict.
+        if (!completed && loadTask(h, id).state !== 'working') return;
         try { api('DELETE', `${issue}/${encodeURIComponent(name)}`); }
         catch (error) { errors.push(error.message); }
       }
@@ -1904,6 +1906,7 @@ function reviewLabels(h, id, completed = false) {
     const desired = completed ? verdict === 'APPROVE' ? approved : changes : under;
     try {
       if (JSON.parse(api('GET', `${repo}/labels/${encodeURIComponent(desired)}`)).name !== desired) throw new Error(`shared label not defined: ${desired}`);
+      if (!completed && loadTask(h, id).state !== 'working') return;
       api('POST', issue, ['--input', '-'], { labels: [desired] });
     } catch (error) { errors.push(error.message); }
   } catch (error) { errors.push(error.message); }

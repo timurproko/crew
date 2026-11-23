@@ -1138,7 +1138,7 @@ function reviewLabelsFixture(name) {
   const under = '\u{1F916} Under review', approved = '\u{1F916} Approved', changes = '\u{1F916} Changes needed';
   fs.writeFileSync(state, JSON.stringify({ labels: ['unrelated'], defined: [under, approved, changes] })); fs.writeFileSync(log, '[]');
   const env = { CREW_GH: fakeGh }, f = gapFixture(`labels-${name}`, env);
-  fs.writeFileSync(fakeGh, `import fs from 'node:fs';
+  fs.writeFileSync(fakeGh, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process';
 const a=process.argv.slice(2), file=${JSON.stringify(state)}, s=JSON.parse(fs.readFileSync(file,'utf8')), log=${JSON.stringify(log)};
 let task; try { task=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json','utf8')); } catch {}
 const method=a[a.indexOf('--method')+1], endpoint=a.find(x=>x.startsWith('repos/')), input=a.includes('--input') ? JSON.parse(fs.readFileSync(0,'utf8')) : null;
@@ -1146,6 +1146,12 @@ fs.writeFileSync(log,JSON.stringify([...JSON.parse(fs.readFileSync(log,'utf8')),
 const fail = msg => { console.error(msg+'\\nsecond diagnostic line'); process.exit(1); };
 if(s.network) fail('network unavailable');
 if(a[0]==='pr') { if(s.noPr) fail('no pull requests found for branch'); console.log('https://github.com/acme/demo/pull/42'); process.exit(0); }
+// Hold a start lookup until real done has saved its verdict and finished its requests.
+if(s.duringVerdict && task?.state==='working' && (s.duringAt==='definition' ? endpoint.endsWith('/labels/'+encodeURIComponent(${JSON.stringify(under)})) : endpoint.endsWith('/actions/variables'))) {
+  const verdict=s.duringVerdict; s.duringVerdict=null; fs.writeFileSync(file,JSON.stringify(s)); fs.writeFileSync(task.report,verdict);
+  const done=spawnSync(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},'done',task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TERMINAL:task.terminal},encoding:'utf8'});
+  if(done.status!==0) fail(done.stdout+done.stderr);
+}
 if(endpoint.endsWith('/actions/variables')) { if(s.variablesDenied) fail('variables unreadable'); console.log(JSON.stringify([{variables:s.enabled===undefined ? [] : [{name:'DELIVERY_LABELS_ENABLED',value:s.enabled}]}])); }
 else if(method==='GET' && endpoint.includes('/issues/')) console.log(JSON.stringify([s.labels.map(name=>({name}))]));
 else if(method==='GET') { const name=decodeURIComponent(endpoint.split('/').at(-1)); if(!s.defined.includes(name)) fail('shared label not defined'); console.log(JSON.stringify({name})); }
@@ -1185,6 +1191,20 @@ gapTests['review-label-swaps'] = () => {
   n = f.calls().length; assert.equal(f.call(['start']).code, 0); assert.equal(f.call(['stop', b.id]).code, 0); assert.equal(f.call(['finish', b.id]).code, 0); assert.equal(f.calls().length, n, 'Other lifecycle commands never reconcile labels');
   assert.ok(!fs.existsSync(path.join(f.home, 'state', 'review-labels')));
   assert.ok(JSON.parse(f.call(['status', '--json']).out).tasks.every(t => !('reviewLabel' in t)));
+};
+gapTests['review-label-start-done'] = () => {
+  const f = reviewLabelsFixture('start-done');
+  for (const [id, verdict, label, duringAt] of [['approve', 'APPROVE', f.approved, 'variables'], ['changes', 'CHANGES NEEDED', f.changes, 'variables'], ['approve-post', 'APPROVE', f.approved, 'definition'], ['changes-post', 'CHANGES NEEDED', f.changes, 'definition']]) {
+    f.parent(id); f.control({ labels: ['unrelated'], duringVerdict: verdict, duringAt }); const before = f.calls().length;
+    const { task, result } = f.start(id); assert.equal(f.warnings(result).length, 0, result.out);
+    assert.equal(task.state, 'reported'); assert.equal(f.control().duringVerdict, null);
+    assert.deepEqual(f.control().labels, ['unrelated', label], 'The delayed start must preserve its completed verdict');
+    const calls = f.calls().slice(before), writes = calls.filter(c => ['POST', 'DELETE'].includes(c.method));
+    const completedAt = calls.findIndex(c => c.saved === 'reported');
+    assert.ok(completedAt > 0 && calls.slice(0, completedAt).every(c => c.saved === 'working'), 'Start lookup begins before completion');
+    assert.ok(calls.slice(completedAt).every(c => c.saved === 'reported'));
+    assert.deepEqual(writes.map(c => c.input?.labels), [[label]], 'No stale verdict DELETE or Under review POST follows done');
+  }
 };
 gapTests['review-label-failures'] = () => {
   const f = reviewLabelsFixture('failures');
