@@ -19,7 +19,7 @@ The maintainer integration decision accepts these scenarios:
   "archive": "openspec/changes/archive/2026-11-23-review-label/",
   "acceptanceManifest": "openspec/changes/archive/2026-11-23-review-label/acceptance.md",
   "finalizedDate": "2026-11-23",
-  "specBaseSha": "56499c41ede991bd059ced65d026c4131c7202f2",
+  "specBaseSha": "f625c5d252d152326ece77e65eb552f8a9c174fa",
   "acceptanceScenarios": [
     "Existing implementation PRs receive the exact shared review label before reviewer launch, without creating definitions or replacing unrelated labels.",
     "Either verdict and every observed review ending release activity ownership while overlapping local reviewers and newer attempts keep the label.",
@@ -29,7 +29,7 @@ The maintainer integration decision accepts these scenarios:
     "The complete fake-Core and fake-GitHub main suite passes with merged safe project registration changes preserved."
   ],
   "archiveDigest": "43ff65a81cb115299c9802dce1ea9f19c45f03dcdd2cbc26ba20c98a481de2a9",
-  "specDigest": "0282a72f713cf1241429bf9e0ca2e60d0daf040a9e3b5580296034031eb62822",
+  "specDigest": "136503a1011bfe28a5a8219868bb175af96e2f90ca94dfbb1dae799087e6dac4",
   "tasksDigest": "9a219825df7f6ae53a53081453aca920b1ca7cef814da16287bc2c12583bd58b",
   "evidenceDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "knownGaps": []
