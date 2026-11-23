@@ -105,7 +105,9 @@ stopping, finishing and backlog changes still belong to the owning coordinator. 
 sees a successful registration on its next command, without restarting its agent.
 
 Registry edits use a short per-home transaction, rereading `crew.json` before atomic
-replacement. The first `preparing` task record uses the same lock, so concurrent edits
+replacement. On Windows, transient replacement/sharing errors retry for up to one second
+while retaining the lock and temporary file; the destination is never deleted first.
+The first `preparing` task record uses the same lock, so concurrent edits
 cannot lose unrelated registrations or remove/repoint a project between lookup and spawn.
 Removal and `--replace` still refuse unfinished tasks and finished tasks with copies waiting
 to return; changing a path also requires `--replace`. Unreadable task references fail closed.

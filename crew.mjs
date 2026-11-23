@@ -75,7 +75,18 @@ function writeJson(file, value) {
   const tmp = `${file}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
-    fs.renameSync(tmp, file);
+    const deadline = Date.now() + 1000;
+    for (;;) {
+      try { fs.renameSync(tmp, file); break; }
+      catch (error) {
+        const remaining = deadline - Date.now();
+        // Windows readers/virus scanners can briefly deny replacement. Keep both
+        // snapshots (and the caller's registry lock) intact until rename succeeds.
+        // Never unlink the destination: readers must always see complete JSON.
+        if (!WINDOWS || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || remaining <= 0) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(20, remaining));
+      }
+    }
   } finally { fs.rmSync(tmp, { force: true }); }
 }
 function run(command, args, options = {}) {

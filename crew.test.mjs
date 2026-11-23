@@ -102,6 +102,14 @@ const commit = (folder, files, message) => {
   return git('-C', folder, 'rev-parse', 'HEAD').trim();
 };
 
+// Exercise crash handling with an explicit unexpected fault, not malformed input.
+function unexpectedListScript(folder) {
+  const script = path.join(folder, 'unexpected-list.mjs');
+  fs.writeFileSync(script, `import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+console.log = () => { throw new TypeError('injected project list failure'); }; main(process.argv.slice(2));`);
+  return script;
+}
+
 // Run a focused regression with --gaps=ignored (or all new regressions with --gaps).
 const gapTests = {};
 gapTests['repair-scope'] = () => {
@@ -180,10 +188,14 @@ gapTests['root-layout'] = () => {
   r = crew(['start'], { script: path.join(differentCase, 'crew.mjs'), cwd: f.home, terminal: f.owner, env: { ...f.env, HOME: user, USERPROFILE: user, CREW_AUTO_UPDATE: '', CREW_NO_UPDATE: '', CREW_TOOL_ROOT: '' } });
   assert.equal(r.code, 0, r.out);
   assert.equal(git('-C', differentCase, 'rev-parse', 'HEAD').trim(), WINDOWS ? repaired : first, 'Only Windows treats CORE as the installed core folder');
+  const crashes = path.join(user, '.crew', 'state', 'crashes');
   fs.writeFileSync(path.join(broken, 'crew.json'), JSON.stringify({ version: 1, tag: 'broken' }));
   r = crew(['project', 'list'], { cwd: broken, env: { HOME: user, USERPROFILE: user, CREW_TOOL_ROOT: t.worktree } });
+  assert.equal(r.code, 2, r.out); assert.match(r.out, /invalid.*registry/);
+  assert.ok(!fs.existsSync(crashes), 'A malformed registry is a refusal, not an internal crash');
+  fs.writeFileSync(path.join(broken, 'crew.json'), JSON.stringify({ version: 1, tag: 'broken', projects: { demo: { path: f.repo } } }));
+  r = crew(['project', 'list'], { script: unexpectedListScript(broken), cwd: broken, env: { HOME: user, USERPROFILE: user, CREW_TOOL_ROOT: t.worktree } });
   assert.equal(r.code, 70, r.out);
-  const crashes = path.join(user, '.crew', 'state', 'crashes');
   const crash = fs.readFileSync(path.join(crashes, fs.readdirSync(crashes)[0]), 'utf8');
   assert.ok(crash.includes(`at ${repaired.slice(0, 8)} (${slash(t.worktree)})`), crash);
 };
@@ -302,7 +314,9 @@ function gapFixture(name, extra = {}) {
 // Concurrent CLIs with test-only filesystem barriers: no timing guesses or production hooks.
 function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), terminal = '', env = {} } = {}) {
   const child = spawn(process.execPath, [script, ...args], { cwd: f.home, env: {
-    ...process.env, CREW_HOME: f.home, CREW_HC: fake, CREW_TERMINAL: terminal, HC_TERMINAL_ID: '',
+    ...process.env, HOME: path.join(f.dir, 'user'), USERPROFILE: path.join(f.dir, 'user'),
+    CREW_CLAUDE_CONFIG: path.join(f.dir, 'claude.json'),
+    CREW_HOME: f.home, CREW_HC: fake, CREW_TERMINAL: terminal, HC_TERMINAL_ID: '',
     CREW_TOOL_PATH: path.join(root, 'no-tools'), CREW_WORKTREES: path.join(f.dir, 'copies'),
     ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...env,
   }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -330,6 +344,46 @@ fs[method] = function(file, ...args) {
 }; main(process.argv.slice(2));`);
   return { ready, release, script };
 }
+gapTests['registry-sharing'] = async () => {
+  const f = gapFixture('registry-sharing'), registry = path.join(f.home, 'crew.json'), lock = path.join(f.home, 'projects.lock');
+  const cases = [
+    ['transient', ['EPERM', 'EACCES', 'EBUSY'], false],
+    ...['EPERM', 'EACCES', 'EBUSY'].map(code => [`persistent-${code}`, [code], true]),
+    ['permanent', ['ENOSPC'], false],
+  ];
+  for (const [label, errors, persistent] of cases) {
+    const before = fs.readFileSync(registry, 'utf8'), log = path.join(f.dir, `${label}.json`), script = path.join(f.dir, `${label}.mjs`);
+    fs.writeFileSync(script, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const registry = ${JSON.stringify(registry)}, lock = ${JSON.stringify(lock)}, log = ${JSON.stringify(log)};
+const errors = ${JSON.stringify(errors)}, persistent = ${persistent}, calls = [], original = fs.renameSync, clock = Date.now;
+fs.renameSync = (from, to) => {
+  if (to !== registry) return original(from, to);
+  calls.push({ from, to, destination: fs.readFileSync(to, 'utf8'), temporary: fs.readFileSync(from, 'utf8'), lock: fs.readFileSync(lock, 'utf8') });
+  fs.writeFileSync(log, JSON.stringify(calls));
+  if (persistent || calls.length <= errors.length) {
+    // Advance the clock only after a retry, so persistent-error tests prove both
+    // retry and timeout without adding seconds to each run of the main suite.
+    if (persistent && calls.length === 2) Date.now = () => clock() + 10000;
+    throw Object.assign(new Error('injected sharing error'), { code: errors[(calls.length - 1) % errors.length] });
+  }
+  return original(from, to);
+}; main(process.argv.slice(2));`);
+    const result = await projectProcess(f, ['project', 'add', 'sharing', f.repo], { script }).result;
+    const success = WINDOWS && label === 'transient'; assert.equal(result.code, success ? 0 : 70, result.out);
+    const calls = JSON.parse(fs.readFileSync(log, 'utf8'));
+    assert.equal(calls.length, WINDOWS ? (success ? 4 : persistent ? 2 : 1) : 1, label);
+    for (const attempt of calls) {
+      assert.equal(attempt.destination, before, 'Destination stays intact until atomic replacement');
+      assert.equal(attempt.from, calls[0].from, 'Retries retain the same temporary file');
+      assert.equal(attempt.temporary, calls[0].temporary, 'Temporary snapshot is retained intact');
+      assert.equal(attempt.lock, calls[0].lock, 'Registry lock stays held throughout replacement retries');
+      assert.ok(JSON.parse(attempt.lock).token); assert.ok(JSON.parse(attempt.temporary).projects.sharing);
+    }
+    if (success) assert.ok(JSON.parse(fs.readFileSync(registry, 'utf8')).projects.sharing);
+    else assert.equal(fs.readFileSync(registry, 'utf8'), before, 'Exhausted/nonretryable errors leave the registry untouched');
+    assert.ok(!fs.existsSync(lock)); assert.ok(!fs.readdirSync(f.home).some(name => name.endsWith('.tmp')));
+  }
+};
 gapTests['project-registry'] = async () => {
   const f = gapFixture('project-registry'), file = path.join(f.home, 'crew.json'), lock = path.join(f.home, 'projects.lock');
   const settings = args => crew(args, { cwd: f.home }), read = () => JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -955,7 +1009,9 @@ try {
   assert.equal(crew(['start']).code, 3, 'start needs a Herdr terminal');
   let w = readWorld(); w.terminals.c1 = { address: 'c1', state: 'live', labels: {} }; w.terminals.c2 = { address: 'c2', state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
   assert.match(crew(['start'], { terminal: 'c1' }).out, /you hold .* \(terminal c1\)/);
-  let r = crew(['start'], { terminal: 'c2' }); assert.equal(r.code, 3); assert.match(r.out, /owned by live terminal c1/);
+  let r = crew(['start'], { terminal: 'c2' }); assert.equal(r.code, 3);
+  assert.ok(r.out.includes(`Crew home ${slash(homeDir)} is controlled by terminal c1.`), r.out);
+  assert.match(r.out, /Only that coordinator may take ownership of this home; this does not mean a project folder is in use/);
   r = crew(['spawn', 't1', '--project', 'demo', 'x'], { terminal: 'c2' }); assert.equal(r.code, 3); assert.match(r.out, /Crew home .*controlled by terminal c1/);
 
   // Missing task ids give command-specific usage, including when only --force is passed.
@@ -1156,14 +1212,19 @@ if (a[0] === 'run') {`));
   const taskOf = id => JSON.parse(fs.readFileSync(path.join(homeDir, 'tasks', id, 'task.json'), 'utf8'));
   const first = head(tool);
 
-  // A crash is written down and points at the repair command.
+  // Malformed registries are refused without a crash. An explicit unexpected fault
+  // is written down and points at the repair command (and is attached to the fixer).
   const crashHome = path.join(root, 'crash-home'); fs.mkdirSync(crashHome);
+  const crashes = path.join(fakeUser, '.crew', 'state', 'crashes');
   fs.writeFileSync(path.join(crashHome, 'crew.json'), JSON.stringify({ version: 1, tag: 'crash' }));
-  r = crew(['project', 'list'], { cwd: crashHome }); assert.equal(r.code, 70, r.out);
+  r = crew(['project', 'list'], { cwd: crashHome }); assert.equal(r.code, 2, r.out); assert.match(r.out, /invalid.*registry/);
+  assert.ok(!fs.existsSync(crashes), 'Malformed input must not produce a crash record');
+  fs.writeFileSync(path.join(crashHome, 'crew.json'), JSON.stringify({ version: 1, tag: 'crash', projects: { demo: { path: project } } }));
+  r = crew(['project', 'list'], { script: unexpectedListScript(crashHome), cwd: crashHome }); assert.equal(r.code, 70, r.out);
   assert.match(r.out, /internal error[\s\S]*defect in crew itself[\s\S]*crew fix "/);
   const crashFiles = fs.readdirSync(path.join(fakeUser, '.crew', 'state', 'crashes'));
   assert.equal(crashFiles.length, 1);
-  assert.match(fs.readFileSync(path.join(fakeUser, '.crew', 'state', 'crashes', crashFiles[0]), 'utf8'), /command: crew project list[\s\S]*TypeError/);
+  assert.match(fs.readFileSync(path.join(fakeUser, '.crew', 'state', 'crashes', crashFiles[0]), 'utf8'), /command: crew project list[\s\S]*TypeError: injected project list failure/);
 
   // fix: only the owner, one at a time, a ship task on crew's own source with the crash attached.
   assert.equal(sm(['fix', 'x'], 'c1').code, 3);
