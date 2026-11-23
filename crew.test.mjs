@@ -905,7 +905,8 @@ else if(method==='GET' && endpoint.endsWith('/labels')) console.log(JSON.stringi
 else fail('unexpected fake endpoint');
 `);
   fs.writeFileSync(hcFake, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process'; const a=process.argv.slice(2), s=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)},'utf8')); if(a[0]==='run') { fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({kind:'launch'})+'\\n'); if(s.failRun) { console.log('{}'); process.exit(1); } } const r=spawnSync(process.execPath,[${JSON.stringify(fake)},...a],{encoding:'utf8'}); process.stdout.write(r.stdout); process.stderr.write(r.stderr); process.exit(r.status);`);
-  const env = { CREW_GH: ghFake, CREW_HC: hcFake, CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', CREW_NO_QUOTA: '1', CREW_AGENT_PATH: '' };
+  const trust = path.join(dir, 'claude.json'); fs.writeFileSync(trust, '{}');
+  const env = { CREW_GH: ghFake, CREW_HC: hcFake, CREW_CLAUDE_CONFIG: trust, CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', CREW_NO_QUOTA: '1', CREW_AGENT_PATH: '' };
   const f = gapFixture(`review-${name}`, env), owner = `owner-review-${name}`;
   const state = patch => { const s = JSON.parse(fs.readFileSync(stateFile, 'utf8')); if (patch) fs.writeFileSync(stateFile, JSON.stringify({ ...s, ...patch })); return patch ? state() : s; };
   const events = () => fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
