@@ -1869,7 +1869,7 @@ const gh = (args, options) => (GH.endsWith('.mjs') ? run(process.execPath, [GH, 
 // Two advisory hooks only, after review/done saved their task state. No task writes,
 // retries, ownership tracking or lifecycle cleanup; each requested label write is tried once.
 function reviewLabels(h, id, completed = false) {
-  const errors = [], under = '\u{1F916} Under review', approved = '\u{1F916} Approved', changes = '\u{1F916} Changes needed';
+  const errors = [];
   try {
     const reviewer = loadTask(h, id), verdict = completed ? fs.readFileSync(reviewer.report, 'utf8').split(/\r?\n/)[0].trim() : null;
     if (completed && verdict !== 'APPROVE' && verdict !== 'CHANGES NEEDED') return;
@@ -1893,9 +1893,27 @@ function reviewLabels(h, id, completed = false) {
     const pages = JSON.parse(api('GET', `${repo}/actions/variables`, ['--paginate', '--slurp']));
     if (!Array.isArray(pages) || !pages.length || pages.some(p => !Array.isArray(p?.variables) || p.variables.some(v => typeof v.name !== 'string' || typeof v.value !== 'string'))) throw new Error('repository variables unreadable');
     if (pages.flatMap(p => p.variables).some(v => v.name === 'DELIVERY_LABELS_ENABLED' && v.value.toLowerCase() === 'false')) throw new Error('repository opted out with DELIVERY_LABELS_ENABLED=false');
+    const keys = ['under-review', 'review-approved', 'review-changes-needed'];
+    let palette = [
+      { name: '\u{1F916} Review', previousNames: ['\u{1F916} Under review'] },
+      { name: '\u{1F916} Approved', previousNames: [] },
+      { name: '\u{1F916} Rework', previousNames: ['\u{1F916} Changes needed'] },
+    ];
+    try {
+      const source = process.env.CREW_REVIEW_LABELS_REPO ?? 'timurproko/MyWorkflows';
+      if (!/^[\w.-]+\/[\w.-]+$/.test(source)) throw new Error('invalid CREW_REVIEW_LABELS_REPO');
+      // Omitting ref selects the source's default branch without another API read.
+      const r = gh(['api', '--hostname', 'github.com', '--method', 'GET', `repos/${source}/contents/labels/base.json`, '--header', 'Accept: application/vnd.github.raw+json'], { timeout: 2000 });
+      if (r.code !== 0) throw new Error(r.stderr || r.error?.message || 'manifest request failed');
+      const manifest = JSON.parse(r.stdout), validName = n => typeof n === 'string' && n.trim().length > 0;
+      if (manifest?.version !== 1 || keys.some(key => !validName(manifest.labels?.[key]?.name) || (manifest.labels[key].previousNames !== undefined && (!Array.isArray(manifest.labels[key].previousNames) || !manifest.labels[key].previousNames.every(validName))))) throw new Error('invalid review label manifest');
+      palette = keys.map(key => ({ name: manifest.labels[key].name, previousNames: manifest.labels[key].previousNames ?? [] }));
+    } catch (error) { errors.push(`review label manifest: ${error.message}; using built-in defaults`); }
+    const desired = palette[completed ? verdict === 'APPROVE' ? 1 : 2 : 0].name;
     const current = JSON.parse(api('GET', issue, ['--paginate', '--slurp'])).flat();
     if (!Array.isArray(current) || current.some(l => typeof l?.name !== 'string')) throw new Error('PR labels unreadable');
-    for (const name of completed ? [under] : [approved, changes]) {
+    const remove = new Set(palette.flatMap(label => [label.name, ...label.previousNames]).filter(name => name !== desired));
+    for (const name of remove) {
       if (current.some(l => l.name === name)) {
         // Completion during a lookup cancels the rest of this start hook, not the verdict.
         if (!completed && loadTask(h, id).state !== 'working') return;
@@ -1903,7 +1921,6 @@ function reviewLabels(h, id, completed = false) {
         catch (error) { errors.push(error.message); }
       }
     }
-    const desired = completed ? verdict === 'APPROVE' ? approved : changes : under;
     try {
       if (JSON.parse(api('GET', `${repo}/labels/${encodeURIComponent(desired)}`)).name !== desired) throw new Error(`shared label not defined: ${desired}`);
       if (!completed && loadTask(h, id).state !== 'working') return;
