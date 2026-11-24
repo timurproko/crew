@@ -37,7 +37,7 @@ This is an excerpt; ordinary home, owner, task and copy-return fields are retain
 | `none` | null | null | null |
 | `unavailable` | null | null | Nonempty reason code |
 
-A valid recorded PR wins without any Git/GitHub lookup, even if the copy is gone. Its
+In legacy status, a valid recorded PR wins without any Git/GitHub lookup, even if the copy is gone. Fleet's closed-PR verification exception is described below. Its
 URL is normalized to `https://github.com/<owner>/<repo>/pull/<positive-number>` with
 query, fragment and trailing slash removed. An invalid recorded link is unavailable,
 not replaced by a lookup. Known network results use the canonical repository identity
@@ -71,8 +71,11 @@ than one candidate produce unavailable. A reused branch with several historical 
 not resolved by guessing the newest. No reports, transcripts, footer badges, other
 tasks' branches, repository-wide inventories, fetches or pushes are used.
 
-Discovery is read-only for owners and non-owners. It does not record PRs, stages, report
-completion or landing, claim ownership, trigger recovery, or write Git state. In
+Discovery is read-only toward GitHub for owners and non-owners. It does not set the
+authoritative task `pr`, stages, report completion or landing, claim ownership, trigger
+recovery, or write Git state. It may save verified observations separately in `task.json`
+as `prFacts`: version 1, canonical `url`, `state` (`OPEN`, `MERGED`, `CLOSED`, `NOT_FOUND` or null),
+`mergedAt`, `closedAt`, and `observedAt`. The terminal `NOT_FOUND` state records only proven absence, not a generic 404. These facts are not delivery authority. In
 particular, discovering a draft does not let plain land bypass its reported-worker and
 clean-copy checks or turn a workflow plan into implementation. `crew done` and `crew
 land` retain their existing authority.
@@ -82,7 +85,26 @@ land` retain their existing authority.
 Added subprocess reads are serial, with at most two seconds per process, a one-MiB
 combined stdout/stderr acceptance limit, and a ten-second shared monotonic discovery
 budget. Timeouts kill the child; Crew does not retry. Repository resolutions are cached
-only within one invocation, not written to disk. Remaining eligible tasks become
+only within one invocation, not written to disk. Verified PR observations are durable:
+the existing discovery response supplies lifecycle facts without another request. Existing
+land/finish PR reads also save state and timestamps when available, including the
+existing approval-freshness GET used by first and repeated plain land. REST observations
+use the validated web `html_url`, never the API `url`; GraphQL/CLI `url` is already a web
+URL. Complete recorded wire responses and endpoint provenance live in
+[the GitHub fixtures](fixtures/github/README.md). Observation updates
+preserve current task lifecycle fields and do not change `updated`; cache-write failures
+never fail status. Observation saves never wait for a task lock, skip when lifecycle work
+is pending, and abandon Windows sharing-error replacement retries so lifecycle commands
+take priority. An already-started atomic replacement cannot be preempted: lifecycle
+writers allow two seconds total to acquire their intent/task locks, covering the supported
+one-second replacement retry window plus scheduling margin. Exhausted contention returns
+retryable exit 6 with `task-busy:` rather than an internal-error exit 70; locks are never
+stolen. Retry after the writer finishes, and do not remove a lock while its writer may
+still be running. Missing/failed reads do not invent closure or erase usable facts.
+Legacy discovery still skips recorded PRs; fleet may verify eligible closed-task links
+within the limits below. Unknown or unreachable state never manufactures a terminal fact. Facts apply only to their PR URL,
+never to a different recorded PR; a newer verified open observation clears old closure.
+GitHub event timestamps, not task age or observation time, determine fleet expiration. Remaining eligible tasks become
 unavailable/budget-exhausted when the deadline expires; recorded-link and non-ship
 classification needs no subprocess. This bounds added discovery, not the pre-existing
 Core/status projection or the consumer's transport. A caller's own overall timeout can
@@ -108,6 +130,70 @@ not raw stderr, credentials, report text or paths:
 Large homes can be incomplete by design. Consumers should preserve unavailable status
 and refresh deliberately through their existing bounded refresh lifecycle, not launch
 unbounded parallel queries or retries to fill gaps.
+
+## Fleet view version 1
+
+`crew status --json --view fleet [--discover-prs]` uses the same version-1 discovery
+objects but a separate exact projection. Root keys are `home`, `owner`, `tasks`,
+`prDiscovery` (`{"version":1}`), and `view` (`{"name":"fleet","version":1}`). Owner is
+null or exactly `terminal`/`live`; tasks contain exactly `id`, `state`, `terminal`, `pr`
+and `prDiscovery`. Missing terminal and recorded PR values are null. No launch, standby,
+fallback, core, recovery, error, elapsed, report or copy-return details are emitted.
+
+Every state except `closed` is retained. A closed task needs a recorded or verified
+saved/current discovered PR. Its age is irrelevant: open and unknown PR states stay;
+MERGED expires strictly more than 24 hours after valid GitHub mergedAt, CLOSED after
+closedAt. Exactly 24 hours, unknown/invalid/future event times, and failed reads do not
+expire a PR. Proven NOT_FOUND expires a closed task immediately, with no time window;
+recorded URLs are not modified. Facts for another recorded URL cannot expire it. Closed scouts/reviews
+without PRs are omitted, and `--all` does not override this view's retention.
+
+Without discovery, root/per-task discovery fields are still present and use saved facts
+only. Valid recorded links are known/recorded; saved discovered links are known/github.
+Unlinked non-ships are none and unobserved ships are unavailable with `not-requested`.
+With discovery, eligible unrecorded ships use the same exact lookup; a saved link remains
+known when refresh is unavailable or no longer finds its returned copy's branch. Newly
+learned lifecycle facts affect filtering on the current call as well as later offline
+calls. The only additional reads are eligible closed-task recorded-PR verifications:
+at most five single GraphQL requests per poll, serial, each within two seconds and the
+same ten-second shared deadline. Existing discovery has first use of that budget. Unknown
+facts are eligible; known-open facts refresh no sooner than ten minutes after their last
+successful observation. Other terminal facts are not re-verified. Live tasks, offline fleet
+and legacy status add no verification requests. A best-effort per-home cursor rotates
+attempts across failures; it also persists open-check cooldowns, including failed open
+refresh attempts or a successful check whose task-fact save yielded to lifecycle work.
+Unqueried tasks simply wait for later polls.
+
+Each proof query uses the same credentials to read the repository's canonical identity,
+its PR connection and the exact recorded PR number. A null PR is authoritative only if
+repository identity and PR-read access are established, with no errors except NOT_FOUND
+at that exact PR field. Generic HTTP 404, inaccessible repository or PR connection,
+permission/authentication/rate-limit failures and malformed responses remain unknown.
+Successful facts are stored as usual; NOT_FOUND is terminal and excludes closed tasks on
+the same call and future offline polls. Live tasks remain included even if another
+lifecycle read learned absence. Land and finish replace their existing exact-PR reads
+with the same proof query where applicable; finish uses an exact URL for branch proof
+only when the supported project origin matches that URL's repository, otherwise retaining
+its existing project-context branch lookup. Missing or foreign PRs never authorize branch deletion.
+
+Fleet never reads task prose or copy-return state and never probes individual worker
+terminals. The home owner's liveness is still checked. Its derived version-1 index at
+`<home>/state/status-fleet-index.json` stores only small state summaries. Every invocation
+checks task IDs and file identity/size/mtime/ctime, reloading changed source files; deleted
+or unreadable sources cannot be resurrected by an old summary. Missing/invalid indexes
+rebuild from state files and cache-write failure falls back to state reads. Initial
+rebuild can exceed indexed polling time; optional network discovery retains its existing
+ten-second budget rather than claiming sub-second GitHub service time. Unbounded numbers
+of still-open/unknown PRs are deliberately not truncated.
+
+Unknown `--view` values fail with usage exit 2 and stable `unsupported-status-view:` text,
+before status or discovery work. Fleet without JSON and missing view values fail usage.
+Help (`crew --help` or `node crew.mjs --help`) advertises literal `--view fleet` for the
+app's capability probe; this text and the complete shape are pinned by CLI tests.
+Clients must validate the view marker too: older Crew may ignore unknown flags and return
+legacy full status. Capability fallback may use `status --all --json --discover-prs`;
+transport failures, timeouts or authentication errors are not unsupported capabilities.
+Legacy status forms without --view retain their field ordering and serialized output.
 
 ## Separate Herdr adoption task
 

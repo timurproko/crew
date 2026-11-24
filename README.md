@@ -62,7 +62,8 @@ crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   c
 crew relaunch <id> [who] ["<why>"]       end the current session and hand over working, stopped or failed work; copy stays
 crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; recover stopped or idle workers
 crew status [--all] [--json]             tasks, terminals and elapsed time; JSON also shows delivery kind, standby eligibility and recovery
-crew status --json --discover-prs       opt-in, versioned read-only PR discovery before workers report
+crew status --json --discover-prs       opt-in, versioned GitHub read-only PR discovery before workers report
+crew status --json --view fleet         minimal v1 fleet and PR-lifetime history; optional --discover-prs
 crew stop <id> [--force]                 ask the worker to leave
 crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
 crew done [<id>]                         (worker) my report is written
@@ -383,11 +384,71 @@ Ordinary status forms read recorded PRs only and make no network calls. Opt in w
 before its first report, for workflow, gate and plain projects. The version-1 overlay
 adds top-level `prDiscovery.version` and per-task `prDiscovery` with `status` (`known`,
 `none`, `unavailable`), `url`, `source` and `reason`. `tasks[].pr` remains the stored
-value: discovery never records links, changes stages, or lands tasks and is available to
-non-owners. Lookups verify the task's exact copy, recorded branch and project origin;
+value: discovery never sets that authoritative link, changes stages, or lands tasks and
+is available to non-owners. It saves verified URL/state/mergedAt/closedAt observations
+separately as task `prFacts`; existing land/finish PR reads save those facts too. Legacy
+status discovery still skips recorded links. Fleet discovery has the narrowly bounded
+closed-PR verification exception below; unreachable or unproven state stays conservative. Lookups verify the task's exact copy, recorded branch and project origin;
 unsupported remotes and failures are unavailable, not confirmed absence. Added reads run
 serially with two-second subprocess limits and a ten-second shared budget; remaining
 tasks can be unavailable. See [the JSON contract and limits](docs/status-pr-discovery.md).
+
+### Minimal fleet status
+
+For a polling fleet reader use `crew status --json --view fleet`, optionally with
+`--discover-prs`. It emits **only** these fields (null owner is also valid):
+
+```json
+{
+  "home": "C:/Users/me/.crew",
+  "owner": { "terminal": "t1", "live": true },
+  "tasks": [{
+    "id": "ship", "state": "working", "terminal": "t2", "pr": null,
+    "prDiscovery": { "status": "unavailable", "url": null, "source": null, "reason": "not-requested" }
+  }],
+  "prDiscovery": { "version": 1 },
+  "view": { "name": "fleet", "version": 1 }
+}
+```
+
+Every non-closed task is included. A closed task is included only with a recorded or
+verified discovered PR. Open and unknown-state PRs stay visible however old the task is;
+known merged/closed PRs disappear only **more than 24 hours after GitHub's mergedAt or
+closedAt**, not after task completion. A proven `NOT_FOUND` PR is excluded immediately,
+without a 24-hour window; the recorded URL is never rewritten or deleted. A generic 404,
+authentication, permission, network or rate-limit failure is not proof and stays included.
+Missing/invalid merge/close event times stay included. Closed scouts/reviews without PRs are omitted. `--all` does not override fleet retention; omit
+`--view` to get the unchanged legacy full history and fields.
+
+Without `--discover-prs`, only saved facts are used: recorded/saved discovered URLs are
+known, unlinked non-ships are none, and unobserved ships are unavailable/not-requested.
+With discovery, existing exact lookup and network budgets apply; saved links survive
+returned copies or failed refreshes. Only `--view fleet --discover-prs` may additionally
+verify a **closed** task's recorded PR when facts are unknown, or refresh known-open facts
+no more than once per **10 minutes** per task. There are at most **five additional GitHub
+requests per poll**, each at most two seconds, inside (never added to) the existing serial
+ten-second discovery budget. Existing unrecorded-PR discovery runs first; unverified tasks
+wait for later polls, with best-effort rotation so failed checks do not starve other rows.
+One GraphQL request proves repository identity and PR-read access and reads the exact PR
+number. Only a missing PR with both proofs becomes durable `NOT_FOUND`; ambiguous failures
+remain unknown. Live tasks get no new verification requests. Offline fleet and all legacy
+status request behavior stay unchanged. Successful facts persist; terminal facts do not
+get re-verified. Existing land/finish reads can learn the same facts without extra reads. `tasks[].pr` always remains the authoritative stored
+value. The minimal view never reads briefs/reports, queries each worker, or inspects
+copy-return safety. A rebuildable summary index checks task file identity/size/timestamps
+on each poll and reloads changed states; a missing/corrupt index is rebuilt from state
+files. Initial rebuild is slower than indexed polling; cache writes are best effort.
+History is bounded by relevant PRs, not an arbitrary row cap: many open/unknown PRs can
+still produce many rows.
+
+The help output (`crew --help` or `node crew.mjs --help`) advertises the literal
+`--view fleet` as the capability signal. Check both version markers before consuming
+this contract. Unknown view names exit 2
+with `unsupported-status-view: <name>`; missing values or fleet without JSON are usage
+errors. A client can probe and fall back to `status --all --json --discover-prs` on an
+unsupported capability, not on a transport/authentication failure or timeout. Older Crew
+may silently ignore the option, so also check `view.name` and `view.version`. Herdr's
+adapter adoption is separate; this change does not edit its polling cadence or transport.
 
 ## Crew repairs itself
 

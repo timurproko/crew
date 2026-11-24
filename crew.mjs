@@ -71,7 +71,7 @@ export const bashPath = p => { const s = slash(p); return /^[A-Za-z]:\//.test(s)
 const now = () => new Date().toISOString();
 
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
-function writeJson(file, value) {
+function writeJson(file, value, { retrySharing = true } = {}) {
   const tmp = `${file}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
@@ -83,7 +83,7 @@ function writeJson(file, value) {
         // Windows readers/virus scanners can briefly deny replacement. Keep both
         // snapshots (and the caller's registry lock) intact until rename succeeds.
         // Never unlink the destination: readers must always see complete JSON.
-        if (!WINDOWS || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || remaining <= 0) throw error;
+        if (!retrySharing || !WINDOWS || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || remaining <= 0) throw error;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(20, remaining));
       }
     }
@@ -250,7 +250,107 @@ function loadTask(h, id) {
   if (!task) refuse(`No task ${id} in ${h.dir}.`);
   return task;
 }
-const saveTask = (h, task) => writeJson(taskFile(h, task.id), { ...task, updated: now() });
+// Lifecycle intent prevents successive polls from taking the task lock ahead of
+// done/finish/land/tell/spawn. An already-started atomic write cannot be preempted:
+// allow its supported one-second Windows replacement window plus scheduling margin.
+function taskTransaction(h, id, action, { observation = false } = {}) {
+  const lock = `${taskFile(h, id)}.lock`, priority = `${taskFile(h, id)}.lifecycle.lock`;
+  const deadline = Date.now() + 2000;
+  const acquire = (file, wait) => {
+    for (;;) {
+      try { return fs.openSync(file, 'wx'); }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        if (!wait) return null;
+        if (Date.now() >= deadline) refuse(`task-busy: ${id}; retry the command after the current writer releases ${slash(file)}. Do not remove a lock while its writer may still be running.`, 6);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+    }
+  };
+  const release = (file, fd) => { fs.closeSync(fd); fs.rmSync(file, { force: true }); };
+  if (observation && fs.existsSync(priority)) return;
+  const intent = observation ? null : acquire(priority, true);
+  try {
+    const fd = acquire(lock, !observation);
+    if (fd === null) return;
+    try {
+      // Close the race with lifecycle intent arriving after the first check.
+      if (observation && fs.existsSync(priority)) return;
+      return action(readJson(taskFile(h, id)));
+    } finally { release(lock, fd); }
+  } finally { if (intent !== null) release(priority, intent); }
+}
+const saveTask = (h, task) => taskTransaction(h, task.id, current => {
+  const prFacts = current?.prFacts;
+  writeJson(taskFile(h, task.id), { ...task, ...(prFacts ? { prFacts } : {}), updated: now() });
+});
+
+const prTime = value => {
+  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value)) return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString().slice(0, 19) === value.slice(0, 19) ? value : null;
+};
+// REST url is the API address; html_url is the browser URL. GraphQL/CLI url
+// is already a browser URL, so it is only the fallback when html_url is absent.
+export function prObservation(pr, url = pr?.html_url ?? pr?.url, observedAt = now()) {
+  url = canonicalPrUrl(url);
+  if (!url) return null;
+  const mergedAt = prTime(pr?.mergedAt ?? pr?.merged_at), closedAt = prTime(pr?.closedAt ?? pr?.closed_at);
+  let state = typeof pr?.state === 'string' ? pr.state.toUpperCase() : null;
+  if (!['OPEN', 'MERGED', 'CLOSED'].includes(state)) state = null;
+  if (state === 'CLOSED' && mergedAt) state = 'MERGED';
+  return { version: 1, url, state, mergedAt: state === 'MERGED' ? mergedAt : null,
+    closedAt: ['MERGED', 'CLOSED'].includes(state) ? closedAt : null, observedAt };
+}
+// A nullable PR alone (or a generic 404) is not proof. The same GraphQL
+// response must establish repository identity AND access to its PR connection.
+export function verifiedPrRead(payload, url, observedAt = now()) {
+  url = canonicalPrUrl(url);
+  const repository = payload?.data?.repository, errors = payload?.errors ?? [];
+  if (!url || !repository || !Array.isArray(errors)) return null;
+  const [, owner, name] = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\//.exec(url);
+  if (typeof repository.nameWithOwner !== 'string' || repository.nameWithOwner.toLowerCase() !== `${owner}/${name}`.toLowerCase()
+    || !Number.isSafeInteger(repository.pullRequests?.totalCount) || repository.pullRequests.totalCount < 0) return null;
+  if (repository.pullRequest === null) {
+    if (errors.some(e => e?.type !== 'NOT_FOUND' || JSON.stringify(e.path) !== '["repository","pullRequest"]')) return null;
+    return { facts: { ...prObservation({}, url, observedAt), state: 'NOT_FOUND' }, pr: null };
+  }
+  const pr = repository.pullRequest;
+  if (errors.length || canonicalPrUrl(pr?.url)?.toLowerCase() !== url.toLowerCase() || !['OPEN', 'MERGED', 'CLOSED'].includes(pr.state)) return null;
+  return { facts: prObservation(pr, url, observedAt), pr };
+}
+function prReadArgs(url, fields = '') {
+  const [, owner, name, number] = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)$/.exec(canonicalPrUrl(url));
+  return ['api', '--hostname', 'github.com', 'graphql', '-f',
+    `query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){nameWithOwner pullRequests(first:1){totalCount} pullRequest(number:$number){url state mergedAt closedAt ${fields}}}}`,
+    '-f', `owner=${owner}`, '-f', `name=${name}`, '-F', `number=${number}`];
+}
+function readPrAtUrl(url, fields, options) {
+  if (!canonicalPrUrl(url)) return null;
+  const asked = gh(prReadArgs(url, fields), options);
+  if (asked.error || ![0, 1].includes(asked.code)) return null;
+  try { return verifiedPrRead(JSON.parse(asked.stdout), url); } catch { return null; }
+}
+export function rememberTaskPr(h, task, facts) {
+  if (!facts || !validId(task.id)) return;
+  try {
+    taskTransaction(h, task.id, current => {
+      if (!current || ['branch', 'project', 'worktree'].some(key => current[key] !== task[key])) return;
+      if (current.pr != null && canonicalPrUrl(current.pr)?.toLowerCase() !== facts.url.toLowerCase()) return;
+      const old = current.prFacts;
+      if (old?.url?.toLowerCase() === facts.url.toLowerCase()) {
+        if (Date.parse(old.observedAt) > Date.parse(facts.observedAt)) return;
+        if (!facts.state && old.state) return;
+        if (old.state === facts.state) facts = { ...facts, mergedAt: facts.mergedAt ?? old.mergedAt, closedAt: facts.closedAt ?? old.closedAt };
+        if (['state', 'mergedAt', 'closedAt', 'observedAt'].every(key => old[key] === facts[key])) return;
+      }
+      // Observations never touch updated, state, pr, stage, reports or landing.
+      // A sharing error yields immediately to lifecycle work; a later poll can
+      // save these facts. Only lifecycle writes use writeJson's replacement retries.
+      writeJson(taskFile(h, task.id), { ...current, prFacts: facts }, { retrySharing: false });
+    }, { observation: true });
+  } catch { /* A read-only caller may not be able to cache; the response still works. */ }
+}
 function allTasks(h) {
   if (!fs.existsSync(h.tasks)) return [];
   return fs.readdirSync(h.tasks).filter(validId).map(id => readJson(taskFile(h, id))).filter(Boolean)
@@ -1445,15 +1545,30 @@ function cmdStop(args) {
 // Once they are merged it holds nothing, so it goes with the copy. Merged means: reachable
 // from the project's current or default branch, or GitHub has a merged pull request whose
 // head is exactly this commit (a squash merge leaves no ancestry). Anything unsure keeps it.
-function dropMergedBranch(project, task) {
+function dropMergedBranch(h, project, task) {
   if (task.kind !== 'ship' || !project?.path) return '';
   const branch = branchOf(task), git = (...a) => run('git', ['-C', project.path, ...a], { timeout: 60000 });
   const tip = git('rev-parse', '--verify', '-q', `refs/heads/${branch}`).stdout.trim();
   if (!tip) return '';
   let merged = ['HEAD', 'refs/remotes/origin/HEAD'].some(ref => git('merge-base', '--is-ancestor', tip, ref).code === 0);
-  if (!merged && git('remote', 'get-url', 'origin').code === 0) {
-    const asked = gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid', '--jq', '.[0].headRefOid'], { cwd: project.path, timeout: 60000 });
-    merged = asked.code === 0 && asked.stdout.trim() === tip;
+  const origin = !merged ? git('remote', 'get-url', 'origin') : null;
+  if (!merged && origin?.code === 0) {
+    const repository = /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([a-z0-9-]+\/[a-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(origin.stdout.trim())?.[1];
+    const recorded = canonicalPrUrl(task.pr);
+    // A recorded URL from another repository must NEVER authorize deletion.
+    // Unsupported origins/SSH aliases retain the existing project-context lookup.
+    if (recorded && repository && recorded.toLowerCase().startsWith(`https://github.com/${repository.toLowerCase()}/pull/`)) {
+      // Replace the existing branch read, not add another request. Exact URL reads
+      // can also prove absence; a missing PR never proves the branch was merged.
+      const found = readPrAtUrl(task.pr, 'headRefOid', { cwd: project.path, timeout: 60000 });
+      if (found) rememberTaskPr(h, task, found.facts);
+      merged = found?.pr?.headRefOid === tip && found.pr.state === 'MERGED';
+    } else {
+      const asked = gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid,url,state,mergedAt,closedAt'], { cwd: project.path, timeout: 60000 });
+      let pr; try { pr = JSON.parse(asked.stdout)?.[0]; } catch { /* No proof. */ }
+      merged = asked.code === 0 && pr?.headRefOid === tip && pr.state === 'MERGED';
+      if (merged) rememberTaskPr(h, task, prObservation(pr));
+    }
   }
   return merged && git('branch', '-D', branch).code === 0 ? `; merged branch ${branch} deleted` : '';
 }
@@ -1725,7 +1840,7 @@ function returnWaiting(h, task, { force = false } = {}) {
     // Removed by hand: git still lists it and the merged branch is still there.
     if (project?.path) run('git', ['-C', project.path, 'worktree', 'prune']);
     saveTask(h, { ...rest, copyReturned: now() });
-    return { state: 'gone', line: `the working copy of finished task ${task.id} was already gone${dropMergedBranch(project, task)}` };
+    return { state: 'gone', line: `the working copy of finished task ${task.id} was already gone${dropMergedBranch(h, project, task)}` };
   }
   const holders = otherTerminalsIn(task.worktree, task.terminal);
   if (holders === null) return { state: 'silent', line: `${CORE_SILENT} the terminals in ${task.worktree}; the working copy of ${task.id} was kept. Try again.` };
@@ -1736,7 +1851,7 @@ function returnWaiting(h, task, { force = false } = {}) {
   const back = returnCopy(task, project, { force: check.leftovers });
   if (!back.ok) return { state: 'failed', line: `the working copy of ${task.id} was not returned yet: ${back.why}` };
   saveTask(h, { ...rest, copyReturned: now() });
-  return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${check.unseen ? '; discarded unseen after explicit --force' : ''}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}` };
+  return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${check.unseen ? '; discarded unseen after explicit --force' : ''}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}` };
 }
 
 function cmdFinish(args) {
@@ -1804,7 +1919,7 @@ function cmdFinish(args) {
     console.log(`finished ${id} (${result.how}); its working copy is kept for now (${reason})${holders?.length ? ' and crew returns it by itself once nothing holds it' : '; the next crew finish or crew start retries its return'}; report kept at ${task.report}`);
   } else {
     saveTask(h, closed);
-    console.log(`finished ${id} (${result.how})${back.said}${comparison?.unseen ? '; discarded unseen after explicit --force' : ''}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}`);
+    console.log(`finished ${id} (${result.how})${back.said}${comparison?.unseen ? '; discarded unseen after explicit --force' : ''}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}`);
   }
   // A legacy treehouse task moves its scout's item even after a review, as it always did.
   if (task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews)) backlogMove(h, id, 'done');
@@ -1919,6 +2034,9 @@ function reviewLabels(h, id, action = 'start') {
     };
     const pr = JSON.parse(api('GET', `${repo}/pulls/${m[4]}`, [], null, 2000));
     if (!['open', 'closed'].includes(pr?.state)) throw new Error('PR state unreadable');
+    if (check && pr.number === Number(m[4]) && canonicalPrUrl(pr.html_url)?.toLowerCase() === canonicalPrUrl(url)?.toLowerCase()) {
+      rememberTaskPr(h, task, prObservation(pr, pr.html_url));
+    }
     const open = pr.state === 'open' && !pr.merged_at;
     const currentHead = typeof pr.head?.sha === 'string' && /^[a-f0-9]{40,64}$/.test(pr.head.sha) ? pr.head.sha : null;
     let recorded;
@@ -1994,11 +2112,12 @@ function unpushedCommits(git, branch) {
   return Number(git('rev-list', '--count', 'FETCH_HEAD..HEAD').stdout.trim()) || 0;
 }
 // "draft, 2 of 3 outcomes ticked" from one read of the pull request; null when GitHub does not answer.
-function pullRequestState(url) {
-  const asked = gh(['pr', 'view', url, '--json', 'isDraft,body'], { timeout: 60000 });
-  let pr = null;
-  try { pr = JSON.parse(asked.stdout); } catch { return null; }
-  if (asked.code !== 0 || !pr) return null;
+function pullRequestState(h, task, url) {
+  const found = readPrAtUrl(url, 'isDraft body', { timeout: 60000 });
+  if (!found) return null;
+  rememberTaskPr(h, task, found.facts);
+  const pr = found.pr;
+  if (!pr) return null;
   const outcomes = /^## Implementation\s*$([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(pr.body ?? '')?.[1] ?? '';
   const ticked = (outcomes.match(/^\s*- \[[xX]\]/gm) ?? []).length, all = ticked + (outcomes.match(/^\s*- \[ \]/gm) ?? []).length;
   return `${pr.isDraft ? 'draft' : 'ready'}${all ? `, ${ticked} of ${all} outcomes ticked` : ''}`;
@@ -2049,7 +2168,7 @@ function cmdLand(args) {
     const found = pullRequestOf(task, branchOf(task), { firstLine: true });
     if (!found) no(`the worker has not opened its pull request yet. Tell it: crew tell ${id} "open the draft pull request as the change-delivery skill says and put Implementation: <its link> in the first line of your report"`);
     saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
-    const shown = pullRequestState(found);
+    const shown = pullRequestState(h, task, found);
     console.log(`delivered ${id}: ${found}${shown ? ` (${shown})` : ''}. It follows the repository's delivery workflow: its bot marks it ready; merging is the person's decision.`);
     backlogMove(h, id, 'done', ['--pr', found]);
     return;
@@ -2277,7 +2396,8 @@ function formatDuration(seconds) {
   return parts.slice(0, 2).join(' ') || '0s';
 }
 
-// Discovery is an output-only overlay: never feed an early PR back into done/land.
+// Discovery never feeds an early PR into done/land authority. Verified lifecycle
+// observations travel separately from the unchanged output overlay.
 const prResult = (status, url = null, source = null, reason = null) => ({ status, url, source, reason });
 export function canonicalPrUrl(value) {
   if (typeof value !== 'string' || value.length > 2048 || /\s/.test(value)) return null;
@@ -2287,28 +2407,37 @@ export function canonicalPrUrl(value) {
 }
 // Runner/clock injection keeps deadline and failure tests deterministic; production reads
 // are serial, bounded subprocesses. This helper neither reads reports nor writes anything.
-export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => performance.now() } = {}) {
+export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => performance.now(), observe = () => {},
+  verifyRecorded = () => false, attempted = () => {}, wallClock = () => Date.now() } = {}) {
   const deadline = clock() + 10000, repositories = new Map();
+  let verifications = 0;
   const fail = reason => { throw new Error(reason); };
-  const read = (command, args, cwd, failure) => {
+  const read = (command, args, cwd, failure, partial = false) => {
     const remaining = Math.floor(deadline - clock());
     if (remaining <= 0) fail('budget-exhausted');
     const result = execute(command, args, { cwd, timeout: Math.min(2000, remaining), killSignal: 'SIGKILL', maxBuffer: 1048576,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GH_PROMPT_DISABLED: '1', GH_HOST: 'github.com', GH_REPO: '', GH_PAGER: 'cat' } });
     if (result.error?.code === 'ETIMEDOUT') fail('timeout');
     if (result.error?.code === 'ENOBUFS' || Buffer.byteLength(result.stdout ?? '') + Buffer.byteLength(result.stderr ?? '') > 1048576) fail('invalid-response');
-    if (result.error || result.code !== 0) fail(failure);
+    if (result.error || (result.code !== 0 && !(partial && result.code === 1))) fail(failure);
     if (clock() >= deadline) fail('budget-exhausted');
     return result.stdout.trim();
   };
-  const ask = (args, cwd) => GH.endsWith('.mjs')
-    ? read(process.execPath, [GH, ...args], cwd, 'github-unavailable') : read(GH, args, cwd, 'github-unavailable');
+  const ask = (args, cwd, partial = false) => GH.endsWith('.mjs')
+    ? read(process.execPath, [GH, ...args], cwd, 'github-unavailable', partial) : read(GH, args, cwd, 'github-unavailable', partial);
   const parse = text => { try { return JSON.parse(text); } catch { fail('invalid-response'); } };
   const samePath = (a, b) => comparablePath(fs.realpathSync.native(a)) === comparablePath(fs.realpathSync.native(b));
   const repoName = value => typeof value === 'string' && /^[a-z0-9-]+\/[a-z0-9_.-]+$/i.test(value) && !['.', '..'].includes(value.split('/')[1]);
   return tasks.map(task => {
     if (task.pr != null) {
       const url = canonicalPrUrl(task.pr);
+      if (url && task.state === 'closed' && verifyRecorded(task) && verifications < 5 && clock() < deadline) {
+        try {
+          verifications++; attempted(task);
+          const found = verifiedPrRead(parse(ask(prReadArgs(url), undefined, true)), url, new Date(wallClock()).toISOString());
+          if (found) observe(task, found.facts);
+        } catch { /* An unproven absence never changes recorded-link discovery. */ }
+      }
       return url ? prResult('known', url, 'recorded') : prResult('unavailable', null, null, 'invalid-recorded-pr');
     }
     if (task.kind !== 'ship') return prResult('none');
@@ -2358,6 +2487,7 @@ export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => 
           || typeof pr.base?.repo?.full_name !== 'string' || pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase()) fail('invalid-response');
       }
       if (prs.length !== 1) fail('ambiguous-pr');
+      observe(task, prObservation(prs[0], canonicalPrUrl(prs[0].html_url)));
       return prResult('known', canonicalPrUrl(prs[0].html_url), 'github');
     } catch (error) {
       // Only our stable reason codes escape; filesystem/runner errors reveal no paths,
@@ -2368,10 +2498,136 @@ export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => 
   });
 }
 
+function savedPrFacts(task) {
+  const facts = task.prFacts;
+  if (facts?.version !== 1 || !canonicalPrUrl(facts.url)) return null;
+  if (task.pr != null && canonicalPrUrl(task.pr)?.toLowerCase() !== facts.url.toLowerCase()) return null;
+  return facts;
+}
+function expiredFleetPr(task, currentTime) {
+  const facts = savedPrFacts(task);
+  if (facts?.state === 'NOT_FOUND') return true;
+  const event = facts?.state === 'MERGED' ? facts.mergedAt : facts?.state === 'CLOSED' ? facts.closedAt : null;
+  return Boolean(prTime(event) && currentTime - Date.parse(event) > 24 * 3600 * 1000);
+}
+export function fleetTaskVisible(task, currentTime) {
+  return task.state !== 'closed' || Boolean((task.pr != null || savedPrFacts(task)) && !expiredFleetPr(task, currentTime));
+}
+function localFleetPr(task) {
+  if (task.pr != null) {
+    const url = canonicalPrUrl(task.pr);
+    return url ? prResult('known', url, 'recorded') : prResult('unavailable', null, null, 'invalid-recorded-pr');
+  }
+  const facts = savedPrFacts(task);
+  if (facts) return prResult('known', facts.url, 'github');
+  return task.kind === 'ship' ? prResult('unavailable', null, null, 'not-requested') : prResult('none');
+}
+// Derived summaries avoid decoding thousands of large historical states on every
+// poll. State files stay authoritative: enumerate IDs and validate file identity,
+// size and timestamps on every read; reload only changed/missing summaries.
+function fleetTasks(h) {
+  if (!fs.existsSync(h.tasks)) return [];
+  const file = path.join(h.dir, 'state', 'status-fleet-index.json'), cached = readJson(file);
+  const usable = cached?.version === 1 && cached.entries && typeof cached.entries === 'object' && !Array.isArray(cached.entries);
+  const entries = {}, tasks = []; let changed = !usable;
+  for (const id of fs.readdirSync(h.tasks).filter(validId)) {
+    const source = taskFile(h, id);
+    let stat; try { stat = fs.statSync(source); } catch { changed = true; continue; }
+    const signature = [stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs];
+    const previous = usable ? ownEntry(cached.entries, id) : null;
+    let task;
+    if (previous?.task?.id === id && typeof previous.task.state === 'string' && Array.isArray(previous.signature)
+      && previous.signature.length === signature.length && signature.every((v, i) => previous.signature[i] === v)) task = previous.task;
+    else {
+      const record = readJson(source); changed = true;
+      if (!record || record.id !== id) continue;
+      // Never cache launch histories, reports, briefs, recovery or copy-return data.
+      task = Object.fromEntries(['id', 'state', 'kind', 'terminal', 'pr', 'prFacts', 'created', 'project', 'branch', 'worktree']
+        .filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]));
+    }
+    entries[id] = { signature, task }; tasks.push(task);
+  }
+  if (usable && Object.keys(cached.entries).length !== Object.keys(entries).length) changed = true;
+  if (changed) {
+    try { fs.mkdirSync(path.dirname(file), { recursive: true }); writeJson(file, { version: 1, entries }); }
+    catch { /* A derived cache is optional for read-only homes. */ }
+  }
+  return tasks.sort((a, b) => String(a.created).localeCompare(String(b.created)));
+}
+function cmdFleetStatus(h, discover) {
+  const { owner, live } = ownerState(h), currentTime = Date.now();
+  // One state-only pass; never enter the full status/report/Core/copy projection.
+  const records = fleetTasks(h).filter(t => fleetTaskVisible(t, currentTime)
+    || (discover && t.state === 'closed' && t.kind === 'ship' && t.pr == null && !savedPrFacts(t)));
+  const results = new Map(records.map(t => [t.id, localFleetPr(t)]));
+  if (discover) {
+    const cursorFile = path.join(h.dir, 'state', 'status-fleet-pr-cursor.json');
+    const cursor = readJson(cursorFile), openChecked = {};
+    for (const t of records) {
+      const checked = cursor?.openChecked && ownEntry(cursor.openChecked, t.id);
+      if (checked && t.state === 'closed' && canonicalPrUrl(t.pr)?.toLowerCase() === canonicalPrUrl(checked.url)?.toLowerCase()) openChecked[t.id] = checked;
+    }
+    const eligible = records.filter(t => {
+      if (t.state !== 'closed' || !canonicalPrUrl(t.pr)) return false;
+      const checked = ownEntry(openChecked, t.id), age = currentTime - Date.parse(prTime(checked?.at));
+      if (checked && age >= 0 && age < 600000) return false;
+      const facts = savedPrFacts(t);
+      return !facts?.state || (facts.state === 'OPEN' && (!prTime(facts.observedAt) || currentTime - Date.parse(facts.observedAt) >= 600000));
+    });
+    const after = cursor?.after;
+    const start = (eligible.findIndex(t => t.id === after) + 1) % (eligible.length || 1);
+    const verification = [...eligible.slice(start), ...eligible.slice(0, start)].slice(0, 5);
+    const verifyIds = new Set(verification.map(t => t.id)); let lastAttempt;
+    // Existing discovery gets first use of the SAME budget. Recorded closed PR
+    // verification adds at most five one-request proofs; unqueried rows wait.
+    const pending = [...records.filter(t => t.pr == null), ...verification];
+    const discovered = discoverTaskPrs(pending, h.config.projects, {
+      verifyRecorded: t => verifyIds.has(t.id), attempted: t => {
+        lastAttempt = t.id;
+        if (savedPrFacts(t)?.state === 'OPEN') openChecked[t.id] = { url: canonicalPrUrl(t.pr), at: new Date(Date.now()).toISOString() };
+      },
+      observe: (task, facts) => {
+      if (!facts) return;
+      if (verifyIds.has(task.id)) {
+        if (facts.state === 'OPEN') openChecked[task.id] = { url: facts.url, at: facts.observedAt };
+        else delete openChecked[task.id];
+      }
+      rememberTaskPr(h, task, facts);
+      // Use current verified observations even if caching failed, but an unknown
+      // response must not erase an earlier usable state or corresponding event.
+      const old = savedPrFacts(task);
+      if (!old || facts.state) task.prFacts = old?.state === facts.state
+        ? { ...facts, mergedAt: facts.mergedAt ?? old.mergedAt, closedAt: facts.closedAt ?? old.closedAt } : facts;
+    } });
+    if (lastAttempt) {
+      try { fs.mkdirSync(path.dirname(cursorFile), { recursive: true }); writeJson(cursorFile, { after: lastAttempt, openChecked }, { retrySharing: false }); }
+      catch { /* Rotation is best effort, not task authority. */ }
+    }
+    pending.forEach((t, i) => {
+      // A returned copy or temporary discovery failure cannot hide a saved link.
+      if (discovered[i].status === 'known' || results.get(t.id).status !== 'known') results.set(t.id, discovered[i]);
+    });
+  }
+  const tasks = records.filter(t => fleetTaskVisible(t, currentTime)).map(t => ({ id: t.id, state: t.state,
+    terminal: t.terminal ?? null, pr: t.pr ?? null, prDiscovery: results.get(t.id) }));
+  console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live } : null,
+    tasks, prDiscovery: { version: 1 }, view: { name: 'fleet', version: 1 } }));
+}
 function cmdStatus(args) {
   const json = args.includes('--json'), all = args.includes('--all'), discover = args.includes('--discover-prs');
+  let view;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--view' || args[i].startsWith('--view=')) {
+      if (view !== undefined) refuse('Usage: crew status --json --view fleet [--discover-prs] (one view only)');
+      view = args[i] === '--view' ? args[++i] : args[i].slice('--view='.length);
+      if (!view || view.startsWith('--')) refuse('Usage: crew status --json --view fleet [--discover-prs] (missing --view value)');
+      if (view !== 'fleet') refuse(`unsupported-status-view: ${view}; supported views: fleet`);
+    }
+  }
+  if (view && !json) refuse('Usage: crew status --json --view fleet [--discover-prs]');
   if (discover && !json) refuse('Usage: crew status --json --discover-prs [--all]');
   const h = home();
+  if (view === 'fleet') { cmdFleetStatus(h, discover); return; }
   const { owner, live, mine } = ownerState(h);
   const currentTime = Date.now();
   const records = allTasks(h).filter(t => all || t.state !== 'closed');
@@ -2392,7 +2648,7 @@ function cmdStatus(args) {
   // holders, and plain status (which is about unfinished work) says how many there are.
   const waiting = all ? 0 : allTasks(h).filter(t => t.state === 'closed' && t.copyToReturn).length;
   if (discover) {
-    const results = discoverTaskPrs(records, h.config.projects);
+    const results = discoverTaskPrs(records, h.config.projects, { observe: (task, facts) => rememberTaskPr(h, task, facts) });
     tasks.forEach((task, i) => { task.prDiscovery = results[i]; });
   }
   if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks, ...(all ? {} : { copiesToReturn: waiting }), ...(discover ? { prDiscovery: { version: 1 } } : {}) })); return; }
@@ -2429,7 +2685,8 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; recover stopped or idle workers
       CREW_NO_FALLBACK=1 also disables recovery and hand-over; questions/permissions need a person even with candidates left; ended terminals fail without hand-over
   crew status [--all] [--json]             tasks, terminals, PR links and elapsed time; --all also shows why finished copies wait
-  crew status --json --discover-prs       versioned read-only PR lookup; bounded network reads, no task-state writes
+  crew status --json --discover-prs       versioned GitHub read-only PR lookup; caches verified lifecycle facts
+  crew status --json --view fleet         minimal v1 fleet, PR-lifetime history; optional --discover-prs
       JSON: elapsedSeconds, recorded deliveryKind (gate/workflow/plain, null for non-ships), standby labels and standbyStatus with recorded skip reasons; no quota refresh
       recovery: current Core errors and continuation counts; JSON includes nudges history and the active recovery record; no messages sent
   crew stop <id> [--force]                 ask the worker to leave
