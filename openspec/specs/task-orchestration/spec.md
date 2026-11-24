@@ -379,6 +379,39 @@ Crew SHALL save verified PR URL, state, mergedAt and closedAt learned by discove
 - **WHEN** a discovery observation is saved while task lifecycle state changes
 - **THEN** saving the observation preserves the newer task state, recorded PR, report stage and unrelated fields
 
+### Requirement: Fleet status scales without reading historical prose
+
+Fleet status SHALL select and project tasks using saved state without reading task briefs, reports or transcripts, inspecting copy-return safety, or querying worker terminals individually. A synthetic history of 1,000 closed tasks without visible PRs plus a fixed small visible fleet SHALL produce fewer than 16,384 UTF-8 bytes. The local no-discovery path SHALL remain well under one second for several thousand finished tasks on the target machine.
+
+#### Scenario: Historical prose is large or inaccessible
+
+- **WHEN** thousands of closed tasks have large or unreadable briefs and reports
+- **THEN** fleet status does not read that prose or inspect their copies and returns only the minimal retained rows
+
+#### Scenario: Payload remains bounded by relevant rows
+
+- **WHEN** 1,000 closed tasks without PRs are added to a small visible fleet
+- **THEN** the output stays below 16,384 bytes and no irrelevant historical row appears
+
+### Requirement: Unsupported status views have detectable errors
+
+Crew SHALL reject unknown --view values with a nonzero usage exit and a stable `unsupported-status-view` diagnostic naming the value. Fleet SHALL require --json. Status without --view, including --all with or without discovery, SHALL retain its existing serialized field order and output bytes for unchanged input facts.
+
+#### Scenario: New client probes unsupported view
+
+- **WHEN** a caller supplies --view with an unknown name
+- **THEN** Crew reports unsupported-status-view before discovery or status projection rather than silently returning full status
+
+#### Scenario: View argument is missing or JSON is absent
+
+- **WHEN** a caller supplies --view without a value or --view fleet without --json
+- **THEN** Crew returns a clear usage error without starting discovery
+
+#### Scenario: Legacy consumer still requests all history
+
+- **WHEN** a caller requests status --all --json without --view
+- **THEN** all historical rows and legacy fields remain present and cached lifecycle facts introduce no new output fields
+
 ### Requirement: Fleet recorded-PR verification is bounded
 
 Only fleet status with --discover-prs SHALL verify closed-task recorded PRs whose facts are unknown, or known-open facts at least ten minutes old. It SHALL add at most five single GitHub requests per poll, within the existing serial two-second subprocess and ten-second shared budget. Existing discovery SHALL run first. Live tasks, offline fleet and legacy status SHALL add no verification requests. Successful facts SHALL persist.
@@ -416,36 +449,3 @@ Crew SHALL persist NOT_FOUND only when one response from the same credentials pr
 
 - **WHEN** an existing land or finish exact-PR read supplies the same authoritative absence proof
 - **THEN** Crew saves NOT_FOUND without an extra request, preserves its recorded URL and retains any branch not proved merged
-
-### Requirement: Fleet status scales without reading historical prose
-
-Fleet status SHALL select and project tasks using saved state without reading task briefs, reports or transcripts, inspecting copy-return safety, or querying worker terminals individually. A synthetic history of 1,000 closed tasks without visible PRs plus a fixed small visible fleet SHALL produce fewer than 16,384 UTF-8 bytes. The local no-discovery path SHALL remain well under one second for several thousand finished tasks on the target machine.
-
-#### Scenario: Historical prose is large or inaccessible
-
-- **WHEN** thousands of closed tasks have large or unreadable briefs and reports
-- **THEN** fleet status does not read that prose or inspect their copies and returns only the minimal retained rows
-
-#### Scenario: Payload remains bounded by relevant rows
-
-- **WHEN** 1,000 closed tasks without PRs are added to a small visible fleet
-- **THEN** the output stays below 16,384 bytes and no irrelevant historical row appears
-
-### Requirement: Unsupported status views have detectable errors
-
-Crew SHALL reject unknown --view values with a nonzero usage exit and a stable `unsupported-status-view` diagnostic naming the value. Fleet SHALL require --json. Status without --view, including --all with or without discovery, SHALL retain its existing serialized field order and output bytes for unchanged input facts.
-
-#### Scenario: New client probes unsupported view
-
-- **WHEN** a caller supplies --view with an unknown name
-- **THEN** Crew reports unsupported-status-view before discovery or status projection rather than silently returning full status
-
-#### Scenario: View argument is missing or JSON is absent
-
-- **WHEN** a caller supplies --view without a value or --view fleet without --json
-- **THEN** Crew returns a clear usage error without starting discovery
-
-#### Scenario: Legacy consumer still requests all history
-
-- **WHEN** a caller requests status --all --json without --view
-- **THEN** all historical rows and legacy fields remain present and cached lifecycle facts introduce no new output fields
