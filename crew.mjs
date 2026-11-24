@@ -270,7 +270,11 @@ const saveTask = (h, task) => taskTransaction(h, task.id, current => {
   writeJson(taskFile(h, task.id), { ...task, ...(prFacts ? { prFacts } : {}), updated: now() });
 });
 
-const prTime = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value) && Number.isFinite(Date.parse(value)) ? value : null;
+const prTime = value => {
+  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value)) return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString().slice(0, 19) === value.slice(0, 19) ? value : null;
+};
 export function prObservation(pr, url = pr?.url ?? pr?.html_url, observedAt = now()) {
   url = canonicalPrUrl(url);
   if (!url) return null;
@@ -292,7 +296,7 @@ export function rememberTaskPr(h, task, facts) {
         if (Date.parse(old.observedAt) > Date.parse(facts.observedAt)) return;
         if (!facts.state && old.state) return;
         if (old.state === facts.state) facts = { ...facts, mergedAt: facts.mergedAt ?? old.mergedAt, closedAt: facts.closedAt ?? old.closedAt };
-        if (['state', 'mergedAt', 'closedAt'].every(key => old[key] === facts[key])) return;
+        if (['state', 'mergedAt', 'closedAt', 'observedAt'].every(key => old[key] === facts[key])) return;
       }
       // Observations never touch updated, state, pr, stage, reports or landing.
       writeJson(taskFile(h, task.id), { ...current, prFacts: facts });
@@ -2372,10 +2376,102 @@ export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => 
   });
 }
 
+function savedPrFacts(task) {
+  const facts = task.prFacts;
+  if (facts?.version !== 1 || !canonicalPrUrl(facts.url)) return null;
+  if (task.pr != null && canonicalPrUrl(task.pr)?.toLowerCase() !== facts.url.toLowerCase()) return null;
+  return facts;
+}
+function expiredFleetPr(task, currentTime) {
+  const facts = savedPrFacts(task);
+  const event = facts?.state === 'MERGED' ? facts.mergedAt : facts?.state === 'CLOSED' ? facts.closedAt : null;
+  return Boolean(prTime(event) && currentTime - Date.parse(event) > 24 * 3600 * 1000);
+}
+export function fleetTaskVisible(task, currentTime) {
+  return task.state !== 'closed' || Boolean((task.pr != null || savedPrFacts(task)) && !expiredFleetPr(task, currentTime));
+}
+function localFleetPr(task) {
+  if (task.pr != null) {
+    const url = canonicalPrUrl(task.pr);
+    return url ? prResult('known', url, 'recorded') : prResult('unavailable', null, null, 'invalid-recorded-pr');
+  }
+  const facts = savedPrFacts(task);
+  if (facts) return prResult('known', facts.url, 'github');
+  return task.kind === 'ship' ? prResult('unavailable', null, null, 'not-requested') : prResult('none');
+}
+// Derived summaries avoid decoding thousands of large historical states on every
+// poll. State files stay authoritative: enumerate IDs and validate file identity,
+// size and timestamps on every read; reload only changed/missing summaries.
+function fleetTasks(h) {
+  if (!fs.existsSync(h.tasks)) return [];
+  const file = path.join(h.dir, 'state', 'status-fleet-index.json'), cached = readJson(file);
+  const usable = cached?.version === 1 && cached.entries && typeof cached.entries === 'object' && !Array.isArray(cached.entries);
+  const entries = {}, tasks = []; let changed = !usable;
+  for (const id of fs.readdirSync(h.tasks).filter(validId)) {
+    const source = taskFile(h, id);
+    let stat; try { stat = fs.statSync(source); } catch { changed = true; continue; }
+    const signature = [stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs];
+    const previous = usable ? ownEntry(cached.entries, id) : null;
+    let task;
+    if (previous?.task?.id === id && typeof previous.task.state === 'string' && Array.isArray(previous.signature)
+      && previous.signature.length === signature.length && signature.every((v, i) => previous.signature[i] === v)) task = previous.task;
+    else {
+      const record = readJson(source); changed = true;
+      if (!record || record.id !== id) continue;
+      // Never cache launch histories, reports, briefs, recovery or copy-return data.
+      task = Object.fromEntries(['id', 'state', 'kind', 'terminal', 'pr', 'prFacts', 'created', 'project', 'branch', 'worktree']
+        .filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]));
+    }
+    entries[id] = { signature, task }; tasks.push(task);
+  }
+  if (usable && Object.keys(cached.entries).length !== Object.keys(entries).length) changed = true;
+  if (changed) {
+    try { fs.mkdirSync(path.dirname(file), { recursive: true }); writeJson(file, { version: 1, entries }); }
+    catch { /* A derived cache is optional for read-only homes. */ }
+  }
+  return tasks.sort((a, b) => String(a.created).localeCompare(String(b.created)));
+}
+function cmdFleetStatus(h, discover) {
+  const { owner, live } = ownerState(h), currentTime = Date.now();
+  // One state-only pass; never enter the full status/report/Core/copy projection.
+  const records = fleetTasks(h).filter(t => fleetTaskVisible(t, currentTime)
+    || (discover && t.state === 'closed' && t.kind === 'ship' && t.pr == null && !savedPrFacts(t)));
+  const results = new Map(records.map(t => [t.id, localFleetPr(t)]));
+  if (discover) {
+    const pending = records.filter(t => t.pr == null);
+    const discovered = discoverTaskPrs(pending, h.config.projects, { observe: (task, facts) => {
+      rememberTaskPr(h, task, facts);
+      // Use current verified observations even if caching failed, but an unknown
+      // response must not erase an earlier usable state or corresponding event.
+      const old = savedPrFacts(task);
+      if (!old || facts.state) task.prFacts = old?.state === facts.state
+        ? { ...facts, mergedAt: facts.mergedAt ?? old.mergedAt, closedAt: facts.closedAt ?? old.closedAt } : facts;
+    } });
+    pending.forEach((t, i) => {
+      // A returned copy or temporary discovery failure cannot hide a saved link.
+      if (discovered[i].status === 'known' || results.get(t.id).status !== 'known') results.set(t.id, discovered[i]);
+    });
+  }
+  const tasks = records.filter(t => fleetTaskVisible(t, currentTime)).map(t => ({ id: t.id, state: t.state,
+    terminal: t.terminal ?? null, pr: t.pr ?? null, prDiscovery: results.get(t.id) }));
+  console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live } : null,
+    tasks, prDiscovery: { version: 1 }, view: { name: 'fleet', version: 1 } }));
+}
 function cmdStatus(args) {
   const json = args.includes('--json'), all = args.includes('--all'), discover = args.includes('--discover-prs');
+  let view;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--view' || args[i].startsWith('--view=')) {
+      if (view !== undefined) refuse('Usage: crew status --json --view fleet [--discover-prs] (one view only)');
+      view = args[i] === '--view' ? args[++i] : args[i].slice('--view='.length);
+      if (!view || view.startsWith('--')) refuse('Usage: crew status --json --view fleet [--discover-prs] (missing --view value)');
+      if (view !== 'fleet') refuse(`unsupported-status-view: ${view}; supported views: fleet`);
+    }
+  }
+  if (view && !json) refuse('Usage: crew status --json --view fleet [--discover-prs]');
   if (discover && !json) refuse('Usage: crew status --json --discover-prs [--all]');
   const h = home();
+  if (view === 'fleet') { cmdFleetStatus(h, discover); return; }
   const { owner, live, mine } = ownerState(h);
   const currentTime = Date.now();
   const records = allTasks(h).filter(t => all || t.state !== 'closed');
@@ -2432,7 +2528,8 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; recover stopped or idle workers
       CREW_NO_FALLBACK=1 also disables recovery and hand-over; questions/permissions need a person even with candidates left; ended terminals fail without hand-over
   crew status [--all] [--json]             tasks, terminals, PR links and elapsed time; --all also shows why finished copies wait
-  crew status --json --discover-prs       versioned read-only PR lookup; bounded network reads, no task-state writes
+  crew status --json --discover-prs       versioned GitHub read-only PR lookup; caches verified lifecycle facts
+  crew status --json --view fleet         minimal v1 fleet, PR-lifetime history; optional --discover-prs
       JSON: elapsedSeconds, recorded deliveryKind (gate/workflow/plain, null for non-ships), standby labels and standbyStatus with recorded skip reasons; no quota refresh
       recovery: current Core errors and continuation counts; JSON includes nudges history and the active recovery record; no messages sent
   crew stop <id> [--force]                 ask the worker to leave

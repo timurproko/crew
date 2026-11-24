@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -132,7 +132,7 @@ function repairFixture(name, sharedOrigin) {
 const a = process.argv.slice(2), file = ${JSON.stringify(log)}, log = JSON.parse(fs.readFileSync(file, 'utf8'));
 log.push({ a, token: process.env.GH_TOKEN === 'fake-token', body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : null }); fs.writeFileSync(file, JSON.stringify(log));
 if (a[0] === 'auth') { console.log('fake-token'); process.exit(0); }
-if (a[1] === 'list') { console.log(fs.existsSync(${JSON.stringify(merged)}) ? fs.readFileSync(${JSON.stringify(merged)}, 'utf8') : ''); process.exit(0); }
+if (a[1] === 'list') { const head = fs.existsSync(${JSON.stringify(merged)}) ? fs.readFileSync(${JSON.stringify(merged)}, 'utf8').trim() : ''; console.log(JSON.stringify(head ? [{ headRefOid: head, state: 'MERGED', url: 'https://github.com/acme/crew/pull/' + log.filter(x => x.a[1] === 'create').length, mergedAt: '2026-01-01T00:00:00Z', closedAt: '2026-01-01T00:00:00Z' }] : [])); process.exit(0); }
 if (a[1] === 'create' && fs.existsSync(${JSON.stringify(down)})) { console.error('GitHub temporarily unavailable'); process.exit(1); }
 console.log('https://github.com/acme/crew/pull/' + log.filter(x => x.a[1] === 'create').length);
 `);
@@ -934,6 +934,7 @@ gapTests['pr-facts'] = () => {
   assert.equal(merged.state, 'MERGED');
   assert.equal(prObservation({}, 'invalid'), null);
   assert.equal(prObservation({ state: 'MERGED', mergedAt: 'invalid' }, url).mergedAt, null);
+  assert.equal(prObservation({ state: 'MERGED', mergedAt: '2026-02-30T00:00:00Z' }, url).mergedAt, null);
   assert.equal(prObservation({ state: 'invented', mergedAt: stamp }, url).state, null);
   assert.equal(prObservation({ state: 'OPEN', mergedAt: stamp, closedAt: stamp }, url).closedAt, null);
   f.save({ ...f.task, state: 'closed', stage: 'implementation', updated: stamp, tells: 7 });
@@ -941,9 +942,10 @@ gapTests['pr-facts'] = () => {
   assert.deepEqual(read().prFacts, merged);
   const { prFacts, ...authority } = read();
   assert.deepEqual(authority, { ...f.task, state: 'closed', stage: 'implementation', updated: stamp, tells: 7 });
-  const bytes = fs.readFileSync(file, 'utf8');
   rememberTaskPr(h, f.task, { ...merged, observedAt: '2026-01-03T00:00:00Z' });
-  assert.equal(fs.readFileSync(file, 'utf8'), bytes, 'identical facts do not rewrite task timestamps or bytes');
+  assert.equal(read().updated, stamp, 'repeated facts never change lifecycle timestamps');
+  assert.equal(read().prFacts.observedAt, '2026-01-03T00:00:00Z', 'freshness watermark still advances');
+  const bytes = fs.readFileSync(file, 'utf8');
   rememberTaskPr(h, f.task, prObservation({}, url, '2026-01-04T00:00:00Z'));
   assert.equal(fs.readFileSync(file, 'utf8'), bytes, 'unknown reads cannot erase learned closure');
   rememberTaskPr(h, f.task, prObservation({ state: 'OPEN' }, url, '2026-01-01T00:00:00Z'));
@@ -1113,12 +1115,17 @@ const {main} = await import(${JSON.stringify(new URL('./crew.mjs', import.meta.u
   r = legacy(['status', '--all', '--json']); assert.equal(r.code, 0, r.out);
   assert.deepEqual(JSON.parse(r.out).tasks.map(t => t.id), ['closed', 'draft', 'scout']);
   assert.deepEqual(JSON.parse(fs.readFileSync(f.log, 'utf8')), [], 'all ordinary status forms make zero Git/GitHub reads here');
+  const variants = [['status'], ['status', '--all'], ['status', '--json'], ['status', '--all', '--json']];
+  const beforeFacts = variants.map(a => legacy(a).out);
   r = f.call(['status', '--all', '--json', '--discover-prs'], reader); assert.equal(r.code, 0, r.out);
+  const enhancedBytes = r.out;
   const enhanced = JSON.parse(r.out); assert.deepEqual(enhanced.owner, original.owner);
   assert.deepEqual(enhanced.tasks.map(t => t.id), ['closed', 'draft', 'scout']);
   assert.equal(enhanced.tasks[0].prDiscovery.source, 'recorded', 'recorded closed task needs no surviving copy');
   assert.equal(enhanced.tasks[1].prDiscovery.source, 'github'); assert.equal(enhanced.tasks[2].prDiscovery.status, 'none');
   assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 2, 'only the unrecorded ship has repo/head requests');
+  assert.deepEqual(variants.map(a => legacy(a).out), beforeFacts, 'all legacy forms remain byte-identical after observation caching');
+  assert.equal(f.call(['status', '--all', '--json', '--discover-prs'], reader).out, enhancedBytes, 'discovery output remains byte-identical too');
 };
 
 // Snapshot all authority/prose/Git bytes. Only the separate PR observation is
@@ -1196,6 +1203,118 @@ gapTests['pr-discovery-bounds'] = () => {
   assert.equal(JSON.parse(r.out).tasks[0].prDiscovery.reason, 'timeout');
   assert.ok(performance.now() - started < 8000, 'a hanging fake CLI is killed, not retried');
   assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 1);
+};
+
+gapTests['fleet-view'] = () => {
+  const f = prDiscoveryFixture('fleet-view'), args = ['status', '--json', '--view', 'fleet'];
+  const help = f.call(['--help']); assert.equal(help.code, 0, help.out);
+  assert.ok(help.out.includes('--view fleet'), 'Herdr capability probe requires this literal help text');
+  const clock = Date.parse('2026-06-01T12:00:00Z'), url = 'https://github.com/acme/demo/pull/12';
+  const ago = hours => new Date(clock - hours * 3600000).toISOString();
+  const task = (id, state, prState, hours, extra = {}) => ({ ...f.task, id, state, pr: url, created: '2020-01-01T00:00:00Z',
+    prFacts: prObservation({ state: prState, mergedAt: ago(hours), closedAt: ago(hours) }, url), ...extra });
+  const samples = [task('old-open', 'closed', 'OPEN', 9000), task('merged-25', 'closed', 'MERGED', 25),
+    task('merged-23', 'closed', 'MERGED', 23), task('merged-24', 'closed', 'MERGED', 24),
+    task('closed-25', 'closed', 'CLOSED', 25), task('closed-23', 'closed', 'CLOSED', 23), task('closed-24', 'closed', 'CLOSED', 24),
+    task('unknown', 'closed', null, 9000), task('invalid-time', 'closed', 'MERGED', 25, { prFacts: { version: 1, url, state: 'MERGED', mergedAt: 'bad' } }),
+    task('missing-time', 'closed', 'CLOSED', 25, { prFacts: { version: 1, url, state: 'CLOSED' } }),
+    task('future', 'closed', 'MERGED', -25), task('different-pr', 'closed', 'MERGED', 25, { pr: 'https://github.com/acme/demo/pull/13' }),
+    task('saved-only', 'closed', 'OPEN', 9000, { pr: null, worktree: path.join(f.dir, 'returned') }),
+    task('no-pr', 'closed', null, 25, { pr: null, prFacts: null, kind: 'scout' }),
+    task('review-no-pr', 'closed', null, 25, { pr: null, prFacts: null, kind: 'scout', reviews: 'draft' }),
+    ...['preparing', 'working', 'reported', 'stopped', 'failed'].map(state => task(`live-${state}`, state, 'MERGED', 9000))];
+  const omitted = ['merged-25', 'closed-25', 'no-pr', 'review-no-pr'];
+  for (const sample of samples) {
+    assert.equal(fleetTaskVisible(sample, clock), !omitted.includes(sample.id), sample.id); f.save(sample);
+  }
+  const script = path.join(f.dir, 'fleet-clock.mjs');
+  fs.writeFileSync(script, `Date.now = () => ${clock}; const {main} = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
+  const call = a => crew(a, { cwd: f.home, script, env: { CREW_GH: f.fakeGh } });
+  let r = call(args); assert.equal(r.code, 0, r.out); const fleet = JSON.parse(r.out);
+  assert.deepEqual(Object.keys(fleet), ['home', 'owner', 'tasks', 'prDiscovery', 'view']);
+  assert.deepEqual(fleet.view, { name: 'fleet', version: 1 }); assert.deepEqual(fleet.prDiscovery, { version: 1 }); assert.equal(fleet.owner, null);
+  for (const t of fleet.tasks) {
+    assert.deepEqual(Object.keys(t), ['id', 'state', 'terminal', 'pr', 'prDiscovery']);
+    assert.deepEqual(Object.keys(t.prDiscovery), ['status', 'url', 'source', 'reason']);
+    assert.ok(!omitted.includes(t.id));
+  }
+  assert.equal(fleet.tasks.length, samples.length - omitted.length + 1);
+  assert.equal(fleet.tasks.find(t => t.id === 'draft').prDiscovery.reason, 'not-requested');
+  assert.equal(fleet.tasks.find(t => t.id === 'saved-only').pr, null);
+  assert.equal(fleet.tasks.find(t => t.id === 'saved-only').prDiscovery.url, url);
+  assert.equal(call([...args, '--all']).out, r.out, '--all cannot undo fleet bounds');
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.log)), [], 'offline fleet performs no GitHub reads');
+  r = call([...args, '--discover-prs']); assert.equal(r.code, 0, r.out);
+  const discovered = JSON.parse(r.out); assert.deepEqual(discovered.view, fleet.view);
+  assert.deepEqual(discovered.tasks.find(t => t.id === 'draft').prDiscovery,
+    { status: 'known', url, source: 'github', reason: null }, 'Herdr consumes the unchanged complete discovery v1 shape');
+  assert.equal(discovered.tasks.find(t => t.id === 'saved-only').prDiscovery.url, url, 'copy return cannot hide a saved PR');
+  const file = path.join(f.home, 'tasks', 'draft', 'task.json');
+  assert.equal(JSON.parse(fs.readFileSync(file)).prFacts.url, url, 'discovery saves facts without setting authoritative pr');
+  f.save({ ...f.task, state: 'closed' });
+  f.set({ response: [{ ...discoveryPr(), state: 'closed', merged_at: ago(25), closed_at: ago(25) }] });
+  r = call([...args, '--discover-prs']); assert.equal(r.code, 0, r.out);
+  assert.ok(!JSON.parse(r.out).tasks.some(t => t.id === 'draft'), 'newly discovered old merge is filtered on the same call');
+  assert.equal(JSON.parse(fs.readFileSync(file)).prFacts.state, 'MERGED');
+  assert.ok(!JSON.parse(call(args).out).tasks.some(t => t.id === 'draft'), 'learned expiry works offline');
+  assert.ok(!JSON.parse(call([...args, '--discover-prs']).out).tasks.some(t => t.id === 'draft'));
+  for (const a of [['status', '--json', '--view', 'unknown'], ['status', '--view=newer', '--discover-prs']]) {
+    r = call(a); assert.equal(r.code, 2); assert.match(r.out, /unsupported-status-view: (unknown|newer)/);
+  }
+  for (const a of [['status', '--view'], ['status', '--view', '--json'], ['status', '--view=fleet'], ['status', '--json', '--view=']]) {
+    r = call(a); assert.equal(r.code, 2); assert.match(r.out, /Usage:/);
+  }
+  r = call(['status', '--all', '--json']); assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(r.out).tasks.length, samples.length + 1, 'legacy --all still includes every historical task');
+};
+
+gapTests['fleet-scale'] = () => {
+  const f = prDiscoveryFixture('fleet-scale'), owner = 'fleet-owner', reader = 'fleet-reader';
+  const w = readWorld(); w.terminals[owner] = { address: owner, state: 'live' }; fs.writeFileSync(world, JSON.stringify(w));
+  fs.writeFileSync(path.join(f.home, 'owner.json'), JSON.stringify({ terminal: owner }));
+  // Historical states deliberately carry large unused launch/recovery data. Prose
+  // and copy paths are forbidden even for stats; only state files may be inspected.
+  const heavy = { launch: { label: 'x'.repeat(500) }, nudges: Array(10).fill({ text: 'n'.repeat(100) }) };
+  const fill = (start, end) => { for (let i = start; i < end; i++) f.save({ ...f.task, ...heavy, id: `closed-${String(i).padStart(5, '0')}`, state: 'closed', kind: 'scout' }); };
+  fill(0, 1000);
+  const guard = path.join(f.dir, 'guard.mjs'), metrics = path.join(f.dir, 'metrics.json');
+  fs.writeFileSync(guard, `import fs from 'node:fs'; import cp from 'node:child_process'; import {syncBuiltinESMExports} from 'node:module';
+const reads = new Set(), copy = ${JSON.stringify(slash(f.copy))};
+for (const method of ['readFileSync','statSync','existsSync','readdirSync']) {
+ const original = fs[method]; fs[method] = function(file,...args) {
+  const name = String(file).replace(/\\\\/g,'/');
+  if (name.endsWith('/report.md') || name.endsWith('/brief.md') || name === copy || name.startsWith(copy+'/')) throw Error('fleet inspected prose/copy: '+name);
+  if (method === 'readFileSync' && name.endsWith('/task.json')) { if (reads.has(name)) throw Error('state read twice'); reads.add(name); }
+  return original.call(fs,file,...args);
+ };
+}
+const spawn = cp.spawnSync; cp.spawnSync = (cmd,args,options) => {
+ if (cmd !== process.execPath || args[0] !== ${JSON.stringify(fake)} || args[1] !== 'get' || args.at(-1) !== ${JSON.stringify(owner)}) throw Error('unexpected fleet subprocess');
+ return spawn(cmd,args,options);
+}; syncBuiltinESMExports();
+const {main} = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));
+fs.writeFileSync(${JSON.stringify(metrics)}, JSON.stringify({stateReads:reads.size}));`);
+  const call = () => crew(['status', '--json', '--view', 'fleet'], { cwd: f.home, script: guard, terminal: reader });
+  let r = call(); assert.equal(r.code, 0, r.out); let output = JSON.parse(r.out);
+  assert.deepEqual(output.owner, { terminal: owner, live: true });
+  assert.equal(output.tasks.length, 1); assert.ok(Buffer.byteLength(r.out) < 16384);
+  assert.equal(JSON.parse(fs.readFileSync(metrics)).stateReads, 1001);
+  const size = Buffer.byteLength(r.out); fill(1000, 5000);
+  const times = [];
+  for (let i = 0; i < 3; i++) { const start = performance.now(); r = call(); times.push(Math.round(performance.now() - start)); assert.equal(r.code, 0, r.out); }
+  assert.equal(Buffer.byteLength(r.out), size); assert.equal(JSON.parse(fs.readFileSync(metrics)).stateReads, 0, 'unchanged states use metadata-validated summaries');
+  const index = path.join(f.home, 'state', 'status-fleet-index.json');
+  const changed = { ...f.task, id: 'closed-00000', kind: 'scout', state: 'working' }; f.save(changed);
+  r = call(); assert.equal(r.code, 0, r.out); assert.equal(JSON.parse(r.out).tasks.length, 2);
+  assert.equal(JSON.parse(fs.readFileSync(metrics)).stateReads, 1, 'changed source invalidates only its summary');
+  fs.rmSync(path.join(f.home, 'tasks', changed.id, 'task.json'));
+  r = call(); assert.equal(r.code, 0, r.out); assert.equal(JSON.parse(r.out).tasks.length, 1, 'deleted source cannot survive in cache');
+  fs.writeFileSync(index, 'corrupt'); r = call(); assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(fs.readFileSync(metrics)).stateReads, 5000, 'corrupt index safely rebuilds from state');
+  assert.equal(Buffer.byteLength(r.out), size);
+  // Avoid a timing assertion on shared CI runners; the reproducible measured command
+  // and guarded operation count are the regression contract. Record target-machine timings.
+  console.log(`fleet-scale: 1000/5000 finished tasks, ${size} bytes, 5000-task process timings ${times.join('/')} ms`);
 };
 
 gapTests.status = () => {

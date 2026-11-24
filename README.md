@@ -62,7 +62,8 @@ crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   c
 crew relaunch <id> [who] ["<why>"]       end the current session and hand over working, stopped or failed work; copy stays
 crew wait <id>... [--timeout seconds] [--no-fallback]   wait for reports; recover stopped or idle workers
 crew status [--all] [--json]             tasks, terminals and elapsed time; JSON also shows delivery kind, standby eligibility and recovery
-crew status --json --discover-prs       opt-in, versioned read-only PR discovery before workers report
+crew status --json --discover-prs       opt-in, versioned GitHub read-only PR discovery before workers report
+crew status --json --view fleet         minimal v1 fleet and PR-lifetime history; optional --discover-prs
 crew stop <id> [--force]                 ask the worker to leave
 crew finish <id> [--force]               close the task; return its copy and proved-merged branch now or later
 crew done [<id>]                         (worker) my report is written
@@ -361,11 +362,59 @@ Ordinary status forms read recorded PRs only and make no network calls. Opt in w
 before its first report, for workflow, gate and plain projects. The version-1 overlay
 adds top-level `prDiscovery.version` and per-task `prDiscovery` with `status` (`known`,
 `none`, `unavailable`), `url`, `source` and `reason`. `tasks[].pr` remains the stored
-value: discovery never records links, changes stages, or lands tasks and is available to
-non-owners. Lookups verify the task's exact copy, recorded branch and project origin;
+value: discovery never sets that authoritative link, changes stages, or lands tasks and
+is available to non-owners. It saves verified URL/state/mergedAt/closedAt observations
+separately as task `prFacts`; existing land/finish PR reads save those facts too. No extra
+status requests are made. Recorded PR links still skip network reads, so unknown or stale
+facts stay conservative until an existing read learns more. Lookups verify the task's exact copy, recorded branch and project origin;
 unsupported remotes and failures are unavailable, not confirmed absence. Added reads run
 serially with two-second subprocess limits and a ten-second shared budget; remaining
 tasks can be unavailable. See [the JSON contract and limits](docs/status-pr-discovery.md).
+
+### Minimal fleet status
+
+For a polling fleet reader use `crew status --json --view fleet`, optionally with
+`--discover-prs`. It emits **only** these fields (null owner is also valid):
+
+```json
+{
+  "home": "C:/Users/me/.crew",
+  "owner": { "terminal": "t1", "live": true },
+  "tasks": [{
+    "id": "ship", "state": "working", "terminal": "t2", "pr": null,
+    "prDiscovery": { "status": "unavailable", "url": null, "source": null, "reason": "not-requested" }
+  }],
+  "prDiscovery": { "version": 1 },
+  "view": { "name": "fleet", "version": 1 }
+}
+```
+
+Every non-closed task is included. A closed task is included only with a recorded or
+verified discovered PR. Open and unknown-state PRs stay visible however old the task is;
+known merged/closed PRs disappear only **more than 24 hours after GitHub's mergedAt or
+closedAt**, not after task completion. Missing/invalid event times stay included. Closed
+scouts/reviews without PRs are omitted. `--all` does not override fleet retention; omit
+`--view` to get the unchanged legacy full history and fields.
+
+Without `--discover-prs`, only saved facts are used: recorded/saved discovered URLs are
+known, unlinked non-ships are none, and unobserved ships are unavailable/not-requested.
+With discovery, existing exact lookup and network budgets apply; saved links survive
+returned copies or failed refreshes. `tasks[].pr` always remains the authoritative stored
+value. The minimal view never reads briefs/reports, queries each worker, or inspects
+copy-return safety. A rebuildable summary index checks task file identity/size/timestamps
+on each poll and reloads changed states; a missing/corrupt index is rebuilt from state
+files. Initial rebuild is slower than indexed polling; cache writes are best effort.
+History is bounded by relevant PRs, not an arbitrary row cap: many open/unknown PRs can
+still produce many rows.
+
+The help output (`crew --help` or `node crew.mjs --help`) advertises the literal
+`--view fleet` as the capability signal. Check both version markers before consuming
+this contract. Unknown view names exit 2
+with `unsupported-status-view: <name>`; missing values or fleet without JSON are usage
+errors. A client can probe and fall back to `status --all --json --discover-prs` on an
+unsupported capability, not on a transport/authentication failure or timeout. Older Crew
+may silently ignore the option, so also check `view.name` and `view.version`. Herdr's
+adapter adoption is separate; this change does not edit its polling cadence or transport.
 
 ## Crew repairs itself
 

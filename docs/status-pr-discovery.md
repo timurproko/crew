@@ -120,6 +120,49 @@ Large homes can be incomplete by design. Consumers should preserve unavailable s
 and refresh deliberately through their existing bounded refresh lifecycle, not launch
 unbounded parallel queries or retries to fill gaps.
 
+## Fleet view version 1
+
+`crew status --json --view fleet [--discover-prs]` uses the same version-1 discovery
+objects but a separate exact projection. Root keys are `home`, `owner`, `tasks`,
+`prDiscovery` (`{"version":1}`), and `view` (`{"name":"fleet","version":1}`). Owner is
+null or exactly `terminal`/`live`; tasks contain exactly `id`, `state`, `terminal`, `pr`
+and `prDiscovery`. Missing terminal and recorded PR values are null. No launch, standby,
+fallback, core, recovery, error, elapsed, report or copy-return details are emitted.
+
+Every state except `closed` is retained. A closed task needs a recorded or verified
+saved/current discovered PR. Its age is irrelevant: open and unknown PR states stay;
+MERGED expires strictly more than 24 hours after valid GitHub mergedAt, CLOSED after
+closedAt. Exactly 24 hours, unknown/invalid/future event times, and failed reads do not
+expire a PR. Facts for another recorded URL cannot expire it. Closed scouts/reviews
+without PRs are omitted, and `--all` does not override this view's retention.
+
+Without discovery, root/per-task discovery fields are still present and use saved facts
+only. Valid recorded links are known/recorded; saved discovered links are known/github.
+Unlinked non-ships are none and unobserved ships are unavailable with `not-requested`.
+With discovery, eligible unrecorded ships use the same exact lookup; a saved link remains
+known when refresh is unavailable or no longer finds its returned copy's branch. Newly
+learned lifecycle facts affect filtering on the current call as well as later offline
+calls. Recorded links still make zero remote calls.
+
+Fleet never reads task prose or copy-return state and never probes individual worker
+terminals. The home owner's liveness is still checked. Its derived version-1 index at
+`<home>/state/status-fleet-index.json` stores only small state summaries. Every invocation
+checks task IDs and file identity/size/mtime/ctime, reloading changed source files; deleted
+or unreadable sources cannot be resurrected by an old summary. Missing/invalid indexes
+rebuild from state files and cache-write failure falls back to state reads. Initial
+rebuild can exceed indexed polling time; optional network discovery retains its existing
+ten-second budget rather than claiming sub-second GitHub service time. Unbounded numbers
+of still-open/unknown PRs are deliberately not truncated.
+
+Unknown `--view` values fail with usage exit 2 and stable `unsupported-status-view:` text,
+before status or discovery work. Fleet without JSON and missing view values fail usage.
+Help (`crew --help` or `node crew.mjs --help`) advertises literal `--view fleet` for the
+app's capability probe; this text and the complete shape are pinned by CLI tests.
+Clients must validate the view marker too: older Crew may ignore unknown flags and return
+legacy full status. Capability fallback may use `status --all --json --discover-prs`;
+transport failures, timeouts or authentication errors are not unsupported capabilities.
+Legacy status forms without --view retain their field ordering and serialized output.
+
 ## Separate Herdr adoption task
 
 This Crew change does not edit or deploy Herdr. Its adapter seam was reviewed in merged
