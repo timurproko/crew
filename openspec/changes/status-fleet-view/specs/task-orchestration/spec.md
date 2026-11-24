@@ -111,7 +111,7 @@ Crew SHALL reject unknown --view values with a nonzero usage exit and a stable `
 
 ### Requirement: Discovery is bounded and read-only for every caller
 
-Crew SHALL permit discovery from non-owner sessions without changing home ownership, reports, delivery authority or Git state, except that verified PR observations SHALL be saved as separate local task facts. Added reads SHALL run serially, each with a timeout of at most two seconds, within a ten-second shared discovery budget, with bounded output and no retries. Discovery failures SHALL produce per-task unavailable results with reasons, not fail otherwise valid status requests. Non-ship tasks without recorded PRs SHALL return none without remote reads.
+Crew SHALL allow non-owner discovery without changing ownership, reports, delivery authority or Git state; only separate verified PR facts may be saved. Reads SHALL be serial, bounded in size, limited to two seconds each and ten seconds total, without retries. Failures SHALL return per-task unavailable reasons without failing valid status requests. Non-ships without recorded PRs SHALL return none without remote reads.
 
 #### Scenario: Non-owner inspects an active home
 
