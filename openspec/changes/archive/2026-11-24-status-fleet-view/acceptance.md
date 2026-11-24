@@ -18,7 +18,7 @@ The maintainer integration decision accepts these scenarios:
   "archive": "openspec/changes/archive/2026-11-24-status-fleet-view/",
   "acceptanceManifest": "openspec/changes/archive/2026-11-24-status-fleet-view/acceptance.md",
   "finalizedDate": "2026-11-24",
-  "specBaseSha": "99e95c5a0533c6f1725fc66a001c950f26efe5c7",
+  "specBaseSha": "cc327e9534b6646ddd2b47f0b581f3d588019622",
   "acceptanceScenarios": [
     "Fleet v1 emits only home, owner terminal/live, task identity and PR discovery fields with both version markers.",
     "Every non-closed task remains visible; closed tasks retain open or unknown PRs and expire only beyond 24 hours after a known PR merge or close.",
