@@ -2464,7 +2464,9 @@ if (a[0] === '--version') process.exit(0);`);
     const errorState = { status: { state: 'error', app: 'a1' } }, workingState = { status: { state: 'working', app: 'a1' } };
     {
       const task = recovering('error-once', { steps: [errorState, workingState] });
-      q = quickWait(task.id, {}, [], 'k1', '0.6'); assert.equal(q.code, 124, q.out);
+      // The assertion depends on two Core subprocess observations, not on speed.
+      // Shared Windows runners can spend most of 0.6 seconds just starting them.
+      q = quickWait(task.id); assert.equal(q.code, 124, q.out);
       assert.equal(sendsTo(task.terminal).length, 0, 'One error observation is not a stop');
       const observed = readWorld().log.filter(a => a[0] === 'get' && a.at(-1) === task.terminal);
       assert.ok(observed.length >= 2, 'Both the error and working state were observed');
