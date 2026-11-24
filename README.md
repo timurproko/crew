@@ -307,8 +307,29 @@ After saving a launched reviewer, `crew review` best-effort adds the current act
 `APPROVE` or `CHANGES NEEDED` clears activity and opposite verdict labels and adds the
 matching current verdict label. Both hooks also remove assigned historical names, including
 `🤖 Under review` and `🤖 Changes needed`, preserving unrelated labels. Malformed or missing
-reports cause no label change. Workflow, gate and plain projects use the same hooks; Plan
-reports and plain branches without a PR at review time are skipped. Status remains read-only.
+reports cause no label change. Before changing labels, each hook reads the PR state once
+with a two-second timeout and no retries; a failed or invalid read warns and skips all writes.
+Review start skips merged/closed PRs and prints that state. A verdict on a now-merged/closed
+PR removes assigned current and historical managed review labels without adding a verdict.
+Workflow, gate and plain projects use the same hooks; Plan reports skip label operations.
+Plain branches without a PR at review time still record review evidence, but skip labels.
+Status remains read-only.
+
+Reviewers are given a fixed branch-head SHA, recorded as `reviewHead`. A valid verdict records
+`reviewVerdict` on both the reviewer and ship task: verdict, reviewed `head`, observed
+`currentHead`, `stale`, `needsReview`, timestamp and reviewer ID (and PR link when known).
+For a PR, that same state read supplies its current head. An `APPROVE` for a different or
+unverifiable head sets Rework instead of Approved and says the task needs another review.
+Before a plain branch has a PR, the local branch head supplies the comparison. Plain
+`crew land`, including a repeated land, checks the PR head against the last approval and
+warns and updates recorded freshness without writing labels. Status JSON exposes the saved
+verdict; plain status says `needs another review` when recorded, without new GitHub reads.
+
+After a successful `crew tell` or `crew relaunch` of a ship task, an existing current or
+historical Approved assignment is best-effort swapped to the current Rework name on an
+open PR. Recorded verdicts are marked as needing another review. No PR, no Approved
+assignment, or a merged/closed PR causes no label writes. A later review and verdict use
+the ordinary Review/Approved/Rework sequence.
 
 Names come from `labels/base.json` on the source repository's default branch. Set
 `CREW_REVIEW_LABELS_REPO=owner/repository` to choose the source (default
@@ -328,12 +349,13 @@ any manifest read or label write. Any failure prints one warning line without ch
 state or exit status. A missing current definition skips that addition but still permits
 removals; crew never adds a historical name instead. Each write is attempted once; a start
 hook stops writing once the reviewer is no longer working. There are no retries, locks,
-label-state files, overlap tracking or lifecycle cleanup.
+pending label-state files, overlap tracking or background lifecycle cleanup.
 
 A crashed/stopped reviewer or failed removal leaves activity labels until the shared workflow
 clears them on merge/close or a person removes them. With two reviewers, the first verdict
 removes activity labels while the other may still be running. Swaps are best effort, not atomic;
-verdict labels remain as a record after merge/close. Labels never gate delivery or imply GitHub approval.
+a PR can close or its head can move after the state read but before a write. Merged/closed PRs should carry no
+managed review labels. Labels never gate delivery or imply GitHub approval.
 
 ## Companion tools
 

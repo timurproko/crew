@@ -1328,8 +1328,8 @@ gapTests.status = () => {
   assert.equal(f.call(['finish', ship.id]).code, 0); assert.equal(f.call(['finish', scout.id]).code, 0);
 };
 
-// The reduced label integration has no persistence or lifecycle recovery: fake GitHub
-// records the already-saved task state at every request, including label mutations.
+// Advisory label integration has no lifecycle recovery: fake GitHub records the
+// already-saved task state at every request, including label mutations.
 function reviewLabelsFixture(name, overrides = {}) {
   const dir = path.join(root, `labels-${name}`); fs.mkdirSync(dir);
   const fakeGh = path.join(dir, 'gh.mjs'), state = path.join(dir, 'github.json'), log = path.join(dir, 'calls.json');
@@ -1341,7 +1341,23 @@ function reviewLabelsFixture(name, overrides = {}) {
     'review-changes-needed': { name: changes, previousNames: [oldChanges] },
   } };
   fs.writeFileSync(state, JSON.stringify({ labels: ['unrelated'], defined: [under, approved, changes], manifest })); fs.writeFileSync(log, '[]');
-  const env = { CREW_GH: fakeGh, CREW_REVIEW_LABELS_REPO: 'timurproko/MyWorkflows', ...overrides }, f = gapFixture(`labels-${name}`, env);
+  // Core is the fake launcher. Installation probes and quota reads must be fake too,
+  // especially relaunch, which checks even a single explicitly named replacement.
+  const bin = path.join(dir, 'agents'), quota = path.join(dir, 'quota.mjs'), quotaLog = path.join(dir, 'quota.jsonl');
+  fs.mkdirSync(bin);
+  for (const agent of ['a1', 'pi', 'claude']) fs.writeFileSync(path.join(bin, agent), '');
+  const launcher = path.join(bin, 'claude-as.sh'); fs.writeFileSync(launcher, '#!/bin/sh\nexit 1\n');
+  fs.writeFileSync(quotaLog, '');
+  fs.writeFileSync(quota, `import fs from 'node:fs';
+const args=process.argv.slice(2), providers=args[args.indexOf('--provider')+1].split(',');
+fs.appendFileSync(${JSON.stringify(quotaLog)},JSON.stringify(args)+'\\n');
+console.log(JSON.stringify({providers:providers.map(provider=>({provider,quotaSemantics:{status:'known',effectiveAvailability:[{scope:'all_models',effectivePercentRemaining:80}]}}))}));`);
+  const env = { CREW_GH: fakeGh, CREW_REVIEW_LABELS_REPO: 'timurproko/MyWorkflows', CREW_AGENT_PATH: bin,
+    CREW_TOOL_QUOTA_AXI: quota, CREW_NO_QUOTA: '0', CREW_CLAUDE_LAUNCHER: launcher, CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '', ...overrides };
+  const f = gapFixture(`labels-${name}`, env);
+  fs.mkdirSync(path.join(f.home, 'config'));
+  fs.writeFileSync(path.join(f.home, 'config', 'crew-dispatch.json'), JSON.stringify({ default: [{ harness: 'pi' }] }));
+  const quotaReads = () => fs.readFileSync(quotaLog, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
   fs.writeFileSync(fakeGh, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process';
 const a=process.argv.slice(2), file=${JSON.stringify(state)}, s=JSON.parse(fs.readFileSync(file,'utf8')), log=${JSON.stringify(log)};
 let task; try { task=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json','utf8')); } catch {}
@@ -1363,6 +1379,11 @@ else if(endpoint.endsWith('/contents/labels/base.json')) {
   if(s.manifestDelay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,s.manifestDelay);
   console.log(s.manifestRaw ?? JSON.stringify(s.manifest));
 }
+else if(method==='GET' && endpoint.includes('/pulls/')) {
+  if(s.prDenied) fail('PR state unavailable');
+  if(s.prDelay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,s.prDelay);
+  console.log(JSON.stringify(s.prResponse ?? {state:s.prState ?? 'open',merged_at:s.mergedAt ?? null,head:{sha:s.head}}));
+}
 else if(method==='GET' && endpoint.includes('/issues/')) console.log(JSON.stringify([s.labels.map(name=>({name}))]));
 else if(method==='GET') { const name=decodeURIComponent(endpoint.split('/').at(-1)); if(!s.defined.includes(name)) fail('shared label not defined'); console.log(JSON.stringify({name})); }
 else if(method==='DELETE') { if(s.removeDenied) fail('removal denied'); const name=decodeURIComponent(endpoint.split('/').at(-1)); s.labels=s.labels.filter(n=>n!==name); fs.writeFileSync(file,JSON.stringify(s)); console.log('{}'); }
@@ -1370,12 +1391,12 @@ else if(method==='POST') { if(s.addDenied) fail('addition denied'); if(input.lab
 else fail('unexpected fake request');`);
   const control = patch => { const s = JSON.parse(fs.readFileSync(state, 'utf8')); if (patch) fs.writeFileSync(state, JSON.stringify({ ...s, ...patch })); return patch ? control() : s; };
   const calls = () => JSON.parse(fs.readFileSync(log, 'utf8'));
-  const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
+  const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim() }); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
   const start = (id = 'ship', suffix = '') => { const review = `${id}-review${suffix}`; control({ watch: review }); const r = f.call(['review', id, '--agent', 'pi']); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
   const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
   const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
   const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
-  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, parent, start, done, writes, warnings };
+  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, parent, start, done, writes, warnings, quotaReads };
 }
 gapTests['review-label-manifest'] = () => {
   const f = reviewLabelsFixture('manifest', { CREW_REVIEW_LABELS_REPO: 'another/palette' });
@@ -1487,6 +1508,157 @@ gapTests['review-label-swaps'] = () => {
   n = f.calls().length; assert.equal(f.call(['start']).code, 0); assert.equal(f.call(['stop', b.id]).code, 0); assert.equal(f.call(['finish', b.id]).code, 0); assert.equal(f.calls().length, n, 'Other lifecycle commands never reconcile labels');
   assert.ok(!fs.existsSync(path.join(f.home, 'state', 'review-labels')));
   assert.ok(JSON.parse(f.call(['status', '--json']).out).tasks.every(t => !('reviewLabel' in t)));
+};
+gapTests['review-label-pr-state'] = () => {
+  const f = reviewLabelsFixture('pr-state');
+  const stateReads = at => f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42');
+  for (const [status, mergedAt, verdict] of [['merged', '2026-11-24T14:11:45Z', 'APPROVE'], ['closed', null, 'CHANGES NEEDED']]) {
+    f.parent(`before-${status}`); f.control({ prState: 'closed', mergedAt, labels: ['unrelated'] });
+    const beforeWrites = f.writes().length;
+    let at = f.calls().length;
+    const before = f.start(`before-${status}`);
+    assert.deepEqual(f.control().labels, ['unrelated'], 'A closed PR must not acquire a Review label');
+    assert.match(before.result.out, new RegExp(`already ${status}`));
+    assert.equal(before.task.state, 'working'); assert.equal(f.warnings(before.result).length, 0);
+    assert.equal(stateReads(at).length, 1, 'Review start reads PR state once');
+    at = f.calls().length;
+    assert.equal(f.done(before.task, verdict).code, 0);
+    assert.equal(stateReads(at).length, 1, 'Verdict reads PR state once');
+    assert.deepEqual(f.control().labels, ['unrelated'], 'A closed PR must not acquire a verdict label');
+    assert.ok(!f.writes().slice(beforeWrites).some(c => c.method === 'POST'));
+
+    f.parent(`during-${status}`); f.control({ prState: 'open', mergedAt: null });
+    const during = f.start(`during-${status}`);
+    assert.deepEqual(f.control().labels, ['unrelated', f.under]);
+    f.control({ prState: 'closed', mergedAt, labels: ['unrelated', f.under, f.oldUnder, f.approved, f.changes, f.oldChanges] });
+    at = f.calls().length;
+    const done = f.done(during.task, verdict);
+    assert.equal(done.code, 0, done.out); assert.equal(f.warnings(done).length, 0);
+    assert.equal(f.task(during.task.id).state, 'reported');
+    assert.deepEqual(f.control().labels, ['unrelated'], 'Late verdict clears managed assignments instead of swapping');
+    assert.equal(stateReads(at).length, 1);
+    assert.ok(!f.calls().slice(at).some(c => c.method === 'POST'));
+  }
+  for (const verdict of ['APPROVE', 'CHANGES NEEDED']) {
+    f.parent(verdict === 'APPROVE' ? 'open-approve' : 'open-rework');
+    f.control({ prState: 'open', mergedAt: null }); const at = f.calls().length;
+    const { task, result } = f.start(verdict === 'APPROVE' ? 'open-approve' : 'open-rework');
+    assert.doesNotMatch(result.out, /already (merged|closed)/);
+    assert.deepEqual(f.control().labels, ['unrelated', f.under]);
+    assert.equal(f.done(task, verdict).code, 0);
+    assert.deepEqual(f.control().labels, ['unrelated', verdict === 'APPROVE' ? f.approved : f.changes]);
+    assert.equal(stateReads(at).length, 2, 'Open PRs also get one state read per hook');
+  }
+};
+gapTests['review-label-current-head'] = () => {
+  const f = reviewLabelsFixture('current-head');
+  f.parent(); const { task } = f.start(), head = f.control().head;
+  let r = f.done(task, 'APPROVE'); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task('ship').reviewVerdict.head, head, 'Verdict records the head actually reviewed');
+  assert.equal(f.task(task.id).reviewVerdict.head, head);
+  assert.deepEqual(f.control().labels, ['unrelated', f.approved]);
+  assert.doesNotMatch(r.out, /approval is for an older head/);
+  assert.equal(f.task('ship').reviewVerdict.needsReview, false);
+  let at = f.calls().length;
+  r = f.call(['tell', 'ship', 'Correct the implementation.']); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Resuming a ship invalidates its approval');
+  assert.equal(f.task('ship').reviewVerdict.needsReview, true);
+  assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
+
+  f.parent('moved'); const moved = f.start('moved').task, reviewed = f.control().head;
+  f.control({ head: 'b'.repeat(40) }); at = f.calls().length;
+  r = f.done(moved, 'APPROVE'); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes]);
+  assert.match(r.out, /approval is for an older head.*needs another review/i);
+  assert.deepEqual(Object.fromEntries(['head', 'currentHead', 'stale', 'needsReview'].map(key => [key, f.task('moved').reviewVerdict[key]])), { head: reviewed, currentHead: 'b'.repeat(40), stale: true, needsReview: true });
+  assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
+  const shown = JSON.parse(f.call(['status', '--json']).out).tasks.find(t => t.id === 'moved');
+  assert.equal(shown.reviewVerdict.stale, true, 'Status exposes recorded review freshness without network reads');
+  f.save({ ...f.task('moved'), pr: 'https://github.com/acme/demo/pull/42' }); at = f.calls().length;
+  r = f.call(['land', 'moved']); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /approval is for an older head.*needs another review/i);
+  assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
+
+  git('-C', f.repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git');
+  f.parent('discovered', {}, 'Done.'); f.control({ labels: ['unrelated', f.approved] });
+  r = f.call(['tell', 'discovered', 'Continue.']); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'A plain PR can be discovered before land records its URL');
+  for (const [id, patch] of [['no-label', { labels: ['unrelated'] }], ['no-pr', { noPr: true }], ['closed', { prState: 'closed', labels: ['unrelated', f.approved] }]]) {
+    f.parent(id, id === 'no-pr' ? {} : { pr: 'https://github.com/acme/demo/pull/42' }, 'Done.');
+    f.control({ noPr: false, prState: 'open', labels: ['unrelated'], ...patch }); at = f.writes().length;
+    r = f.call(['tell', id, 'Continue.']); assert.equal(r.code, 0, r.out);
+    assert.equal(f.writes().length, at, 'No PR, no Approved label, or a closed PR means no writes');
+  }
+  f.parent('relaunch'); f.control({ noPr: false, prState: 'open', labels: ['unrelated', f.approved] });
+  f.save({ ...f.task('relaunch'), state: 'working' });
+  const quotaAt = f.quotaReads().length;
+  r = f.call(['relaunch', 'relaunch', '--agent', 'a1', '--model', 'openai-codex/review-label-test']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task('relaunch').agent, 'a1');
+  assert.equal(f.task('relaunch').launch.model, 'openai-codex/review-label-test');
+  assert.deepEqual(f.quotaReads().slice(quotaAt), [['--provider', 'codex', '--max-age', '2m', '--json']], 'Relaunch reads only the fake candidate quota');
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes]);
+  f.parent('failed-send'); f.control({ labels: ['unrelated', f.approved] });
+  setTerminal(f.task('failed-send').terminal, { sendError: true }); at = f.calls().length;
+  r = f.call(['tell', 'failed-send', 'Continue.']); assert.equal(r.code, 4, r.out);
+  assert.equal(f.calls().length, at, 'A refused follow-up never changes labels');
+  assert.equal(f.task('failed-send').state, 'reported');
+  for (const [id, patch] of [['rework-network', { network: true }], ['rework-opt-out', { enabled: 'false' }], ['rework-write', { addDenied: true }]]) {
+    f.parent(id); f.control({ labels: ['unrelated', f.approved], network: false, enabled: '', addDenied: false, ...patch }); at = f.calls().length;
+    r = f.call(['tell', id, 'Continue.']); assert.equal(r.code, 0, r.out);
+    assert.equal(f.task(id).state, 'working'); assert.equal(f.warnings(r).length, 1, r.out);
+    assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
+  }
+  f.control({ network: false, enabled: '', addDenied: false });
+  f.parent('renamed-approval');
+  const renamed = structuredClone(f.manifest);
+  renamed.labels['review-approved'] = { name: 'Approval v2', previousNames: [f.approved] };
+  renamed.labels['review-changes-needed'] = { name: 'Rework v2', previousNames: [f.changes] };
+  f.control({ manifest: renamed, defined: [f.under, 'Approval v2', 'Rework v2'], labels: ['unrelated', f.approved] });
+  r = f.call(['tell', 'renamed-approval', 'Continue.']); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(f.control().labels, ['unrelated', 'Rework v2'], 'Follow-ups use stable manifest roles and approval aliases');
+  f.control({ manifest: f.manifest, defined: [f.under, f.approved, f.changes], labels: ['unrelated'] });
+  f.parent('missing-head'); const missing = f.start('missing-head').task;
+  f.control({ prResponse: { state: 'open' } }); r = f.done(missing, 'APPROVE');
+  assert.equal(r.code, 0, r.out); assert.match(r.out, /head could not be verified.*needs another review/);
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes]);
+};
+gapTests['review-label-plain-land-head'] = () => {
+  const f = reviewLabelsFixture('plain-land-head'), remote = path.join(f.dir, 'origin.git');
+  git('init', '--bare', '-q', remote); git('-C', f.repo, 'remote', 'add', 'origin', remote); git('-C', f.repo, 'push', '-q', 'origin', 'HEAD');
+  const ship = f.parent('ship', {}, 'Done.');
+  const head = commit(ship.worktree, { 'change.txt': 'reviewed\n' }, 'reviewed change'); f.control({ head, noPr: true });
+  const { task } = f.start(); let r = f.done(task, 'APPROVE'); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task('ship').reviewVerdict.head, head, 'A plain pre-PR review still records its fixed local head');
+  assert.equal(f.task('ship').reviewVerdict.stale, false);
+  assert.equal(f.writes().length, 0);
+  const moved = commit(ship.worktree, { 'change.txt': 'changed after approval\n' }, 'later change');
+  f.control({ head: moved, noPr: false }); const at = f.calls().length;
+  r = f.call(['land', 'ship']); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /approval is for an older head.*needs another review/);
+  assert.equal(f.task('ship').reviewVerdict.stale, true);
+  assert.equal(f.task('ship').reviewVerdict.currentHead, moved);
+  assert.equal(f.task('ship').pr, 'https://github.com/acme/demo/pull/42');
+  assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
+  assert.equal(f.writes().length, 0, 'Land reports freshness without writing labels');
+};
+gapTests['review-label-pr-state-failures'] = () => {
+  const f = reviewLabelsFixture('pr-state-failures');
+  for (const [id, patch] of [['denied', { prDenied: true }], ['invalid', { prResponse: { state: 'unknown' } }], ['timeout', { prDelay: 5000 }]]) {
+    f.parent(id); f.control({ prDenied: false, prResponse: null, prDelay: 0, ...patch });
+    let at = f.calls().length, started = performance.now();
+    const { task, result } = f.start(id);
+    assert.equal(task.state, 'working'); assert.equal(f.warnings(result).length, 1, result.out);
+    assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1, 'Failed state reads are never retried');
+    assert.ok(performance.now() - started < 8000, 'State reads have a bounded timeout');
+    at = f.calls().length; started = performance.now();
+    const done = f.done(task, 'APPROVE');
+    assert.equal(done.code, 0, done.out); assert.equal(f.task(task.id).state, 'reported'); assert.equal(f.warnings(done).length, 1, done.out);
+    assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
+    assert.ok(performance.now() - started < 8000);
+    assert.deepEqual(f.control().labels, ['unrelated']);
+  }
+  assert.equal(f.writes().length, 0, 'Unknown PR state never permits label mutations');
+  assert.ok(!f.calls().some(c => c.endpoint?.includes('/contents/')), 'Unknown PR state skips manifest lookup');
 };
 gapTests['review-label-start-done'] = () => {
   const f = reviewLabelsFixture('start-done');
@@ -1992,7 +2164,7 @@ console.log('https://example.invalid/acme/demo/pull/7');
   const review = taskOf('s1-review');
   assert.ok(readWorld().log.filter(a => a[0] === 'run').at(-1).includes('crew.kind=review'), 'A reviewer is labelled as one');
   assert.deepEqual([review.kind, review.reviews, review.project], ['scout', 's1', 'demo']);
-  assert.ok(fs.readFileSync(review.brief, 'utf8').includes('git diff HEAD...feature/s1') && fs.readFileSync(review.brief, 'utf8').includes('`APPROVE` or `CHANGES NEEDED`'));
+  assert.ok(fs.readFileSync(review.brief, 'utf8').includes(`git diff HEAD...${review.reviewHead}`) && fs.readFileSync(review.brief, 'utf8').includes('`APPROVE` or `CHANGES NEEDED`'));
   assert.match(own(['review', 's1', '--agent', 'claude']).out, /spawned s1-review-2: claude scout/);
   // land: refused with unsaved work, without a place to push to, and honest when GitHub says no.
   fs.writeFileSync(path.join(s1copy, 'loose.txt'), 'x');
