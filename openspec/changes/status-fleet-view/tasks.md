@@ -2,10 +2,10 @@
 
 ## 1. Saved PR observations preserve lifecycle facts without granting delivery authority
 
-- [ ] 1.1 Add identity-scoped saved observations for canonical URL, state, mergedAt and closedAt, with atomic narrow updates that preserve concurrent lifecycle changes; cover identity replacement, reopened PRs, malformed times, repeated facts and cache-write failures using deterministic tests.
-- [ ] 1.2 Capture verified lifecycle fields from existing exact discovery responses without extra requests or changing the four-field overlay; prove request counts, deadlines, no GitHub writes and unchanged task.pr/stage/ownership/report/Git state in fake discovery tests.
-- [ ] 1.3 Extend existing land/finish PR-read field selections and save learned facts while preserving existing safety checks and merged-head proof; cover these paths with fake GitHub tests and offline rereads.
-- [ ] 1.4 Update docs/status-pr-discovery.md to distinguish saved observations from authoritative links and explain unknown/stale facts and recorded-link short-circuiting; ensure examples match persistence fixtures.
+- [x] 1.1 Add identity-scoped saved observations for canonical URL, state, mergedAt and closedAt, with atomic narrow updates that preserve concurrent lifecycle changes; cover identity replacement, reopened PRs, malformed times, repeated facts and cache-write failures using deterministic tests.
+- [x] 1.2 Capture verified lifecycle fields from existing exact discovery responses without extra requests or changing the four-field overlay; prove request counts, deadlines, no GitHub writes and unchanged task.pr/stage/ownership/report/Git state in fake discovery tests.
+- [x] 1.3 Extend existing land/finish PR-read field selections and save learned facts while preserving existing safety checks and merged-head proof; cover these paths with fake GitHub tests and offline rereads.
+- [x] 1.4 Update docs/status-pr-discovery.md to distinguish saved observations from authoritative links and explain unknown/stale facts and recorded-link short-circuiting; ensure examples match persistence fixtures.
 
 ## 2. Minimal fleet status bounds history by PR lifetime while preserving legacy output
 

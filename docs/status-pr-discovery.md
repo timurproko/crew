@@ -71,8 +71,11 @@ than one candidate produce unavailable. A reused branch with several historical 
 not resolved by guessing the newest. No reports, transcripts, footer badges, other
 tasks' branches, repository-wide inventories, fetches or pushes are used.
 
-Discovery is read-only for owners and non-owners. It does not record PRs, stages, report
-completion or landing, claim ownership, trigger recovery, or write Git state. In
+Discovery is read-only toward GitHub for owners and non-owners. It does not set the
+authoritative task `pr`, stages, report completion or landing, claim ownership, trigger
+recovery, or write Git state. It may save verified observations separately in `task.json`
+as `prFacts`: version 1, canonical `url`, `state` (`OPEN`, `MERGED`, `CLOSED` or null),
+`mergedAt`, `closedAt`, and `observedAt`. These facts are not delivery authority. In
 particular, discovering a draft does not let plain land bypass its reported-worker and
 clean-copy checks or turn a workflow plan into implementation. `crew done` and `crew
 land` retain their existing authority.
@@ -82,7 +85,15 @@ land` retain their existing authority.
 Added subprocess reads are serial, with at most two seconds per process, a one-MiB
 combined stdout/stderr acceptance limit, and a ten-second shared monotonic discovery
 budget. Timeouts kill the child; Crew does not retry. Repository resolutions are cached
-only within one invocation, not written to disk. Remaining eligible tasks become
+only within one invocation, not written to disk. Verified PR observations are durable:
+the existing discovery response supplies lifecycle facts without another request. Existing
+land/finish PR reads also save state and timestamps when available. Observation updates
+preserve current task lifecycle fields and do not change `updated`; cache-write failures
+never fail status. Missing/failed reads do not invent closure or erase usable facts.
+Recorded PRs still skip network lookup, so unknown or stale-open observations can remain
+until another existing lifecycle read learns closure. Facts apply only to their PR URL,
+never to a different recorded PR; a newer verified open observation clears old closure.
+GitHub event timestamps, not task age or observation time, determine fleet expiration. Remaining eligible tasks become
 unavailable/budget-exhausted when the deadline expires; recorded-link and non-ship
 classification needs no subprocess. This bounds added discovery, not the pre-existing
 Core/status projection or the consumer's transport. A caller's own overall timeout can

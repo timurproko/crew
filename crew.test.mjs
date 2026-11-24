@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -926,6 +926,82 @@ function discoveryRunner(f, { origin = 'https://github.com/acme/demo.git', prs =
   return { calls, execute };
 }
 
+gapTests['pr-facts'] = () => {
+  const f = prDiscoveryFixture('facts'), h = { tasks: path.join(f.home, 'tasks') };
+  const file = path.join(h.tasks, 'draft', 'task.json'), read = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+  const url = 'https://github.com/acme/demo/pull/12', stamp = '2026-01-02T00:00:00Z';
+  const merged = prObservation({ state: 'closed', merged_at: '2026-01-01T00:00:00Z', closed_at: '2026-01-01T00:00:00Z' }, url, stamp);
+  assert.equal(merged.state, 'MERGED');
+  assert.equal(prObservation({}, 'invalid'), null);
+  assert.equal(prObservation({ state: 'MERGED', mergedAt: 'invalid' }, url).mergedAt, null);
+  assert.equal(prObservation({ state: 'invented', mergedAt: stamp }, url).state, null);
+  assert.equal(prObservation({ state: 'OPEN', mergedAt: stamp, closedAt: stamp }, url).closedAt, null);
+  f.save({ ...f.task, state: 'closed', stage: 'implementation', updated: stamp, tells: 7 });
+  rememberTaskPr(h, f.task, merged);
+  assert.deepEqual(read().prFacts, merged);
+  const { prFacts, ...authority } = read();
+  assert.deepEqual(authority, { ...f.task, state: 'closed', stage: 'implementation', updated: stamp, tells: 7 });
+  const bytes = fs.readFileSync(file, 'utf8');
+  rememberTaskPr(h, f.task, { ...merged, observedAt: '2026-01-03T00:00:00Z' });
+  assert.equal(fs.readFileSync(file, 'utf8'), bytes, 'identical facts do not rewrite task timestamps or bytes');
+  rememberTaskPr(h, f.task, prObservation({}, url, '2026-01-04T00:00:00Z'));
+  assert.equal(fs.readFileSync(file, 'utf8'), bytes, 'unknown reads cannot erase learned closure');
+  rememberTaskPr(h, f.task, prObservation({ state: 'OPEN' }, url, '2026-01-01T00:00:00Z'));
+  assert.equal(read().prFacts.state, 'MERGED', 'older observations cannot regress facts');
+  rememberTaskPr(h, f.task, prObservation({ state: 'OPEN' }, url, '2026-01-05T00:00:00Z'));
+  assert.equal(read().prFacts.state, 'OPEN'); assert.equal(read().prFacts.mergedAt, null, 'reopened clears closure');
+  f.save({ ...read(), pr: 'https://github.com/acme/demo/pull/13' });
+  const replaced = fs.readFileSync(file, 'utf8');
+  rememberTaskPr(h, f.task, merged);
+  assert.equal(fs.readFileSync(file, 'utf8'), replaced, 'cannot attach facts to a different recorded identity');
+  rememberTaskPr(h, { ...f.task, branch: 'different' }, prObservation({ state: 'OPEN' }, read().pr));
+  assert.equal(fs.readFileSync(file, 'utf8'), replaced, 'reused task identity fails closed');
+  fs.writeFileSync(`${file}.lock`, 'held');
+  rememberTaskPr(h, f.task, prObservation({ state: 'OPEN' }, read().pr));
+  assert.equal(fs.readFileSync(file, 'utf8'), replaced); fs.rmSync(`${file}.lock`);
+  const rename = fs.renameSync;
+  try {
+    fs.renameSync = () => { throw Error('injected read-only filesystem'); };
+    rememberTaskPr(h, f.task, prObservation({ state: 'OPEN' }, read().pr));
+  } finally { fs.renameSync = rename; }
+  assert.equal(fs.readFileSync(file, 'utf8'), replaced);
+  assert.ok(!fs.existsSync(`${file}.lock`));
+
+  // The existing exact query supplies lifecycle facts with no additional calls.
+  const runner = discoveryRunner(f, { prs: [{ ...discoveryPr(), state: 'closed', merged_at: merged.mergedAt, closed_at: merged.closedAt }] });
+  const observations = [];
+  const result = discoverTaskPrs([f.task], f.projects, { ...runner, observe: (task, facts) => observations.push([task, facts]) });
+  assert.equal(result[0].status, 'known'); assert.equal(observations.length, 1);
+  assert.equal(observations[0][1].state, 'MERGED'); assert.equal(runner.calls.filter(c => c.args.includes('api')).length, 1);
+  const bad = discoveryRunner(f, { prs: [{ ...discoveryPr('not-our-branch'), state: 'closed' }] });
+  discoverTaskPrs([f.task], f.projects, { ...bad, observe: () => assert.fail('unverified facts cannot be saved') });
+};
+
+gapTests['pr-facts-commands'] = () => {
+  const f = gapFixture('pr-facts-commands'), origin = path.join(f.dir, 'origin.git');
+  git('init', '-q', '--bare', origin); git('-C', f.repo, 'remote', 'add', 'origin', origin);
+  const t = f.spawn('ship', ['--kind', 'ship', '--agent', 'pi']);
+  const tip = commit(t.worktree, { 'change': 'ship\n' }, 'change');
+  git('-C', t.worktree, 'push', '-q', 'origin', `HEAD:${t.branch}`);
+  const url = 'https://github.com/acme/demo/pull/12', stamp = '2026-01-01T00:00:00Z';
+  fs.writeFileSync(t.report, `Implementation: ${url}\n`);
+  f.save({ ...t, state: 'reported', workflow: 'delivery', stage: 'implementation', pr: url });
+  const gh = path.join(f.dir, 'gh.mjs'), log = path.join(f.dir, 'gh-log.json'); fs.writeFileSync(log, '[]');
+  fs.writeFileSync(gh, `import fs from 'node:fs'; const a = process.argv.slice(2), log = ${JSON.stringify(log)};
+fs.writeFileSync(log, JSON.stringify([...JSON.parse(fs.readFileSync(log)), a]));
+const pr = {url:${JSON.stringify(url)},state:'MERGED',mergedAt:${JSON.stringify(stamp)},closedAt:${JSON.stringify(stamp)},headRefOid:${JSON.stringify(tip)},isDraft:true,body:''};
+if (a[1] === 'view') console.log(JSON.stringify(pr)); else if (a[1] === 'list') console.log(JSON.stringify([pr])); else process.exit(1);`);
+  let r = f.call(['land', t.id], { CREW_GH: gh }); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(t.id).prFacts.state, 'MERGED'); assert.equal(f.task(t.id).prFacts.mergedAt, stamp);
+  // Force the finish path to learn its own facts, not merely preserve land's cache.
+  const { prFacts, ...uncached } = f.task(t.id); f.save(uncached);
+  r = f.call(['finish', t.id, '--force'], { CREW_GH: gh }); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /merged branch .* deleted/); assert.equal(f.task(t.id).prFacts.mergedAt, stamp);
+  assert.equal(f.task(t.id).state, 'closed'); assert.equal(f.task(t.id).pr, url);
+  const calls = JSON.parse(fs.readFileSync(log)); assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(a => a.slice(0, 2)), [['pr', 'view'], ['pr', 'list']]);
+};
+
 gapTests['pr-discovery'] = () => {
   const f = prDiscoveryFixture('contract'), discover = (tasks, options) => discoverTaskPrs(tasks, f.projects, options);
   const known = { status: 'known', url: 'https://github.com/acme/demo/pull/12', source: 'github', reason: null };
@@ -1045,11 +1121,14 @@ const {main} = await import(${JSON.stringify(new URL('./crew.mjs', import.meta.u
   assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 2, 'only the unrecorded ship has repo/head requests');
 };
 
-// Capture every byte of the small fixture home and Git directory, not just task.pr.
+// Snapshot all authority/prose/Git bytes. Only the separate PR observation is
+// allowed to change, and JSON formatting is not authority.
 function discoveryState(f) {
   const tree = folder => fs.readdirSync(folder).sort().flatMap(name => {
     const file = path.join(folder, name);
-    return fs.statSync(file).isDirectory() ? tree(file) : [[file, fs.readFileSync(file).toString('base64')]];
+    if (fs.statSync(file).isDirectory()) return tree(file);
+    if (name === 'task.json') { const { prFacts, ...authority } = JSON.parse(fs.readFileSync(file, 'utf8')); return [[file, JSON.stringify(authority)]]; }
+    return [[file, fs.readFileSync(file).toString('base64')]];
   });
   return [tree(f.home), tree(path.join(f.repo, '.git')), tree(f.copy)];
 }
@@ -1763,7 +1842,7 @@ log.push({ a, body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--b
 if (a[0] === 'auth') process.exit(1);
 if (fs.existsSync(${JSON.stringify(ghDown)})) { console.error('gh: not signed in'); process.exit(1); }
 if (a[0] === 'pr' && a[1] === 'list') { console.log(fs.existsSync(${JSON.stringify(ghMerged)}) ? fs.readFileSync(${JSON.stringify(ghMerged)}, 'utf8') : ''); process.exit(0); }
-if (a[0] === 'pr' && a[1] === 'view' && a.includes('isDraft,body')) { console.log(JSON.stringify({ isDraft: true, body: '## Proposal\\n\\nWhy.\\n\\n## Implementation\\n\\n- [x] The first outcome is delivered.\\n- [ ] The second outcome is delivered.\\n\\n## Acceptance\\n\\n- [ ] not an outcome\\n' })); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view' && a.includes('isDraft,body,url,state,mergedAt,closedAt')) { console.log(JSON.stringify({ url: a[2], state: 'OPEN', mergedAt: null, closedAt: null, isDraft: true, body: '## Proposal\\n\\nWhy.\\n\\n## Implementation\\n\\n- [x] The first outcome is delivered.\\n- [ ] The second outcome is delivered.\\n\\n## Acceptance\\n\\n- [ ] not an outcome\\n' })); process.exit(0); }
 console.log('https://example.invalid/acme/demo/pull/7');
 `);
   const own = (args, terminal = 'c2') => crew(args, { terminal, env: { CREW_GH: fakeGh } });
@@ -1824,14 +1903,16 @@ console.log('https://example.invalid/acme/demo/pull/7');
   // A squash merge leaves no ancestry: GitHub's merged pull request with this exact head counts.
   assert.equal(own(['spawn', 'm1', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   const m1head = commit(path.join(copies, 'm1'), { 'squashed.txt': 'x\n' }, 'Squashed work');
-  fs.writeFileSync(ghMerged, 'another-commit\n');
+  fs.writeFileSync(ghMerged, JSON.stringify([{ headRefOid: 'another-commit', state: 'MERGED' }]));
   assert.equal(own(['spawn', 'm2', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   commit(path.join(copies, 'm2'), { 'later.txt': 'x\n' }, 'Work after the merged head');
   r = own(['finish', 'm2', '--force']); assert.equal(r.code, 0, r.out); assert.ok(!r.out.includes('deleted'), r.out);
   assert.ok(git('-C', project, 'branch', '--list', 'feature/m2').includes('feature/m2'), 'Commits the merged pull request did not have keep the branch');
-  fs.writeFileSync(ghMerged, m1head + '\n');
+  fs.writeFileSync(ghMerged, JSON.stringify([{ headRefOid: m1head, url: 'https://github.com/acme/demo/pull/21', state: 'MERGED', mergedAt: '2026-01-01T12:00:00Z', closedAt: '2026-01-01T12:00:00Z' }]));
   r = own(['finish', 'm1', '--force']); assert.equal(r.code, 0, r.out); assert.match(r.out, /; merged branch feature\/m1 deleted/);
   assert.equal(git('-C', project, 'branch', '--list', 'feature/m1').trim(), '');
+  assert.equal(taskOf('m1').prFacts.mergedAt, '2026-01-01T12:00:00Z');
+  assert.equal(taskOf('m2').prFacts, undefined, 'wrong head cannot supply merge proof or lifecycle facts');
   fs.rmSync(ghMerged);
 
   // --- optional companion tools ---------------------------------------------------------
@@ -2012,8 +2093,8 @@ if (a[0] === 'start') {
   const ghBefore = ghCalls().length;
   r = dl(['land', 'w1']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /delivered w1: https:\/\/github\.com\/acme\/demo\/pull\/11 \(draft, 1 of 2 outcomes ticked\)\. It follows the repository's delivery workflow/);
-  assert.deepEqual(ghCalls().slice(ghBefore), [['pr', 'view', 'https://github.com/acme/demo/pull/11', '--json', 'isDraft,body']], 'Only read, never opened');
-  assert.ok(taskOf('w1').landed);
+  assert.deepEqual(ghCalls().slice(ghBefore), [['pr', 'view', 'https://github.com/acme/demo/pull/11', '--json', 'isDraft,body,url,state,mergedAt,closedAt']], 'Only read, never opened');
+  assert.ok(taskOf('w1').landed); assert.equal(taskOf('w1').prFacts.state, 'OPEN');
   assert.match(dl(['land', 'w1']).out, /already has a pull request: https:\/\/github\.com\/acme\/demo\/pull\/11/);
   // No link on the first line: the pull request GitHub has for the branch, never another one
   // the report mentions further down.

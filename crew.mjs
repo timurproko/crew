@@ -250,7 +250,55 @@ function loadTask(h, id) {
   if (!task) refuse(`No task ${id} in ${h.dir}.`);
   return task;
 }
-const saveTask = (h, task) => writeJson(taskFile(h, task.id), { ...task, updated: now() });
+// Observation writers and lifecycle writers share a short per-task transaction. A
+// delayed lifecycle snapshot must not discard a newer PR observation (or vice versa).
+function taskTransaction(h, id, action) {
+  const lock = `${taskFile(h, id)}.lock`, deadline = Date.now() + 250;
+  let fd;
+  for (;;) {
+    try { fd = fs.openSync(lock, 'wx'); break; }
+    catch (error) {
+      if (error.code !== 'EEXIST' || Date.now() >= deadline) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  try { return action(readJson(taskFile(h, id))); }
+  finally { fs.closeSync(fd); fs.rmSync(lock, { force: true }); }
+}
+const saveTask = (h, task) => taskTransaction(h, task.id, current => {
+  const prFacts = current?.prFacts;
+  writeJson(taskFile(h, task.id), { ...task, ...(prFacts ? { prFacts } : {}), updated: now() });
+});
+
+const prTime = value => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value) && Number.isFinite(Date.parse(value)) ? value : null;
+export function prObservation(pr, url = pr?.url ?? pr?.html_url, observedAt = now()) {
+  url = canonicalPrUrl(url);
+  if (!url) return null;
+  const mergedAt = prTime(pr?.mergedAt ?? pr?.merged_at), closedAt = prTime(pr?.closedAt ?? pr?.closed_at);
+  let state = typeof pr?.state === 'string' ? pr.state.toUpperCase() : null;
+  if (!['OPEN', 'MERGED', 'CLOSED'].includes(state)) state = null;
+  if (state === 'CLOSED' && mergedAt) state = 'MERGED';
+  return { version: 1, url, state, mergedAt: state === 'MERGED' ? mergedAt : null,
+    closedAt: ['MERGED', 'CLOSED'].includes(state) ? closedAt : null, observedAt };
+}
+export function rememberTaskPr(h, task, facts) {
+  if (!facts || !validId(task.id)) return;
+  try {
+    taskTransaction(h, task.id, current => {
+      if (!current || ['branch', 'project', 'worktree'].some(key => current[key] !== task[key])) return;
+      if (current.pr != null && canonicalPrUrl(current.pr)?.toLowerCase() !== facts.url.toLowerCase()) return;
+      const old = current.prFacts;
+      if (old?.url?.toLowerCase() === facts.url.toLowerCase()) {
+        if (Date.parse(old.observedAt) > Date.parse(facts.observedAt)) return;
+        if (!facts.state && old.state) return;
+        if (old.state === facts.state) facts = { ...facts, mergedAt: facts.mergedAt ?? old.mergedAt, closedAt: facts.closedAt ?? old.closedAt };
+        if (['state', 'mergedAt', 'closedAt'].every(key => old[key] === facts[key])) return;
+      }
+      // Observations never touch updated, state, pr, stage, reports or landing.
+      writeJson(taskFile(h, task.id), { ...current, prFacts: facts });
+    });
+  } catch { /* A read-only caller may not be able to cache; the response still works. */ }
+}
 function allTasks(h) {
   if (!fs.existsSync(h.tasks)) return [];
   return fs.readdirSync(h.tasks).filter(validId).map(id => readJson(taskFile(h, id))).filter(Boolean)
@@ -1441,15 +1489,17 @@ function cmdStop(args) {
 // Once they are merged it holds nothing, so it goes with the copy. Merged means: reachable
 // from the project's current or default branch, or GitHub has a merged pull request whose
 // head is exactly this commit (a squash merge leaves no ancestry). Anything unsure keeps it.
-function dropMergedBranch(project, task) {
+function dropMergedBranch(h, project, task) {
   if (task.kind !== 'ship' || !project?.path) return '';
   const branch = branchOf(task), git = (...a) => run('git', ['-C', project.path, ...a], { timeout: 60000 });
   const tip = git('rev-parse', '--verify', '-q', `refs/heads/${branch}`).stdout.trim();
   if (!tip) return '';
   let merged = ['HEAD', 'refs/remotes/origin/HEAD'].some(ref => git('merge-base', '--is-ancestor', tip, ref).code === 0);
   if (!merged && git('remote', 'get-url', 'origin').code === 0) {
-    const asked = gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid', '--jq', '.[0].headRefOid'], { cwd: project.path, timeout: 60000 });
-    merged = asked.code === 0 && asked.stdout.trim() === tip;
+    const asked = gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid,url,state,mergedAt,closedAt'], { cwd: project.path, timeout: 60000 });
+    let pr; try { pr = JSON.parse(asked.stdout)?.[0]; } catch { /* No proof. */ }
+    merged = asked.code === 0 && pr?.headRefOid === tip && pr.state === 'MERGED';
+    if (merged) rememberTaskPr(h, task, prObservation(pr));
   }
   return merged && git('branch', '-D', branch).code === 0 ? `; merged branch ${branch} deleted` : '';
 }
@@ -1721,7 +1771,7 @@ function returnWaiting(h, task, { force = false } = {}) {
     // Removed by hand: git still lists it and the merged branch is still there.
     if (project?.path) run('git', ['-C', project.path, 'worktree', 'prune']);
     saveTask(h, { ...rest, copyReturned: now() });
-    return { state: 'gone', line: `the working copy of finished task ${task.id} was already gone${dropMergedBranch(project, task)}` };
+    return { state: 'gone', line: `the working copy of finished task ${task.id} was already gone${dropMergedBranch(h, project, task)}` };
   }
   const holders = otherTerminalsIn(task.worktree, task.terminal);
   if (holders === null) return { state: 'silent', line: `${CORE_SILENT} the terminals in ${task.worktree}; the working copy of ${task.id} was kept. Try again.` };
@@ -1732,7 +1782,7 @@ function returnWaiting(h, task, { force = false } = {}) {
   const back = returnCopy(task, project, { force: check.leftovers });
   if (!back.ok) return { state: 'failed', line: `the working copy of ${task.id} was not returned yet: ${back.why}` };
   saveTask(h, { ...rest, copyReturned: now() });
-  return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${check.unseen ? '; discarded unseen after explicit --force' : ''}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}` };
+  return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${check.unseen ? '; discarded unseen after explicit --force' : ''}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}` };
 }
 
 function cmdFinish(args) {
@@ -1800,7 +1850,7 @@ function cmdFinish(args) {
     console.log(`finished ${id} (${result.how}); its working copy is kept for now (${reason})${holders?.length ? ' and crew returns it by itself once nothing holds it' : '; the next crew finish or crew start retries its return'}; report kept at ${task.report}`);
   } else {
     saveTask(h, closed);
-    console.log(`finished ${id} (${result.how})${back.said}${comparison?.unseen ? '; discarded unseen after explicit --force' : ''}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(project, task) : ''}`);
+    console.log(`finished ${id} (${result.how})${back.said}${comparison?.unseen ? '; discarded unseen after explicit --force' : ''}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}`);
   }
   // A legacy treehouse task moves its scout's item even after a review, as it always did.
   if (task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews)) backlogMove(h, id, 'done');
@@ -1949,11 +1999,12 @@ function unpushedCommits(git, branch) {
   return Number(git('rev-list', '--count', 'FETCH_HEAD..HEAD').stdout.trim()) || 0;
 }
 // "draft, 2 of 3 outcomes ticked" from one read of the pull request; null when GitHub does not answer.
-function pullRequestState(url) {
-  const asked = gh(['pr', 'view', url, '--json', 'isDraft,body'], { timeout: 60000 });
+function pullRequestState(h, task, url) {
+  const asked = gh(['pr', 'view', url, '--json', 'isDraft,body,url,state,mergedAt,closedAt'], { timeout: 60000 });
   let pr = null;
   try { pr = JSON.parse(asked.stdout); } catch { return null; }
   if (asked.code !== 0 || !pr) return null;
+  if (canonicalPrUrl(pr.url)?.toLowerCase() === canonicalPrUrl(url)?.toLowerCase()) rememberTaskPr(h, task, prObservation(pr));
   const outcomes = /^## Implementation\s*$([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(pr.body ?? '')?.[1] ?? '';
   const ticked = (outcomes.match(/^\s*- \[[xX]\]/gm) ?? []).length, all = ticked + (outcomes.match(/^\s*- \[ \]/gm) ?? []).length;
   return `${pr.isDraft ? 'draft' : 'ready'}${all ? `, ${ticked} of ${all} outcomes ticked` : ''}`;
@@ -2001,7 +2052,7 @@ function cmdLand(args) {
     const found = pullRequestOf(task, branchOf(task), { firstLine: true });
     if (!found) no(`the worker has not opened its pull request yet. Tell it: crew tell ${id} "open the draft pull request as the change-delivery skill says and put Implementation: <its link> in the first line of your report"`);
     saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
-    const shown = pullRequestState(found);
+    const shown = pullRequestState(h, task, found);
     console.log(`delivered ${id}: ${found}${shown ? ` (${shown})` : ''}. It follows the repository's delivery workflow: its bot marks it ready; merging is the person's decision.`);
     backlogMove(h, id, 'done', ['--pr', found]);
     return;
@@ -2228,7 +2279,8 @@ function formatDuration(seconds) {
   return parts.slice(0, 2).join(' ') || '0s';
 }
 
-// Discovery is an output-only overlay: never feed an early PR back into done/land.
+// Discovery never feeds an early PR into done/land authority. Verified lifecycle
+// observations travel separately from the unchanged output overlay.
 const prResult = (status, url = null, source = null, reason = null) => ({ status, url, source, reason });
 export function canonicalPrUrl(value) {
   if (typeof value !== 'string' || value.length > 2048 || /\s/.test(value)) return null;
@@ -2238,7 +2290,7 @@ export function canonicalPrUrl(value) {
 }
 // Runner/clock injection keeps deadline and failure tests deterministic; production reads
 // are serial, bounded subprocesses. This helper neither reads reports nor writes anything.
-export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => performance.now() } = {}) {
+export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => performance.now(), observe = () => {} } = {}) {
   const deadline = clock() + 10000, repositories = new Map();
   const fail = reason => { throw new Error(reason); };
   const read = (command, args, cwd, failure) => {
@@ -2309,6 +2361,7 @@ export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => 
           || typeof pr.base?.repo?.full_name !== 'string' || pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase()) fail('invalid-response');
       }
       if (prs.length !== 1) fail('ambiguous-pr');
+      observe(task, prObservation(prs[0]));
       return prResult('known', canonicalPrUrl(prs[0].html_url), 'github');
     } catch (error) {
       // Only our stable reason codes escape; filesystem/runner errors reveal no paths,
@@ -2342,7 +2395,7 @@ function cmdStatus(args) {
   // holders, and plain status (which is about unfinished work) says how many there are.
   const waiting = all ? 0 : allTasks(h).filter(t => t.state === 'closed' && t.copyToReturn).length;
   if (discover) {
-    const results = discoverTaskPrs(records, h.config.projects);
+    const results = discoverTaskPrs(records, h.config.projects, { observe: (task, facts) => rememberTaskPr(h, task, facts) });
     tasks.forEach((task, i) => { task.prDiscovery = results[i]; });
   }
   if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks, ...(all ? {} : { copiesToReturn: waiting }), ...(discover ? { prDiscovery: { version: 1 } } : {}) })); return; }
