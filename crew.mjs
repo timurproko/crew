@@ -1330,6 +1330,7 @@ function cmdRelaunch(args) {
   if (!fs.existsSync(task.worktree)) refuse(`Task ${id} has no working copy any more (${task.worktree}); spawn a new task instead.`, 6);
   const moved = relaunch(h, task, words.join(' ').trim() || 'the coordinator handed the task over', flags);
   if (!moved.pick) refuse(`Task ${id} was not handed over: ${moved.why}`, 8);
+  reviewLabels(h, id, 'rework');
   console.log(`relaunched ${id}: ${pickLabel(moved.pick)} in terminal ${moved.address}${moved.rest.length ? `, ${moved.rest.length} more can take over` : ''}; next: crew wait ${id}`);
 }
 
@@ -1343,7 +1344,10 @@ function cmdDone(args) {
   if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
   if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
   saveTask(h, { ...task, state: 'reported', reported: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
-  if (task.reviews) reviewLabels(h, id, true);
+  if (task.reviews) {
+    reviewLabels(h, id, 'verdict');
+    if (loadTask(h, id).reviewVerdict?.stale) staleApproval(task.reviews);
+  }
   console.log(`reported ${id}. You are finished; stop here.`);
 }
 
@@ -1900,6 +1904,7 @@ function cmdTell(args) {
     saveTask(h, { ...loadTask(h, id), state: task.state });
     refuse(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
   }
+  reviewLabels(h, id, 'rework');
   console.log(`told ${id}; next: crew wait ${id}`);
 }
 
@@ -1921,14 +1926,15 @@ function cmdReview(args) {
   if (!AGENTS[legacy]) refuse(`Unknown agent: ${legacy}. Known: ${Object.keys(AGENTS).join(', ')}`);
   let n = 1, reviewId = `${id}-review`.slice(0, 40);
   while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
+  const reviewHead = reviewHeadOf(task), target = reviewHead ?? branchOf(task);
   const text = [
     `Review the work of task ${id}. It is the branch \`${branchOf(task)}\` of this repository; you are on the commit it started from.`,
-    '', `- See it with \`git log HEAD..${branchOf(task)}\` and \`git diff HEAD...${branchOf(task)}\`. Read the changed files whole where the diff is not enough.`,
+    '', `- Review the fixed head \`${target}\` with \`git log HEAD..${target}\` and \`git diff HEAD...${target}\`. Read the changed files whole where the diff is not enough.`,
     `- What it was asked to do is in \`${task.brief}\`; what its author says it did is in \`${task.report}\`.`,
     '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
     '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
   ].join('\n');
-  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id } });
+  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead } });
   reviewLabels(h, reviewId);
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }
@@ -1937,16 +1943,37 @@ function cmdReview(args) {
 export const githubOwner = url => /github\.com[:/]+([^/]+)\/[^/]+?(?:\.git)?\/?$/.exec(String(url).trim())?.[1] ?? null;
 const GH = process.env.CREW_GH || 'gh';
 const gh = (args, options) => (GH.endsWith('.mjs') ? run(process.execPath, [GH, ...args], options) : run(GH, args, options));
-// Two advisory hooks only, after review/done saved their task state. No task writes,
-// retries, ownership tracking or lifecycle cleanup; each requested label write is tried once.
-function reviewLabels(h, id, completed = false) {
-  const errors = [];
+// Review evidence is a snapshot, never a merge gate or a request to GitHub from status.
+function reviewHeadOf(task) {
+  const r = run('git', ['-C', task.worktree, 'rev-parse', branchOf(task)], { timeout: 2000 });
+  return r.code === 0 && /^[a-f0-9]{40,64}$/.test(r.stdout.trim()) ? r.stdout.trim() : null;
+}
+function staleApproval(id) {
+  console.log(`crew: ${id}: approval is for an older head (or its head could not be verified); task needs another review`);
+}
+function recordReviewVerdict(h, task, reviewer, verdict, currentHead, pr) {
+  const head = reviewer.reviewHead ?? null, stale = verdict === 'APPROVE' && (!head || !currentHead || head !== currentHead);
+  const reviewVerdict = { verdict, head, currentHead, stale, needsReview: verdict !== 'APPROVE' || stale, at: now(), reviewer: reviewer.id, ...(pr ? { pr } : {}) };
+  saveTask(h, { ...loadTask(h, reviewer.id), reviewVerdict });
+  saveTask(h, { ...loadTask(h, task.id), reviewVerdict });
+  return reviewVerdict;
+}
+// Advisory hooks only: saved launch/report, successful follow-up/handover, or plain land.
+// Each PR state/head read is bounded and attempted once, with no label retries or leases.
+function reviewLabels(h, id, action = 'start') {
+  const errors = [], completed = action === 'verdict', rework = action === 'rework', check = action === 'check';
   try {
     const reviewer = loadTask(h, id), verdict = completed ? fs.readFileSync(reviewer.report, 'utf8').split(/\r?\n/)[0].trim() : null;
     if (completed && verdict !== 'APPROVE' && verdict !== 'CHANGES NEEDED') return;
-    const task = loadTask(h, reviewer.reviews), first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
+    const task = rework || check ? reviewer : loadTask(h, reviewer.reviews);
+    if (task.kind !== 'ship' || task.selfFix) return;
+    const first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
     if (task.stage === 'plan' || /^Plan:/i.test(first)) return;
-    let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr;
+    if (completed) recordReviewVerdict(h, task, reviewer, verdict, reviewHeadOf(task));
+    if (check && task.reviewVerdict?.verdict !== 'APPROVE') return;
+    if (rework && task.reviewVerdict) saveTask(h, { ...loadTask(h, id), reviewVerdict: { ...task.reviewVerdict, needsReview: true } });
+    let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr;
+    if (!url && rework && run('git', ['-C', task.worktree, 'remote', 'get-url', 'origin'], { timeout: 2000 }).code !== 0) return;
     if (!url) {
       const found = gh(['pr', 'view', branchOf(task), '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 10000 });
       if (found.code !== 0 && /no pull requests? found|no pull request associated/i.test(found.stderr)) return;
@@ -1956,11 +1983,27 @@ function reviewLabels(h, id, completed = false) {
     const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(url);
     if (!m) throw new Error('invalid implementation PR URL');
     const repo = `repos/${m[2]}/${m[3]}`, issue = `${repo}/issues/${m[4]}/labels`;
-    const api = (method, endpoint, extra = [], input) => {
-      const r = gh(['api', '--hostname', m[1], '--method', method, endpoint, ...extra], { timeout: 10000, ...(input ? { input: JSON.stringify(input) } : {}) });
+    const api = (method, endpoint, extra = [], input, timeout = 10000) => {
+      const r = gh(['api', '--hostname', m[1], '--method', method, endpoint, ...extra], { timeout, ...(input ? { input: JSON.stringify(input) } : {}) });
       if (r.code !== 0) throw new Error(r.stderr || `${method} ${endpoint} failed`);
       return r.stdout;
     };
+    const pr = JSON.parse(api('GET', `${repo}/pulls/${m[4]}`, [], null, 2000));
+    if (!['open', 'closed'].includes(pr?.state)) throw new Error('PR state unreadable');
+    const open = pr.state === 'open' && !pr.merged_at;
+    const currentHead = typeof pr.head?.sha === 'string' && /^[a-f0-9]{40,64}$/.test(pr.head.sha) ? pr.head.sha : null;
+    let recorded;
+    if (completed) recorded = recordReviewVerdict(h, task, reviewer, verdict, currentHead, url);
+    if (check) {
+      const previous = task.reviewVerdict, stale = !previous.head || !currentHead || previous.head !== currentHead;
+      saveTask(h, { ...loadTask(h, id), reviewVerdict: { ...previous, currentHead, stale, needsReview: previous.needsReview || stale } });
+      if (open && stale) staleApproval(id);
+      return;
+    }
+    if (!open && !completed) {
+      if (!rework) console.log(`crew: implementation PR ${url} is already ${pr.merged_at ? 'merged' : 'closed'}; review labels skipped`);
+      return;
+    }
     const pages = JSON.parse(api('GET', `${repo}/actions/variables`, ['--paginate', '--slurp']));
     if (!Array.isArray(pages) || !pages.length || pages.some(p => !Array.isArray(p?.variables) || p.variables.some(v => typeof v.name !== 'string' || typeof v.value !== 'string'))) throw new Error('repository variables unreadable');
     if (pages.flatMap(p => p.variables).some(v => v.name === 'DELIVERY_LABELS_ENABLED' && v.value.toLowerCase() === 'false')) throw new Error('repository opted out with DELIVERY_LABELS_ENABLED=false');
@@ -1980,21 +2023,23 @@ function reviewLabels(h, id, completed = false) {
       if (manifest?.version !== 1 || keys.some(key => !validName(manifest.labels?.[key]?.name) || (manifest.labels[key].previousNames !== undefined && (!Array.isArray(manifest.labels[key].previousNames) || !manifest.labels[key].previousNames.every(validName))))) throw new Error('invalid review label manifest');
       palette = keys.map(key => ({ name: manifest.labels[key].name, previousNames: manifest.labels[key].previousNames ?? [] }));
     } catch (error) { errors.push(`review label manifest: ${error.message}; using built-in defaults`); }
-    const desired = palette[completed ? verdict === 'APPROVE' ? 1 : 2 : 0].name;
+    const desired = open ? palette[rework || completed && (verdict !== 'APPROVE' || recorded.stale) ? 2 : completed ? 1 : 0].name : null;
     const current = JSON.parse(api('GET', issue, ['--paginate', '--slurp'])).flat();
     if (!Array.isArray(current) || current.some(l => typeof l?.name !== 'string')) throw new Error('PR labels unreadable');
+    if (rework && !current.some(l => [palette[1].name, ...palette[1].previousNames].includes(l.name))) return;
     const remove = new Set(palette.flatMap(label => [label.name, ...label.previousNames]).filter(name => name !== desired));
     for (const name of remove) {
       if (current.some(l => l.name === name)) {
         // Completion during a lookup cancels the rest of this start hook, not the verdict.
-        if (!completed && loadTask(h, id).state !== 'working') return;
+        if (!completed && !rework && loadTask(h, id).state !== 'working') return;
         try { api('DELETE', `${issue}/${encodeURIComponent(name)}`); }
         catch (error) { errors.push(error.message); }
       }
     }
+    if (!desired) return; // A late verdict only clears managed labels on a closed PR.
     try {
       if (JSON.parse(api('GET', `${repo}/labels/${encodeURIComponent(desired)}`)).name !== desired) throw new Error(`shared label not defined: ${desired}`);
-      if (!completed && loadTask(h, id).state !== 'working') return;
+      if (!completed && !rework && loadTask(h, id).state !== 'working') return;
       api('POST', issue, ['--input', '-'], { labels: [desired] });
     } catch (error) { errors.push(error.message); }
   } catch (error) { errors.push(error.message); }
@@ -2041,7 +2086,10 @@ function cmdLand(args) {
   if (task.selfFix) refuse(`Task ${id} repairs crew itself; deliver it with \`crew selfrepair ${id}\`.`);
   if (task.kind !== 'ship') refuse(`Task ${id} is a scout; it has a report, not a branch.`);
   // A workflow task's link is recorded already when its worker reports; it lands only once.
-  if (task.pr && (task.landed || !task.workflow)) { console.log(`${id} already has a pull request: ${task.pr}`); return; }
+  if (task.pr && (task.landed || !task.workflow)) {
+    if (!task.workflow && !task.gate) reviewLabels(h, id, 'check');
+    console.log(`${id} already has a pull request: ${task.pr}`); return;
+  }
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; it is delivered only after its worker reported.`);
   const project = registeredProject(h, task.project) ?? refuse(`Unknown project: ${task.project}.`);
   const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
@@ -2100,6 +2148,7 @@ function cmdLand(args) {
   const url = /https?:\/\/\S+/.exec(made.stdout)?.[0];
   if (made.error || made.code !== 0 || !url) no(`its branch ${branchOf(task)} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew land ${id}\` again, or open it by hand.`, 4);
   saveTask(h, { ...loadTask(h, id), pr: url, landed: now() });
+  reviewLabels(h, id, 'check');
   console.log(`delivered ${id}: ${url} (against ${base}, ${subjects.length} commit${subjects.length === 1 ? '' : 's'}). Merging it is the person's decision.`);
   backlogMove(h, id, 'done', ['--pr', url]);
 }
@@ -2502,6 +2551,7 @@ function cmdStatus(args) {
       report: fs.existsSync(t.report) ? t.report : null, pr: t.pr ?? null, error: t.error ?? null, elapsedSeconds: taskElapsedSeconds(t, currentTime),
       deliveryKind: t.kind === 'ship' ? t.gate ? 'gate' : t.workflow ? 'workflow' : 'plain' : null,
       ...(t.workflow ? { workflow: t.workflow, stage: t.stage ?? null } : {}),
+      ...(t.reviewVerdict ? { reviewVerdict: t.reviewVerdict } : {}),
       ...(t.copyToReturn ? { copyToReturn: copyWaiting(t) } : {}) };
   });
   // A closed task whose copy still waits to be returned is not hidden: --all lists it with its
@@ -2516,7 +2566,7 @@ function cmdStatus(args) {
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
   // A workflow task's stage is what its last report said it is; GitHub is not asked here.
   const stageOf = t => (!t.stage ? '' : t.stage === 'plan' && t.state === 'reported' ? ' (plan awaiting approval)' : ` (${t.stage})`);
-  for (const t of tasks) console.log(`${t.id}\t${t.state}${stageOf(t)}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state}${t.core.status === 'error' ? `; told to continue ${t.continuations} ${t.continuations === 1 ? 'time' : 'times'}` : ''})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.pending ? `waits: ${t.copyToReturn.pending}${t.copyToReturn.heldBy ? `; held by ${t.copyToReturn.heldBy}` : ''}` : t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
+  for (const t of tasks) console.log(`${t.id}\t${t.state}${stageOf(t)}\t${t.kind}/${t.launch?.label ?? t.agent}${t.fallbacks.length ? ` (after ${t.fallbacks.map(f => f.from).join(', ')})` : ''}\t${t.project}\t${t.terminal ?? '-'}${t.core ? ` (${t.core.status ?? t.core.state}${t.core.status === 'error' ? `; told to continue ${t.continuations} ${t.continuations === 1 ? 'time' : 'times'}` : ''})` : ''}\t${formatDuration(t.elapsedSeconds)}${t.pr ? `\t${t.pr}` : ''}${t.error ? `\t${t.error}` : ''}${t.reviewVerdict?.needsReview ? '\tneeds another review' : ''}${t.copyToReturn ? `\tworking copy still to be returned, ${t.copyToReturn.pending ? `waits: ${t.copyToReturn.pending}${t.copyToReturn.heldBy ? `; held by ${t.copyToReturn.heldBy}` : ''}` : t.copyToReturn.heldBy ? `held by ${t.copyToReturn.heldBy}` : t.copyToReturn.kept ? `waits: ${t.copyToReturn.kept} (crew finish ${t.id} --force discards it)` : t.copyToReturn.free ? 'free now (returned at the next crew start or finish)' : 'Core did not say who holds it'}` : ''}`);
   if (waiting) console.log(`${waiting} working ${waiting === 1 ? 'copy' : 'copies'} of finished tasks still to be returned (crew status --all)`);
 }
 // Where a postponed copy stands now, asked of Core: { worktree, since, heldBy, free }.
