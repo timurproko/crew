@@ -89,7 +89,14 @@ only within one invocation, not written to disk. Verified PR observations are du
 the existing discovery response supplies lifecycle facts without another request. Existing
 land/finish PR reads also save state and timestamps when available. Observation updates
 preserve current task lifecycle fields and do not change `updated`; cache-write failures
-never fail status. Missing/failed reads do not invent closure or erase usable facts.
+never fail status. Observation saves never wait for a task lock, skip when lifecycle work
+is pending, and abandon Windows sharing-error replacement retries so lifecycle commands
+take priority. An already-started atomic replacement cannot be preempted: lifecycle
+writers allow two seconds total to acquire their intent/task locks, covering the supported
+one-second replacement retry window plus scheduling margin. Exhausted contention returns
+retryable exit 6 with `task-busy:` rather than an internal-error exit 70; locks are never
+stolen. Retry after the writer finishes, and do not remove a lock while its writer may
+still be running. Missing/failed reads do not invent closure or erase usable facts.
 Recorded PRs still skip network lookup, so unknown or stale-open observations can remain
 until another existing lifecycle read learns closure. Facts apply only to their PR URL,
 never to a different recorded PR; a newer verified open observation clears old closure.

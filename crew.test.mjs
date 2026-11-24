@@ -958,14 +958,22 @@ gapTests['pr-facts'] = () => {
   assert.equal(fs.readFileSync(file, 'utf8'), replaced, 'cannot attach facts to a different recorded identity');
   rememberTaskPr(h, { ...f.task, branch: 'different' }, prObservation({ state: 'OPEN' }, read().pr));
   assert.equal(fs.readFileSync(file, 'utf8'), replaced, 'reused task identity fails closed');
-  fs.writeFileSync(`${file}.lock`, 'held');
-  rememberTaskPr(h, f.task, prObservation({ state: 'OPEN' }, read().pr));
-  assert.equal(fs.readFileSync(file, 'utf8'), replaced); fs.rmSync(`${file}.lock`);
-  const rename = fs.renameSync;
+  const wait = Atomics.wait; let waits = 0;
   try {
-    fs.renameSync = () => { throw Error('injected read-only filesystem'); };
+    Atomics.wait = (...args) => { waits++; return wait(...args); };
+    for (const lock of [`${file}.lock`, `${file}.lifecycle.lock`]) {
+      fs.writeFileSync(lock, 'held');
+      rememberTaskPr(h, f.task, prObservation({ state: 'OPEN' }, read().pr));
+      assert.equal(fs.readFileSync(file, 'utf8'), replaced); fs.rmSync(lock);
+    }
+  } finally { Atomics.wait = wait; }
+  assert.equal(waits, 0, 'observations skip both active writers and pending lifecycle intent without waiting');
+  const rename = fs.renameSync; let attempts = 0;
+  try {
+    fs.renameSync = () => { attempts++; throw Object.assign(Error('injected sharing error'), { code: 'EACCES' }); };
     rememberTaskPr(h, f.task, prObservation({ state: 'OPEN' }, read().pr));
   } finally { fs.renameSync = rename; }
+  assert.equal(attempts, 1, 'observations yield on sharing errors instead of holding the lock for retries');
   assert.equal(fs.readFileSync(file, 'utf8'), replaced);
   assert.ok(!fs.existsSync(`${file}.lock`));
 
@@ -977,6 +985,71 @@ gapTests['pr-facts'] = () => {
   assert.equal(observations[0][1].state, 'MERGED'); assert.equal(runner.calls.filter(c => c.args.includes('api')).length, 1);
   const bad = discoveryRunner(f, { prs: [{ ...discoveryPr('not-our-branch'), state: 'closed' }] });
   discoverTaskPrs([f.task], f.projects, { ...bad, observe: () => assert.fail('unverified facts cannot be saved') });
+};
+
+gapTests['pr-facts-contention'] = async () => {
+  const f = gapFixture('pr-facts-contention');
+  const owner = JSON.parse(fs.readFileSync(path.join(f.home, 'owner.json'))).terminal;
+  const module = JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href);
+  for (const [verb, delay] of [['done', 500], ['finish', 500], ['done', 1100]]) {
+    const label = `${verb}-${delay}`, task = f.spawn(`overlap-${label}`, ['--agent', 'pi']);
+    fs.writeFileSync(task.report, 'Complete.');
+    const file = path.join(f.home, 'tasks', task.id, 'task.json'), lock = `${file}.lock`;
+    const ready = path.join(f.dir, `${label}-observation-ready`), release = path.join(f.dir, `${label}-observation-release`);
+    const waiting = path.join(f.dir, `${label}-lifecycle-waiting`);
+    const observer = path.join(f.dir, `${label}-observer.mjs`), lifecycle = path.join(f.dir, `${label}-lifecycle.mjs`);
+    fs.writeFileSync(observer, `import fs from 'node:fs'; import {rememberTaskPr,prObservation} from ${module};
+const file = ${JSON.stringify(file)}, rename = fs.renameSync;
+fs.renameSync = (from,to) => {
+ if (to === file) {
+  fs.writeFileSync(${JSON.stringify(ready)},'ready'); const deadline = Date.now()+15000;
+  while (!fs.existsSync(${JSON.stringify(release)})) { if (Date.now()>deadline) throw Error('observation barrier timeout'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10); }
+  // Delay atomic rename only after lifecycle actually attempted its lock.
+  // Also cover the full one-second supported retry interval plus margin.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${delay});
+ }
+ return rename(from,to);
+};
+const task = JSON.parse(fs.readFileSync(file));
+rememberTaskPr({tasks:${JSON.stringify(path.join(f.home, 'tasks'))}},task,prObservation({state:'OPEN'},'https://github.com/acme/demo/pull/12'));`);
+    fs.writeFileSync(lifecycle, `import fs from 'node:fs'; import {main} from ${module};
+const open = fs.openSync; let marked = false;
+fs.openSync = (file,...args) => {
+ if (!marked && file === ${JSON.stringify(lock)} && args[0] === 'wx') { marked = true; fs.writeFileSync(${JSON.stringify(waiting)},'waiting'); }
+ return open(file,...args);
+}; main(process.argv.slice(2));`);
+    const observation = projectProcess(f, [], { script: observer });
+    await until(() => fs.existsSync(ready));
+    const writer = projectProcess(f, [verb, task.id, ...(verb === 'finish' ? ['--force'] : [])],
+      { script: lifecycle, terminal: verb === 'done' ? task.terminal : owner });
+    await until(() => fs.existsSync(waiting));
+    fs.writeFileSync(release, 'release');
+    const [observed, written] = await Promise.all([observation.result, writer.result]);
+    assert.equal(observed.code, 0, observed.out);
+    assert.equal(written.code, 0, `${verb} must survive the observation's ${delay} ms rename: ${written.out}`);
+    assert.equal(f.task(task.id).state, verb === 'done' ? 'reported' : 'closed');
+    assert.equal(f.task(task.id).prFacts.state, 'OPEN', 'lifecycle writes preserve completed observations');
+    assert.equal(f.task(task.id).pr, undefined, 'observations do not grant delivery authority');
+    assert.ok(!fs.existsSync(lock)); assert.ok(!fs.existsSync(`${file}.lifecycle.lock`));
+  }
+  // Exhausted/stale contention is an actionable refusal, not an internal crash.
+  // Advance only the contending child's clock after it really retries the lock.
+  const task = f.spawn('busy-refusal', ['--agent', 'pi']); fs.writeFileSync(task.report, 'Complete.');
+  const file = path.join(f.home, 'tasks', task.id, 'task.json'), script = path.join(f.dir, 'busy.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs'; import {main} from ${module};
+const open = fs.openSync, clock = Date.now; let attempts = 0;
+fs.openSync = (file,...args) => {
+ if (file === ${JSON.stringify(`${file}.lock`)} && ++attempts === 2) Date.now = () => clock()+10000;
+ return open(file,...args);
+}; main(process.argv.slice(2));`);
+  fs.writeFileSync(`${file}.lock`, 'held');
+  let r = await projectProcess(f, ['done', task.id], { script, terminal: task.terminal }).result;
+  assert.equal(r.code, 6, r.out); assert.match(r.out, /task-busy: busy-refusal; retry/);
+  assert.ok(!r.out.includes('internal error')); assert.equal(f.task(task.id).state, 'working');
+  assert.ok(!fs.existsSync(`${file}.lifecycle.lock`), 'failed acquisition releases lifecycle intent');
+  fs.rmSync(`${file}.lock`);
+  r = await projectProcess(f, ['done', task.id], { terminal: task.terminal }).result;
+  assert.equal(r.code, 0, r.out); assert.equal(f.task(task.id).state, 'reported');
 };
 
 gapTests['pr-facts-commands'] = () => {

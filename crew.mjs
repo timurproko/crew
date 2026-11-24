@@ -71,7 +71,7 @@ export const bashPath = p => { const s = slash(p); return /^[A-Za-z]:\//.test(s)
 const now = () => new Date().toISOString();
 
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
-function writeJson(file, value) {
+function writeJson(file, value, { retrySharing = true } = {}) {
   const tmp = `${file}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
@@ -83,7 +83,7 @@ function writeJson(file, value) {
         // Windows readers/virus scanners can briefly deny replacement. Keep both
         // snapshots (and the caller's registry lock) intact until rename succeeds.
         // Never unlink the destination: readers must always see complete JSON.
-        if (!WINDOWS || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || remaining <= 0) throw error;
+        if (!retrySharing || !WINDOWS || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || remaining <= 0) throw error;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(20, remaining));
       }
     }
@@ -250,20 +250,35 @@ function loadTask(h, id) {
   if (!task) refuse(`No task ${id} in ${h.dir}.`);
   return task;
 }
-// Observation writers and lifecycle writers share a short per-task transaction. A
-// delayed lifecycle snapshot must not discard a newer PR observation (or vice versa).
-function taskTransaction(h, id, action) {
-  const lock = `${taskFile(h, id)}.lock`, deadline = Date.now() + 250;
-  let fd;
-  for (;;) {
-    try { fd = fs.openSync(lock, 'wx'); break; }
-    catch (error) {
-      if (error.code !== 'EEXIST' || Date.now() >= deadline) throw error;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+// Lifecycle intent prevents successive polls from taking the task lock ahead of
+// done/finish/land/tell/spawn. An already-started atomic write cannot be preempted:
+// allow its supported one-second Windows replacement window plus scheduling margin.
+function taskTransaction(h, id, action, { observation = false } = {}) {
+  const lock = `${taskFile(h, id)}.lock`, priority = `${taskFile(h, id)}.lifecycle.lock`;
+  const deadline = Date.now() + 2000;
+  const acquire = (file, wait) => {
+    for (;;) {
+      try { return fs.openSync(file, 'wx'); }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        if (!wait) return null;
+        if (Date.now() >= deadline) refuse(`task-busy: ${id}; retry the command after the current writer releases ${slash(file)}. Do not remove a lock while its writer may still be running.`, 6);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
     }
-  }
-  try { return action(readJson(taskFile(h, id))); }
-  finally { fs.closeSync(fd); fs.rmSync(lock, { force: true }); }
+  };
+  const release = (file, fd) => { fs.closeSync(fd); fs.rmSync(file, { force: true }); };
+  if (observation && fs.existsSync(priority)) return;
+  const intent = observation ? null : acquire(priority, true);
+  try {
+    const fd = acquire(lock, !observation);
+    if (fd === null) return;
+    try {
+      // Close the race with lifecycle intent arriving after the first check.
+      if (observation && fs.existsSync(priority)) return;
+      return action(readJson(taskFile(h, id)));
+    } finally { release(lock, fd); }
+  } finally { if (intent !== null) release(priority, intent); }
 }
 const saveTask = (h, task) => taskTransaction(h, task.id, current => {
   const prFacts = current?.prFacts;
@@ -299,8 +314,10 @@ export function rememberTaskPr(h, task, facts) {
         if (['state', 'mergedAt', 'closedAt', 'observedAt'].every(key => old[key] === facts[key])) return;
       }
       // Observations never touch updated, state, pr, stage, reports or landing.
-      writeJson(taskFile(h, task.id), { ...current, prFacts: facts });
-    });
+      // A sharing error yields immediately to lifecycle work; a later poll can
+      // save these facts. Only lifecycle writes use writeJson's replacement retries.
+      writeJson(taskFile(h, task.id), { ...current, prFacts: facts }, { retrySharing: false });
+    }, { observation: true });
   } catch { /* A read-only caller may not be able to cache; the response still works. */ }
 }
 function allTasks(h) {
