@@ -2579,8 +2579,8 @@ function cmdFleetStatus(h, discover) {
     const discovered = discoverTaskPrs(pending, h.config.projects, {
       verifyRecorded: t => verifyIds.has(t.id), attempted: t => {
         lastAttempt = t.id;
-        if (savedPrFacts(t)?.state === 'OPEN') openChecked[t.id] = { url: canonicalPrUrl(t.pr), at: new Date(currentTime).toISOString() };
-      }, wallClock: () => currentTime,
+        if (savedPrFacts(t)?.state === 'OPEN') openChecked[t.id] = { url: canonicalPrUrl(t.pr), at: new Date(Date.now()).toISOString() };
+      },
       observe: (task, facts) => {
       if (verifyIds.has(task.id)) {
         if (facts.state === 'OPEN') openChecked[task.id] = { url: facts.url, at: facts.observedAt };

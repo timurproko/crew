@@ -1368,7 +1368,10 @@ gapTests['fleet-not-found'] = () => {
   const opened = { data: { repository: { ...repository, pullRequest: { url, state: 'OPEN', mergedAt: null, closedAt: null } } } };
   f.set({ verification: opened });
   const script = path.join(f.dir, 'clock.mjs'), clock = Date.now();
-  fs.writeFileSync(script, `Date.now = () => Number(process.env.TEST_STATUS_TIME); const {main} = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
+  fs.writeFileSync(script, `import cp from 'node:child_process'; import {syncBuiltinESMExports} from 'node:module';
+let time = Number(process.env.TEST_STATUS_TIME); Date.now = () => time;
+const execute = cp.spawnSync; cp.spawnSync = (command,args,options) => { const result = execute(command,args,options); if (args.includes('graphql')) time += Number(process.env.TEST_REQUEST_ADVANCE ?? 0); return result; }; syncBuiltinESMExports();
+const {main} = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
   const at = time => crew(args, { cwd: f.home, script, env: { CREW_GH: f.fakeGh, TEST_STATUS_TIME: String(time) } });
   const held = path.join(f.home, 'tasks', 'uncertain', 'task.json.lifecycle.lock'); fs.writeFileSync(held, 'lifecycle owns priority');
   let before = calls().length; assert.equal(at(clock).code, 0); assert.equal(calls().length, before + 1);
@@ -1380,6 +1383,14 @@ gapTests['fleet-not-found'] = () => {
   f.set({ fail: true });
   assert.equal(at(clock + 1200000).code, 0); assert.equal(calls().length, before + 3);
   assert.equal(at(clock + 1200001).code, 0); assert.equal(calls().length, before + 3, 'failed open refreshes also obey the ten-minute attempt interval');
+  f.save({ ...f.task, id: 'uncertain', state: 'closed', pr: url });
+  fs.rmSync(path.join(f.home, 'state', 'status-fleet-pr-cursor.json')); f.set({ verification: opened });
+  const base = clock + 2000000; before = calls().length;
+  r = crew(args, { cwd: f.home, script, env: { CREW_GH: f.fakeGh, TEST_STATUS_TIME: String(base), TEST_REQUEST_ADVANCE: '5000' } });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(Date.parse(JSON.parse(fs.readFileSync(path.join(f.home, 'tasks', 'uncertain', 'task.json'))).prFacts.observedAt), base + 5000, 'cooldown starts at the completed proof, not the earlier poll snapshot');
+  assert.equal(at(base + 600000).code, 0); assert.equal(calls().length, before + 1, 'request duration cannot shorten the minimum refresh interval');
+  assert.equal(at(base + 605000).code, 0); assert.equal(calls().length, before + 2);
 };
 
 gapTests['fleet-verification-bounds'] = () => {
