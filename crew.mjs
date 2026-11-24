@@ -300,6 +300,35 @@ export function prObservation(pr, url = pr?.url ?? pr?.html_url, observedAt = no
   return { version: 1, url, state, mergedAt: state === 'MERGED' ? mergedAt : null,
     closedAt: ['MERGED', 'CLOSED'].includes(state) ? closedAt : null, observedAt };
 }
+// A nullable PR alone (or a generic 404) is not proof. The same GraphQL
+// response must establish repository identity AND access to its PR connection.
+export function verifiedPrRead(payload, url, observedAt = now()) {
+  url = canonicalPrUrl(url);
+  const repository = payload?.data?.repository, errors = payload?.errors ?? [];
+  if (!url || !repository || !Array.isArray(errors)) return null;
+  const [, owner, name] = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\//.exec(url);
+  if (typeof repository.nameWithOwner !== 'string' || repository.nameWithOwner.toLowerCase() !== `${owner}/${name}`.toLowerCase()
+    || !Number.isSafeInteger(repository.pullRequests?.totalCount) || repository.pullRequests.totalCount < 0) return null;
+  if (repository.pullRequest === null) {
+    if (errors.some(e => e?.type !== 'NOT_FOUND' || JSON.stringify(e.path) !== '["repository","pullRequest"]')) return null;
+    return { facts: { ...prObservation({}, url, observedAt), state: 'NOT_FOUND' }, pr: null };
+  }
+  const pr = repository.pullRequest;
+  if (errors.length || canonicalPrUrl(pr?.url)?.toLowerCase() !== url.toLowerCase() || !['OPEN', 'MERGED', 'CLOSED'].includes(pr.state)) return null;
+  return { facts: prObservation(pr, url, observedAt), pr };
+}
+function prReadArgs(url, fields = '') {
+  const [, owner, name, number] = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)$/.exec(canonicalPrUrl(url));
+  return ['api', '--hostname', 'github.com', 'graphql', '-f',
+    `query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){nameWithOwner pullRequests(first:1){totalCount} pullRequest(number:$number){url state mergedAt closedAt ${fields}}}}`,
+    '-f', `owner=${owner}`, '-f', `name=${name}`, '-F', `number=${number}`];
+}
+function readPrAtUrl(url, fields, options) {
+  if (!canonicalPrUrl(url)) return null;
+  const asked = gh(prReadArgs(url, fields), options);
+  if (asked.error || ![0, 1].includes(asked.code)) return null;
+  try { return verifiedPrRead(JSON.parse(asked.stdout), url); } catch { return null; }
+}
 export function rememberTaskPr(h, task, facts) {
   if (!facts || !validId(task.id)) return;
   try {
@@ -1520,11 +1549,24 @@ function dropMergedBranch(h, project, task) {
   const tip = git('rev-parse', '--verify', '-q', `refs/heads/${branch}`).stdout.trim();
   if (!tip) return '';
   let merged = ['HEAD', 'refs/remotes/origin/HEAD'].some(ref => git('merge-base', '--is-ancestor', tip, ref).code === 0);
-  if (!merged && git('remote', 'get-url', 'origin').code === 0) {
-    const asked = gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid,url,state,mergedAt,closedAt'], { cwd: project.path, timeout: 60000 });
-    let pr; try { pr = JSON.parse(asked.stdout)?.[0]; } catch { /* No proof. */ }
-    merged = asked.code === 0 && pr?.headRefOid === tip && pr.state === 'MERGED';
-    if (merged) rememberTaskPr(h, task, prObservation(pr));
+  const origin = !merged ? git('remote', 'get-url', 'origin') : null;
+  if (!merged && origin?.code === 0) {
+    const repository = /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([a-z0-9-]+\/[a-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(origin.stdout.trim())?.[1];
+    const recorded = canonicalPrUrl(task.pr);
+    // A recorded URL from another repository must NEVER authorize deletion.
+    // Unsupported origins/SSH aliases retain the existing project-context lookup.
+    if (recorded && repository && recorded.toLowerCase().startsWith(`https://github.com/${repository.toLowerCase()}/pull/`)) {
+      // Replace the existing branch read, not add another request. Exact URL reads
+      // can also prove absence; a missing PR never proves the branch was merged.
+      const found = readPrAtUrl(task.pr, 'headRefOid', { cwd: project.path, timeout: 60000 });
+      if (found) rememberTaskPr(h, task, found.facts);
+      merged = found?.pr?.headRefOid === tip && found.pr.state === 'MERGED';
+    } else {
+      const asked = gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid,url,state,mergedAt,closedAt'], { cwd: project.path, timeout: 60000 });
+      let pr; try { pr = JSON.parse(asked.stdout)?.[0]; } catch { /* No proof. */ }
+      merged = asked.code === 0 && pr?.headRefOid === tip && pr.state === 'MERGED';
+      if (merged) rememberTaskPr(h, task, prObservation(pr));
+    }
   }
   return merged && git('branch', '-D', branch).code === 0 ? `; merged branch ${branch} deleted` : '';
 }
@@ -2066,11 +2108,11 @@ function unpushedCommits(git, branch) {
 }
 // "draft, 2 of 3 outcomes ticked" from one read of the pull request; null when GitHub does not answer.
 function pullRequestState(h, task, url) {
-  const asked = gh(['pr', 'view', url, '--json', 'isDraft,body,url,state,mergedAt,closedAt'], { timeout: 60000 });
-  let pr = null;
-  try { pr = JSON.parse(asked.stdout); } catch { return null; }
-  if (asked.code !== 0 || !pr) return null;
-  if (canonicalPrUrl(pr.url)?.toLowerCase() === canonicalPrUrl(url)?.toLowerCase()) rememberTaskPr(h, task, prObservation(pr));
+  const found = readPrAtUrl(url, 'isDraft body', { timeout: 60000 });
+  if (!found) return null;
+  rememberTaskPr(h, task, found.facts);
+  const pr = found.pr;
+  if (!pr) return null;
   const outcomes = /^## Implementation\s*$([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(pr.body ?? '')?.[1] ?? '';
   const ticked = (outcomes.match(/^\s*- \[[xX]\]/gm) ?? []).length, all = ticked + (outcomes.match(/^\s*- \[ \]/gm) ?? []).length;
   return `${pr.isDraft ? 'draft' : 'ready'}${all ? `, ${ticked} of ${all} outcomes ticked` : ''}`;
@@ -2360,28 +2402,37 @@ export function canonicalPrUrl(value) {
 }
 // Runner/clock injection keeps deadline and failure tests deterministic; production reads
 // are serial, bounded subprocesses. This helper neither reads reports nor writes anything.
-export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => performance.now(), observe = () => {} } = {}) {
+export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => performance.now(), observe = () => {},
+  verifyRecorded = () => false, attempted = () => {}, wallClock = () => Date.now() } = {}) {
   const deadline = clock() + 10000, repositories = new Map();
+  let verifications = 0;
   const fail = reason => { throw new Error(reason); };
-  const read = (command, args, cwd, failure) => {
+  const read = (command, args, cwd, failure, partial = false) => {
     const remaining = Math.floor(deadline - clock());
     if (remaining <= 0) fail('budget-exhausted');
     const result = execute(command, args, { cwd, timeout: Math.min(2000, remaining), killSignal: 'SIGKILL', maxBuffer: 1048576,
       env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GH_PROMPT_DISABLED: '1', GH_HOST: 'github.com', GH_REPO: '', GH_PAGER: 'cat' } });
     if (result.error?.code === 'ETIMEDOUT') fail('timeout');
     if (result.error?.code === 'ENOBUFS' || Buffer.byteLength(result.stdout ?? '') + Buffer.byteLength(result.stderr ?? '') > 1048576) fail('invalid-response');
-    if (result.error || result.code !== 0) fail(failure);
+    if (result.error || (result.code !== 0 && !(partial && result.code === 1))) fail(failure);
     if (clock() >= deadline) fail('budget-exhausted');
     return result.stdout.trim();
   };
-  const ask = (args, cwd) => GH.endsWith('.mjs')
-    ? read(process.execPath, [GH, ...args], cwd, 'github-unavailable') : read(GH, args, cwd, 'github-unavailable');
+  const ask = (args, cwd, partial = false) => GH.endsWith('.mjs')
+    ? read(process.execPath, [GH, ...args], cwd, 'github-unavailable', partial) : read(GH, args, cwd, 'github-unavailable', partial);
   const parse = text => { try { return JSON.parse(text); } catch { fail('invalid-response'); } };
   const samePath = (a, b) => comparablePath(fs.realpathSync.native(a)) === comparablePath(fs.realpathSync.native(b));
   const repoName = value => typeof value === 'string' && /^[a-z0-9-]+\/[a-z0-9_.-]+$/i.test(value) && !['.', '..'].includes(value.split('/')[1]);
   return tasks.map(task => {
     if (task.pr != null) {
       const url = canonicalPrUrl(task.pr);
+      if (url && task.state === 'closed' && verifyRecorded(task) && verifications < 5 && clock() < deadline) {
+        try {
+          verifications++; attempted(task);
+          const found = verifiedPrRead(parse(ask(prReadArgs(url), undefined, true)), url, new Date(wallClock()).toISOString());
+          if (found) observe(task, found.facts);
+        } catch { /* An unproven absence never changes recorded-link discovery. */ }
+      }
       return url ? prResult('known', url, 'recorded') : prResult('unavailable', null, null, 'invalid-recorded-pr');
     }
     if (task.kind !== 'ship') return prResult('none');
@@ -2450,6 +2501,7 @@ function savedPrFacts(task) {
 }
 function expiredFleetPr(task, currentTime) {
   const facts = savedPrFacts(task);
+  if (facts?.state === 'NOT_FOUND') return true;
   const event = facts?.state === 'MERGED' ? facts.mergedAt : facts?.state === 'CLOSED' ? facts.closedAt : null;
   return Boolean(prTime(event) && currentTime - Date.parse(event) > 24 * 3600 * 1000);
 }
@@ -2504,8 +2556,36 @@ function cmdFleetStatus(h, discover) {
     || (discover && t.state === 'closed' && t.kind === 'ship' && t.pr == null && !savedPrFacts(t)));
   const results = new Map(records.map(t => [t.id, localFleetPr(t)]));
   if (discover) {
-    const pending = records.filter(t => t.pr == null);
-    const discovered = discoverTaskPrs(pending, h.config.projects, { observe: (task, facts) => {
+    const cursorFile = path.join(h.dir, 'state', 'status-fleet-pr-cursor.json');
+    const cursor = readJson(cursorFile), openChecked = {};
+    for (const t of records) {
+      const checked = cursor?.openChecked && ownEntry(cursor.openChecked, t.id);
+      if (checked && t.state === 'closed' && canonicalPrUrl(t.pr)?.toLowerCase() === canonicalPrUrl(checked.url)?.toLowerCase()) openChecked[t.id] = checked;
+    }
+    const eligible = records.filter(t => {
+      if (t.state !== 'closed' || !canonicalPrUrl(t.pr)) return false;
+      const checked = ownEntry(openChecked, t.id), age = currentTime - Date.parse(prTime(checked?.at));
+      if (checked && age >= 0 && age < 600000) return false;
+      const facts = savedPrFacts(t);
+      return !facts?.state || (facts.state === 'OPEN' && (!prTime(facts.observedAt) || currentTime - Date.parse(facts.observedAt) >= 600000));
+    });
+    const after = cursor?.after;
+    const start = (eligible.findIndex(t => t.id === after) + 1) % (eligible.length || 1);
+    const verification = [...eligible.slice(start), ...eligible.slice(0, start)].slice(0, 5);
+    const verifyIds = new Set(verification.map(t => t.id)); let lastAttempt;
+    // Existing discovery gets first use of the SAME budget. Recorded closed PR
+    // verification adds at most five one-request proofs; unqueried rows wait.
+    const pending = [...records.filter(t => t.pr == null), ...verification];
+    const discovered = discoverTaskPrs(pending, h.config.projects, {
+      verifyRecorded: t => verifyIds.has(t.id), attempted: t => {
+        lastAttempt = t.id;
+        if (savedPrFacts(t)?.state === 'OPEN') openChecked[t.id] = { url: canonicalPrUrl(t.pr), at: new Date(currentTime).toISOString() };
+      }, wallClock: () => currentTime,
+      observe: (task, facts) => {
+      if (verifyIds.has(task.id)) {
+        if (facts.state === 'OPEN') openChecked[task.id] = { url: facts.url, at: facts.observedAt };
+        else delete openChecked[task.id];
+      }
       rememberTaskPr(h, task, facts);
       // Use current verified observations even if caching failed, but an unknown
       // response must not erase an earlier usable state or corresponding event.
@@ -2513,6 +2593,10 @@ function cmdFleetStatus(h, discover) {
       if (!old || facts.state) task.prFacts = old?.state === facts.state
         ? { ...facts, mergedAt: facts.mergedAt ?? old.mergedAt, closedAt: facts.closedAt ?? old.closedAt } : facts;
     } });
+    if (lastAttempt) {
+      try { fs.mkdirSync(path.dirname(cursorFile), { recursive: true }); writeJson(cursorFile, { after: lastAttempt, openChecked }, { retrySharing: false }); }
+      catch { /* Rotation is best effort, not task authority. */ }
+    }
     pending.forEach((t, i) => {
       // A returned copy or temporary discovery failure cannot hide a saved link.
       if (discovered[i].status === 'known' || results.get(t.id).status !== 'known') results.set(t.id, discovered[i]);

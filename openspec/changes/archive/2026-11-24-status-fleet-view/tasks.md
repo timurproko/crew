@@ -7,6 +7,8 @@
 - [x] 1.3 Extend existing land/finish PR-read field selections and save learned facts while preserving existing safety checks and merged-head proof; cover these paths with fake GitHub tests and offline rereads.
 - [x] 1.4 Update docs/status-pr-discovery.md to distinguish saved observations from authoritative links and explain unknown/stale facts and recorded-link short-circuiting; ensure examples match persistence fixtures.
 
+- [x] 1.5 Persist permission-proven NOT_FOUND from discovery and replacement land/finish reads without modifying URLs or merge authority; verify readable-repository and PR-connection proof, ambiguous failure cases, offline expiration and lifecycle fixtures.
+
 ## 2. Minimal fleet status bounds history by PR lifetime while preserving legacy output
 
 - [x] 2.1 Add explicit view parsing and an early fleet-only projection with exact versioned root/owner/task fields; cover missing/unknown views, JSON requirement, optional discovery and --all retention in CLI tests.
@@ -15,3 +17,4 @@
 - [x] 2.4 Preserve legacy text and JSON bytes and field order for status, --json, --all and discovery combinations; assert exact deterministic fixtures and no extra network calls, with observation fields absent from legacy output.
 - [x] 2.5 Document the fleet command, exact field/version contract, 24-hour event-time rule, unsupported-view fallback and performance/cache limits in README.md and docs/status-pr-discovery.md; cross-check all command examples against CLI fixtures.
 - [x] 2.6 Incorporate the latest published default branch, including PR #10 only if merged, and run node crew.test.mjs once on the final implementation; record suite results, measured bytes/timings and final-head required-check status in the implementation handoff.
+- [x] 2.7 Add the approved closed-task recorded-PR verification exception with at most five extra requests inside the existing shared budget and a ten-minute open refresh interval; verify cap, deadlines, rotation, live/legacy/offline exclusions and the three legacy missing URLs, and document the rule in README and specs.

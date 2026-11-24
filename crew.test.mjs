@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -132,6 +132,11 @@ function repairFixture(name, sharedOrigin) {
 const a = process.argv.slice(2), file = ${JSON.stringify(log)}, log = JSON.parse(fs.readFileSync(file, 'utf8'));
 log.push({ a, token: process.env.GH_TOKEN === 'fake-token', body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : null }); fs.writeFileSync(file, JSON.stringify(log));
 if (a[0] === 'auth') { console.log('fake-token'); process.exit(0); }
+if (a.includes('graphql')) {
+ const head = fs.existsSync(${JSON.stringify(merged)}) ? fs.readFileSync(${JSON.stringify(merged)}, 'utf8').trim() : '';
+ const number = a.find(x => x.startsWith('number=')).slice(7);
+ console.log(JSON.stringify({data:{repository:{nameWithOwner:'acme/crew',pullRequests:{totalCount:10},pullRequest:{url:'https://github.com/acme/crew/pull/'+number,state:head?'MERGED':'OPEN',headRefOid:head,mergedAt:head?'2026-01-01T00:00:00Z':null,closedAt:head?'2026-01-01T00:00:00Z':null}}}})); process.exit(0);
+}
 if (a[1] === 'list') { const head = fs.existsSync(${JSON.stringify(merged)}) ? fs.readFileSync(${JSON.stringify(merged)}, 'utf8').trim() : ''; console.log(JSON.stringify(head ? [{ headRefOid: head, state: 'MERGED', url: 'https://github.com/acme/crew/pull/' + log.filter(x => x.a[1] === 'create').length, mergedAt: '2026-01-01T00:00:00Z', closedAt: '2026-01-01T00:00:00Z' }] : [])); process.exit(0); }
 if (a[1] === 'create' && fs.existsSync(${JSON.stringify(down)})) { console.error('GitHub temporarily unavailable'); process.exit(1); }
 console.log('https://github.com/acme/crew/pull/' + log.filter(x => x.a[1] === 'create').length);
@@ -893,7 +898,11 @@ if (control.malformed) { console.log('not json'); process.exit(0); }
 if (control.oversized) { process.stdout.write('x'.repeat(1100000)); process.exit(0); }
 if (control.sleep) { setInterval(()=>{},1000); }
 else if (a[0] === 'repo') console.log(JSON.stringify(control.repository ?? {nameWithOwner:'acme/demo',url:'https://github.com/acme/demo'}));
-else if (a[0] === 'api') {
+else if (a[0] === 'api' && a.includes('graphql')) {
+ const owner = a.find(x=>x.startsWith('owner='))?.slice(6), name = a.find(x=>x.startsWith('name='))?.slice(5), number = a.find(x=>x.startsWith('number='))?.slice(7);
+ console.log(JSON.stringify(control.verification ?? {data:{repository:{nameWithOwner:owner+'/'+name,pullRequests:{totalCount:11},pullRequest:{url:'https://github.com/'+owner+'/'+name+'/pull/'+number,state:'OPEN',mergedAt:null,closedAt:null}}}}));
+ process.exit(control.verificationCode ?? 0);
+} else if (a[0] === 'api') {
  const branch = a.find(x=>x.startsWith('head='))?.slice('head=acme:'.length);
  console.log(JSON.stringify(control.response ?? [{number:12,html_url:'https://github.com/acme/demo/pull/12',draft:true,head:{ref:branch,repo:{full_name:'acme/demo'}},base:{repo:{full_name:'acme/demo'}}}]));
 } else process.exit(1);
@@ -936,6 +945,7 @@ gapTests['pr-facts'] = () => {
   assert.equal(prObservation({ state: 'MERGED', mergedAt: 'invalid' }, url).mergedAt, null);
   assert.equal(prObservation({ state: 'MERGED', mergedAt: '2026-02-30T00:00:00Z' }, url).mergedAt, null);
   assert.equal(prObservation({ state: 'invented', mergedAt: stamp }, url).state, null);
+  assert.equal(prObservation({ state: 'NOT_FOUND' }, url).state, null, 'raw state text is not authoritative absence proof');
   assert.equal(prObservation({ state: 'OPEN', mergedAt: stamp, closedAt: stamp }, url).closedAt, null);
   f.save({ ...f.task, state: 'closed', stage: 'implementation', updated: stamp, tells: 7 });
   rememberTaskPr(h, f.task, merged);
@@ -1061,20 +1071,56 @@ gapTests['pr-facts-commands'] = () => {
   const url = 'https://github.com/acme/demo/pull/12', stamp = '2026-01-01T00:00:00Z';
   fs.writeFileSync(t.report, `Implementation: ${url}\n`);
   f.save({ ...t, state: 'reported', workflow: 'delivery', stage: 'implementation', pr: url });
-  const gh = path.join(f.dir, 'gh.mjs'), log = path.join(f.dir, 'gh-log.json'); fs.writeFileSync(log, '[]');
+  const gh = path.join(f.dir, 'gh.mjs'), log = path.join(f.dir, 'gh-log.json'), missing = path.join(f.dir, 'missing-pr'); fs.writeFileSync(log, '[]');
   fs.writeFileSync(gh, `import fs from 'node:fs'; const a = process.argv.slice(2), log = ${JSON.stringify(log)};
 fs.writeFileSync(log, JSON.stringify([...JSON.parse(fs.readFileSync(log)), a]));
 const pr = {url:${JSON.stringify(url)},state:'MERGED',mergedAt:${JSON.stringify(stamp)},closedAt:${JSON.stringify(stamp)},headRefOid:${JSON.stringify(tip)},isDraft:true,body:''};
-if (a[1] === 'view') console.log(JSON.stringify(pr)); else if (a[1] === 'list') console.log(JSON.stringify([pr])); else process.exit(1);`);
+if (a.includes('graphql') && fs.existsSync(${JSON.stringify(missing)})) { console.log(JSON.stringify({data:{repository:{nameWithOwner:'acme/demo',pullRequests:{totalCount:1},pullRequest:null}},errors:[{type:'NOT_FOUND',path:['repository','pullRequest']}]})); process.exit(1); }
+if (a.includes('graphql')) console.log(JSON.stringify({data:{repository:{nameWithOwner:'acme/demo',pullRequests:{totalCount:1},pullRequest:pr}}})); else if (a[1] === 'list') console.log(JSON.stringify([pr])); else process.exit(1);`);
   let r = f.call(['land', t.id], { CREW_GH: gh }); assert.equal(r.code, 0, r.out);
   assert.equal(f.task(t.id).prFacts.state, 'MERGED'); assert.equal(f.task(t.id).prFacts.mergedAt, stamp);
   // Force the finish path to learn its own facts, not merely preserve land's cache.
   const { prFacts, ...uncached } = f.task(t.id); f.save(uncached);
+  // Finish performs no Git network reads; expose a supported origin for its
+  // exact-URL proof after land/push used the isolated local bare remote.
+  git('-C', f.repo, 'remote', 'set-url', 'origin', 'https://github.com/acme/demo.git');
   r = f.call(['finish', t.id, '--force'], { CREW_GH: gh }); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /merged branch .* deleted/); assert.equal(f.task(t.id).prFacts.mergedAt, stamp);
   assert.equal(f.task(t.id).state, 'closed'); assert.equal(f.task(t.id).pr, url);
   const calls = JSON.parse(fs.readFileSync(log)); assert.equal(calls.length, 2);
-  assert.deepEqual(calls.map(a => a.slice(0, 2)), [['pr', 'view'], ['pr', 'list']]);
+  assert.ok(calls.every(a => a[0] === 'api' && a.includes('graphql')), 'land/finish replace their existing reads, not add requests');
+  git('-C', f.repo, 'remote', 'set-url', 'origin', origin);
+  const t2 = f.spawn('missing', ['--kind', 'ship', '--agent', 'pi']);
+  commit(t2.worktree, { 'unmerged': 'keep\n' }, 'unmerged work');
+  git('-C', t2.worktree, 'push', '-q', 'origin', `HEAD:${t2.branch}`);
+  fs.writeFileSync(t2.report, `Implementation: ${url}\n`);
+  f.save({ ...t2, state: 'reported', workflow: 'delivery', stage: 'implementation', pr: url });
+  fs.writeFileSync(missing, 'missing');
+  r = f.call(['land', t2.id], { CREW_GH: gh }); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(t2.id).prFacts.state, 'NOT_FOUND'); assert.equal(f.task(t2.id).pr, url);
+  assert.ok(JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.some(t => t.id === t2.id), 'live tasks remain visible even with not-found facts');
+  git('-C', f.repo, 'remote', 'set-url', 'origin', 'https://github.com/acme/demo.git');
+  r = f.call(['finish', t2.id, '--force'], { CREW_GH: gh }); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(t2.id).state, 'closed'); assert.equal(f.task(t2.id).prFacts.state, 'NOT_FOUND');
+  assert.ok(git('-C', f.repo, 'branch', '--list', t2.branch).trim(), 'absence does not prove a branch was merged');
+  assert.ok(!JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.some(t => t.id === t2.id));
+  assert.equal(JSON.parse(fs.readFileSync(log)).length, 4, 'not-found proofs replace the two existing lifecycle reads');
+};
+
+gapTests['pr-facts-foreign-merge'] = () => {
+  const f = gapFixture('foreign-pr-merge'), task = f.spawn('ship', ['--kind', 'ship', '--agent', 'pi']);
+  const tip = commit(task.worktree, { 'keep': 'unmerged in this project\n' }, 'work');
+  git('-C', f.repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git');
+  f.save({ ...task, pr: 'https://github.com/other/foreign/pull/9' });
+  const fakeGh = path.join(f.dir, 'gh.mjs'), log = path.join(f.dir, 'calls.json'); fs.writeFileSync(log, '[]');
+  fs.writeFileSync(fakeGh, `import fs from 'node:fs'; const a = process.argv.slice(2), file = ${JSON.stringify(log)};
+fs.writeFileSync(file, JSON.stringify([...JSON.parse(fs.readFileSync(file)),a]));
+if (a.includes('graphql')) console.log(JSON.stringify({data:{repository:{nameWithOwner:'other/foreign',pullRequests:{totalCount:1},pullRequest:{url:'https://github.com/other/foreign/pull/9',state:'MERGED',headRefOid:${JSON.stringify(tip)},mergedAt:'2026-01-01T00:00:00Z',closedAt:'2026-01-01T00:00:00Z'}}}}));
+else if (a[0]==='pr' && a[1]==='list') console.log('[]'); else process.exit(1);`);
+  const r = f.call(['finish', task.id, '--force'], { CREW_GH: fakeGh }); assert.equal(r.code, 0, r.out);
+  assert.ok(git('-C', f.repo, 'branch', '--list', task.branch).trim(), 'a foreign merged PR with the same commit cannot authorize deleting this project branch');
+  const calls = JSON.parse(fs.readFileSync(log)); assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].slice(0,2), ['pr','list'], 'foreign/unsupported identities retain the existing project-context proof');
 };
 
 gapTests['pr-discovery'] = () => {
@@ -1276,6 +1322,86 @@ gapTests['pr-discovery-bounds'] = () => {
   assert.equal(JSON.parse(r.out).tasks[0].prDiscovery.reason, 'timeout');
   assert.ok(performance.now() - started < 8000, 'a hanging fake CLI is killed, not retried');
   assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 1);
+};
+
+gapTests['fleet-not-found'] = () => {
+  const f = prDiscoveryFixture('not-found'), args = ['status', '--json', '--view', 'fleet', '--discover-prs'];
+  fs.rmSync(path.join(f.home, 'tasks', 'draft'), { recursive: true });
+  const repository = { nameWithOwner: 'timurproko/crew', pullRequests: { totalCount: 11 }, pullRequest: null };
+  const missing = { data: { repository }, errors: [{ type: 'NOT_FOUND', path: ['repository', 'pullRequest'] }] };
+  const ids = ['crew-gaps-and-docs', 'wait-recovers-errors', 'layout-and-selfrepair'];
+  ids.forEach((id, i) => f.save({ ...f.task, id, state: 'closed', pr: `https://github.com/timurproko/crew/pull/${36 + i}`, worktree: 'returned' }));
+  f.save({ ...f.task, id: 'live', pr: 'https://github.com/timurproko/crew/pull/999' });
+  f.set({ verification: missing, verificationCode: 1 });
+  let r = f.call(args); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(JSON.parse(r.out).tasks.map(t => t.id), ['live']);
+  for (const [i, id] of ids.entries()) {
+    const record = JSON.parse(fs.readFileSync(path.join(f.home, 'tasks', id, 'task.json')));
+    assert.equal(record.prFacts.state, 'NOT_FOUND'); assert.equal(record.pr, `https://github.com/timurproko/crew/pull/${36 + i}`);
+    assert.equal(record.prFacts.mergedAt, null); assert.equal(record.prFacts.closedAt, null);
+  }
+  const calls = () => JSON.parse(fs.readFileSync(f.log));
+  assert.equal(calls().length, 3, 'one proof request per missing closed PR; never verify the live task');
+  for (const a of [args, args.filter(a => a !== '--discover-prs')]) {
+    r = f.call(a); assert.equal(r.code, 0, r.out); assert.deepEqual(JSON.parse(r.out).tasks.map(t => t.id), ['live']);
+  }
+  r = f.call(['status', '--all', '--json', '--discover-prs']); assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(r.out).tasks.length, 4, 'legacy all still exposes original recorded URLs');
+  assert.equal(calls().length, 3, 'terminal facts and legacy/offline status add no requests');
+  const url = 'https://github.com/timurproko/crew/pull/36';
+  f.save({ ...f.task, id: 'uncertain', state: 'closed', pr: url });
+  for (const payload of [{ message: 'Not Found' }, { data: { repository: null } },
+    { data: { repository: { ...repository, pullRequests: null } } },
+    { data: { repository }, errors: [{ type: 'FORBIDDEN', path: ['repository', 'pullRequest'] }] },
+    { data: { repository }, errors: [{ type: 'RATE_LIMITED', path: ['repository'] }] },
+    { data: { repository: { ...repository, nameWithOwner: 'other/repo' } } }]) {
+    assert.equal(verifiedPrRead(payload, url), null, 'ambiguous absence cannot supply a terminal fact');
+    f.set({ verification: payload, verificationCode: 1 });
+    r = f.call(args); assert.equal(r.code, 0, r.out);
+    assert.ok(JSON.parse(r.out).tasks.some(t => t.id === 'uncertain'));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'tasks', 'uncertain', 'task.json'))).prFacts, undefined);
+  }
+  for (const control of [{ fail: true }, { malformed: true }]) {
+    f.set(control); r = f.call(args); assert.equal(r.code, 0, r.out);
+    assert.ok(JSON.parse(r.out).tasks.some(t => t.id === 'uncertain'));
+  }
+  const opened = { data: { repository: { ...repository, pullRequest: { url, state: 'OPEN', mergedAt: null, closedAt: null } } } };
+  f.set({ verification: opened });
+  const script = path.join(f.dir, 'clock.mjs'), clock = Date.now();
+  fs.writeFileSync(script, `Date.now = () => Number(process.env.TEST_STATUS_TIME); const {main} = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
+  const at = time => crew(args, { cwd: f.home, script, env: { CREW_GH: f.fakeGh, TEST_STATUS_TIME: String(time) } });
+  const held = path.join(f.home, 'tasks', 'uncertain', 'task.json.lifecycle.lock'); fs.writeFileSync(held, 'lifecycle owns priority');
+  let before = calls().length; assert.equal(at(clock).code, 0); assert.equal(calls().length, before + 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'tasks', 'uncertain', 'task.json'))).prFacts, undefined, 'verification yields its fact save to lifecycle work');
+  fs.rmSync(held);
+  assert.equal(at(clock + 599999).code, 0); assert.equal(calls().length, before + 1, 'open facts suppress checks for ten minutes');
+  assert.equal(at(clock + 600000).code, 0); assert.equal(calls().length, before + 2);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'tasks', 'uncertain', 'task.json'))).prFacts.state, 'OPEN');
+  f.set({ fail: true });
+  assert.equal(at(clock + 1200000).code, 0); assert.equal(calls().length, before + 3);
+  assert.equal(at(clock + 1200001).code, 0); assert.equal(calls().length, before + 3, 'failed open refreshes also obey the ten-minute attempt interval');
+};
+
+gapTests['fleet-verification-bounds'] = () => {
+  const f = prDiscoveryFixture('verification-bounds');
+  fs.rmSync(path.join(f.home, 'tasks', 'draft'), { recursive: true });
+  for (let n = 1; n <= 7; n++) f.save({ ...f.task, id: `old-${n}`, state: 'closed', pr: `https://github.com/acme/demo/pull/${n}` });
+  f.set({ verification: { data: { repository: null } }, verificationCode: 1 });
+  const args = ['status', '--json', '--view', 'fleet', '--discover-prs'];
+  let r = f.call(args); assert.equal(r.code, 0, r.out); assert.equal(JSON.parse(r.out).tasks.length, 7);
+  let calls = JSON.parse(fs.readFileSync(f.log)); assert.equal(calls.length, 5);
+  r = f.call(args); assert.equal(r.code, 0, r.out); calls = JSON.parse(fs.readFileSync(f.log)); assert.equal(calls.length, 10);
+  assert.equal(new Set(calls.map(a => a.find(v => v.startsWith('number=')))).size, 7, 'failed verifications rotate rather than starving later rows');
+  assert.ok(calls.every(a => a.includes('graphql') && a.some(v => v.startsWith('query=') && v.includes('pullRequests(first:1){totalCount}'))), 'repository/PR-read proof shares the same request');
+  const recorded = Array.from({ length: 12 }, (_, i) => ({ ...f.task, state: 'closed', pr: `https://github.com/acme/demo/pull/${i + 1}` }));
+  let time = 0;
+  const runner = discoveryRunner(f, { before: () => { time += 2100; } });
+  discoverTaskPrs([f.task, ...recorded], f.projects, { ...runner, clock: () => time, verifyRecorded: () => true });
+  assert.equal(runner.calls.length, 5, 'existing discovery exhausts the one shared deadline; verification cannot extend it');
+  assert.equal(runner.calls.filter(c => c.args.includes('api')).length, 0);
+  const fast = discoveryRunner(f); discoverTaskPrs(recorded, f.projects, { ...fast, verifyRecorded: () => true });
+  assert.equal(fast.calls.length, 5, 'independent hard cap applies even when all requests return immediately');
+  discoverTaskPrs([{ ...recorded[0], state: 'working' }], f.projects, { verifyRecorded: () => true, execute: () => assert.fail('live recorded PRs never add verification requests') });
 };
 
 gapTests['fleet-view'] = () => {
@@ -2206,7 +2332,7 @@ log.push({ a, body: a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--b
 if (a[0] === 'auth') process.exit(1);
 if (fs.existsSync(${JSON.stringify(ghDown)})) { console.error('gh: not signed in'); process.exit(1); }
 if (a[0] === 'pr' && a[1] === 'list') { console.log(fs.existsSync(${JSON.stringify(ghMerged)}) ? fs.readFileSync(${JSON.stringify(ghMerged)}, 'utf8') : ''); process.exit(0); }
-if (a[0] === 'pr' && a[1] === 'view' && a.includes('isDraft,body,url,state,mergedAt,closedAt')) { console.log(JSON.stringify({ url: a[2], state: 'OPEN', mergedAt: null, closedAt: null, isDraft: true, body: '## Proposal\\n\\nWhy.\\n\\n## Implementation\\n\\n- [x] The first outcome is delivered.\\n- [ ] The second outcome is delivered.\\n\\n## Acceptance\\n\\n- [ ] not an outcome\\n' })); process.exit(0); }
+if (a[0] === 'api' && a.includes('graphql')) { const number = a.find(x => x.startsWith('number=')).slice(7); console.log(JSON.stringify({ data: { repository: { nameWithOwner: 'acme/demo', pullRequests: {totalCount:11}, pullRequest: { url: 'https://github.com/acme/demo/pull/'+number, state: 'OPEN', mergedAt: null, closedAt: null, isDraft: true, body: '## Proposal\\n\\nWhy.\\n\\n## Implementation\\n\\n- [x] The first outcome is delivered.\\n- [ ] The second outcome is delivered.\\n\\n## Acceptance\\n\\n- [ ] not an outcome\\n' } } } })); process.exit(0); }
 console.log('https://example.invalid/acme/demo/pull/7');
 `);
   const own = (args, terminal = 'c2') => crew(args, { terminal, env: { CREW_GH: fakeGh } });
@@ -2457,7 +2583,8 @@ if (a[0] === 'start') {
   const ghBefore = ghCalls().length;
   r = dl(['land', 'w1']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /delivered w1: https:\/\/github\.com\/acme\/demo\/pull\/11 \(draft, 1 of 2 outcomes ticked\)\. It follows the repository's delivery workflow/);
-  assert.deepEqual(ghCalls().slice(ghBefore), [['pr', 'view', 'https://github.com/acme/demo/pull/11', '--json', 'isDraft,body,url,state,mergedAt,closedAt']], 'Only read, never opened');
+  assert.equal(ghCalls().slice(ghBefore).length, 1, 'One read, never an extra request');
+  assert.ok(ghCalls().at(-1).includes('graphql')); assert.ok(ghCalls().at(-1).includes('number=11'));
   assert.ok(taskOf('w1').landed); assert.equal(taskOf('w1').prFacts.state, 'OPEN');
   assert.match(dl(['land', 'w1']).out, /already has a pull request: https:\/\/github\.com\/acme\/demo\/pull\/11/);
   // No link on the first line: the pull request GitHub has for the branch, never another one

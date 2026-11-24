@@ -386,9 +386,9 @@ adds top-level `prDiscovery.version` and per-task `prDiscovery` with `status` (`
 `none`, `unavailable`), `url`, `source` and `reason`. `tasks[].pr` remains the stored
 value: discovery never sets that authoritative link, changes stages, or lands tasks and
 is available to non-owners. It saves verified URL/state/mergedAt/closedAt observations
-separately as task `prFacts`; existing land/finish PR reads save those facts too. No extra
-status requests are made. Recorded PR links still skip network reads, so unknown or stale
-facts stay conservative until an existing read learns more. Lookups verify the task's exact copy, recorded branch and project origin;
+separately as task `prFacts`; existing land/finish PR reads save those facts too. Legacy
+status discovery still skips recorded links. Fleet discovery has the narrowly bounded
+closed-PR verification exception below; unreachable or unproven state stays conservative. Lookups verify the task's exact copy, recorded branch and project origin;
 unsupported remotes and failures are unavailable, not confirmed absence. Added reads run
 serially with two-second subprocess limits and a ten-second shared budget; remaining
 tasks can be unavailable. See [the JSON contract and limits](docs/status-pr-discovery.md).
@@ -414,14 +414,26 @@ For a polling fleet reader use `crew status --json --view fleet`, optionally wit
 Every non-closed task is included. A closed task is included only with a recorded or
 verified discovered PR. Open and unknown-state PRs stay visible however old the task is;
 known merged/closed PRs disappear only **more than 24 hours after GitHub's mergedAt or
-closedAt**, not after task completion. Missing/invalid event times stay included. Closed
-scouts/reviews without PRs are omitted. `--all` does not override fleet retention; omit
+closedAt**, not after task completion. A proven `NOT_FOUND` PR is excluded immediately,
+without a 24-hour window; the recorded URL is never rewritten or deleted. A generic 404,
+authentication, permission, network or rate-limit failure is not proof and stays included.
+Missing/invalid merge/close event times stay included. Closed scouts/reviews without PRs are omitted. `--all` does not override fleet retention; omit
 `--view` to get the unchanged legacy full history and fields.
 
 Without `--discover-prs`, only saved facts are used: recorded/saved discovered URLs are
 known, unlinked non-ships are none, and unobserved ships are unavailable/not-requested.
 With discovery, existing exact lookup and network budgets apply; saved links survive
-returned copies or failed refreshes. `tasks[].pr` always remains the authoritative stored
+returned copies or failed refreshes. Only `--view fleet --discover-prs` may additionally
+verify a **closed** task's recorded PR when facts are unknown, or refresh known-open facts
+no more than once per **10 minutes** per task. There are at most **five additional GitHub
+requests per poll**, each at most two seconds, inside (never added to) the existing serial
+ten-second discovery budget. Existing unrecorded-PR discovery runs first; unverified tasks
+wait for later polls, with best-effort rotation so failed checks do not starve other rows.
+One GraphQL request proves repository identity and PR-read access and reads the exact PR
+number. Only a missing PR with both proofs becomes durable `NOT_FOUND`; ambiguous failures
+remain unknown. Live tasks get no new verification requests. Offline fleet and all legacy
+status request behavior stay unchanged. Successful facts persist; terminal facts do not
+get re-verified. Existing land/finish reads can learn the same facts without extra reads. `tasks[].pr` always remains the authoritative stored
 value. The minimal view never reads briefs/reports, queries each worker, or inspects
 copy-return safety. A rebuildable summary index checks task file identity/size/timestamps
 on each poll and reloads changed states; a missing/corrupt index is rebuilt from state

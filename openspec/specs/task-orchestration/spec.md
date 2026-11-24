@@ -165,7 +165,7 @@ For an unrecorded ship PR, Crew SHALL verify the task's recorded worktree, branc
 
 #### Scenario: Task already has a PR
 
-- **WHEN** a task has a valid recorded GitHub PR URL
+- **WHEN** a task has a valid recorded GitHub PR URL outside eligible fleet closed-PR verification
 - **THEN** discovery returns its canonical URL as known with source recorded and makes no remote request for that task
 
 ### Requirement: Discovery is bounded and read-only for every caller
@@ -323,7 +323,7 @@ Crew SHALL offer `status --json --view fleet` with exactly home, owner, tasks, p
 
 ### Requirement: Fleet history follows PR lifetime rather than task age
 
-Fleet status SHALL include every task not in state closed. A closed task SHALL be included only with a recorded or safely discovered PR, and SHALL be excluded only if that PR is known merged or closed more than 24 hours ago using GitHub's corresponding mergedAt or closedAt. Open PRs and unknown states or event times SHALL remain visible regardless of task age. Adding --all SHALL NOT bypass fleet retention.
+Fleet status SHALL include every non-closed task. Closed tasks SHALL require a recorded or verified discovered PR and SHALL expire only when it is authoritatively NOT_FOUND, or known merged/closed more than 24 hours after GitHub's mergedAt/closedAt. Open PRs and unknown states or event times SHALL remain visible regardless of task age. Adding --all SHALL NOT bypass retention.
 
 #### Scenario: Old open pull request stays visible
 
@@ -357,7 +357,7 @@ Fleet status SHALL include every task not in state closed. A closed task SHALL b
 
 ### Requirement: PR lifecycle facts are durable and identity scoped
 
-Crew SHALL save verified PR URL, state, mergedAt and closedAt learned by discovery or existing land/finish PR reads in task state separately from authoritative pr and stage. Facts SHALL apply only to their verified PR identity. Missing or failed reads SHALL NOT manufacture closure or discard usable facts. Status SHALL add no network requests beyond the existing opt-in discovery reads and SHALL remain read-only toward GitHub.
+Crew SHALL save verified PR URL, state, mergedAt and closedAt learned by discovery or existing land/finish PR reads in task state separately from authoritative pr and stage. Facts SHALL apply only to their verified PR identity. Missing or failed reads SHALL NOT manufacture closure or discard usable facts. Only bounded fleet closed-PR verification SHALL add status requests beyond existing discovery. GitHub access SHALL remain read-only.
 
 #### Scenario: Discovery records lifecycle without landing
 
@@ -378,6 +378,44 @@ Crew SHALL save verified PR URL, state, mergedAt and closedAt learned by discove
 
 - **WHEN** a discovery observation is saved while task lifecycle state changes
 - **THEN** saving the observation preserves the newer task state, recorded PR, report stage and unrelated fields
+
+### Requirement: Fleet recorded-PR verification is bounded
+
+Only fleet status with --discover-prs SHALL verify closed-task recorded PRs whose facts are unknown, or known-open facts at least ten minutes old. It SHALL add at most five single GitHub requests per poll, within the existing serial two-second subprocess and ten-second shared budget. Existing discovery SHALL run first. Live tasks, offline fleet and legacy status SHALL add no verification requests. Successful facts SHALL persist.
+
+#### Scenario: A poll cannot expand the budget
+
+- **WHEN** eligible recorded links exceed the cap or existing discovery exhausts the shared deadline
+- **THEN** at most five added requests start within the remaining budget and unverified tasks wait for a later poll
+
+#### Scenario: Open facts refresh slowly
+
+- **WHEN** a closed task has successful open facts less than ten minutes old
+- **THEN** fleet discovery makes no verification request for it until the interval elapses
+
+#### Scenario: Failed reads do not starve later rows
+
+- **WHEN** several closed PRs cannot be verified across consecutive polls
+- **THEN** best-effort rotation gives later eligible tasks a chance without turning failures into terminal facts
+
+### Requirement: Missing PR facts require authoritative proof
+
+Crew SHALL persist NOT_FOUND only when one response from the same credentials proves repository identity and PR-read access while the exact PR number is absent. Generic 404, permission, authentication, network and rate-limit failures SHALL remain unknown. Proven absence learned by discovery or an existing land/finish read SHALL immediately exclude closed tasks, including offline reads, without rewriting recorded URLs. Absence SHALL NOT prove a branch merged.
+
+#### Scenario: A recorded legacy URL does not exist
+
+- **WHEN** the repository and its PR connection are readable but the exact recorded PR is authoritatively absent
+- **THEN** Crew saves NOT_FOUND and excludes the closed task immediately, without a 24-hour window or changing its URL
+
+#### Scenario: Absence is ambiguous
+
+- **WHEN** repository or PR-read access is unproven, or the read fails with permission, authentication, transport or rate-limit errors
+- **THEN** the closed task remains included and no terminal fact is manufactured
+
+#### Scenario: A lifecycle read learns absence
+
+- **WHEN** an existing land or finish exact-PR read supplies the same authoritative absence proof
+- **THEN** Crew saves NOT_FOUND without an extra request, preserves its recorded URL and retains any branch not proved merged
 
 ### Requirement: Fleet status scales without reading historical prose
 

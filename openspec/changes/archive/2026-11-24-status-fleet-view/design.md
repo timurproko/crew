@@ -6,13 +6,13 @@ See proposal.md for motivation. `allTasks` already reads only tasks/<id>/task.js
 
 `discoverTaskPrs` currently returns an output-only overlay. Valid recorded PR URLs short-circuit all network reads. Unrecorded ships use exact copy/branch/repository verification and an existing pulls API response that already includes state and merge/close timestamps. `pullRequestState` at workflow land currently reads isDraft/body; finish's merged-branch proof currently requests only headRefOid. Existing lifecycle tests assert every local byte remains unchanged by discovery: these assertions must narrow deliberately to permit saved facts while preserving authority.
 
-The task-orchestration spec therefore needs a targeted modification to its discovery no-local-writes requirement, not a silent exception. Recorded-link precedence and zero-network behavior stay intact. PR #10 is still open during planning and touches the same source file.
+The task-orchestration spec therefore needs a targeted modification to its discovery no-local-writes requirement, not a silent exception. Recorded-link precedence and legacy zero-network behavior stay intact; the approved closed-PR fleet exception is described in decision 6. PR #10 is still open during planning and touches the same source file.
 
 ## Goals / Non-Goals
 
 **Goals:** Separate fleet selection/projection from full status, persist identity-scoped observations safely, and make cost depend on state-file traversal plus relevant rows rather than prose or copy inspection.
 
-**Non-Goals:** Herdr adapter changes, task deletion, arbitrary row limits, GitHub writes, label changes, new network polling, periodic cleanup, task-age expiration, or weakening finish's merged-branch proof.
+**Non-Goals:** Herdr adapter changes, task deletion, arbitrary row limits, GitHub writes, label changes, unbounded network polling or added verification of live tasks, periodic cleanup, task-age expiration, or weakening finish's merged-branch proof.
 
 ## Decisions
 
@@ -28,17 +28,17 @@ Alternative rejected: reusing full status then deleting keys still pays for Core
 
 ### 2. Save observations separately from delivery authority
 
-Use a small versioned observation record in saved task state with canonical URL, normalized OPEN/MERGED/CLOSED or unknown state, mergedAt, closedAt and observation time. Never infer merge/close event times from task dates or observation time. An invalid or absent state/time stays unknown. Match the observation URL against current authoritative task.pr when present; do not apply another PR's terminal facts. A later verified OPEN observation clears obsolete terminal timestamps for that identity.
+Use a small versioned observation record in saved task state with canonical URL, normalized OPEN/MERGED/CLOSED/NOT_FOUND or unknown state, mergedAt, closedAt and observation time. Never infer merge/close event times from task dates or observation time. An invalid or absent state/time stays unknown. Match the observation URL against current authoritative task.pr when present; do not apply another PR's terminal facts. A later verified OPEN observation clears obsolete terminal timestamps for that identity.
 
 Capture facts as a separate result/callback channel from the pure discovery helper; keep its public overlay shape unchanged. Persist only verified observations. Existing remote pulls responses supply lifecycle values without another request. Expand existing land/finish JSON selections to capture state and timestamps, retaining their original return strings and exact head-commit proof. If a command obtains no PR state, it saves none rather than making an extra status call.
 
 Observation writes must use a narrow atomic update of current saved state, serialized with task writes as needed, not a stale task snapshot. Preserve newer lifecycle fields and unrelated keys; do not change updated merely for a repeated identical observation, since that timestamp is used by failed-task elapsed output. Cache write failures are best effort and must not make valid status fail or produce non-JSON stdout.
 
-Alternatives rejected: storing the discovered URL in task.pr would grant premature delivery authority; writing GitHub on status violates the contract; separate refresh requests would expand the existing network budget.
+Alternatives rejected: storing the discovered URL in task.pr would grant premature delivery authority; writing GitHub on status violates the contract; unbounded refresh requests would expand the existing network budget.
 
 ### 3. Retention is conservative and based on PR events
 
-Use one injected wall-clock instant per status invocation. Always retain state != closed, even if the PR is old/terminal. For closed tasks, a recorded or verified saved/current discovered link is required. Keep OPEN or unknown state indefinitely. For MERGED use mergedAt; for CLOSED use closedAt. Omit only if the relevant valid event is strictly more than 24 hours before now. Exactly 24 hours, missing/invalid/future event times, cache misses and discovery failures do not justify expiration.
+Use one injected wall-clock instant per status invocation. Always retain state != closed, even if the PR is old/terminal. For closed tasks, a recorded or verified saved/current discovered link is required. Keep OPEN or unknown state indefinitely. For MERGED use mergedAt; for CLOSED use closedAt. Omit immediately for authoritative NOT_FOUND; otherwise omit only if the relevant valid event is strictly more than 24 hours before now. Exactly 24 hours, missing/invalid/future event times, cache misses and discovery failures do not justify expiration.
 
 Filter facts already known expired before any discovery work. Closed tasks lacking saved links may still get an existing exact discovery attempt when requested, within its unchanged budget; only actual known links justify including those rows. Saved observations allow offline selection after copy return. Keep creation-order output for deterministic compatibility where applicable.
 
@@ -56,9 +56,15 @@ Use deterministic fake clocks and existing fake Core/GitHub fixtures. Assert exa
 
 Require a 1,000-closed-task fixture with a fixed small visible fleet to stay under 16,384 bytes. Compare legacy text and JSON bytes against stable fixtures for default and --all, including --discover-prs; lifecycle facts must remain internal. Assert subprocess counts/budgets do not grow and no GitHub mutation occurs. Run the whole main suite once on the final implementation, not during this plan-only phase.
 
+### 6. Approved amendment: authoritative absence and bounded recorded-PR verification
+
+The coordinator explicitly approved a narrow exception to the original no-extra-requests rule for old closed tasks whose recorded PR numbers no longer exist. Fleet with discovery may add at most five single GraphQL requests per poll, within the same serial two-second subprocess / ten-second total budget; existing unrecorded discovery runs first. Unknown facts are eligible, and known-open facts refresh no more than once per ten minutes. Live tasks, offline fleet and legacy status do not add verification reads. A best-effort per-home cursor rotates attempts across failures and persists open-check cooldowns even when a task-fact save yields to lifecycle work.
+
+One query returns canonical repository identity, its PR connection count and the exact PR number. Only a readable matching repository and PR connection, with an absent target and no errors except NOT_FOUND on that precise field, prove absence. Generic 404 or authentication/permission/rate-limit/network failures stay unknown. Save the terminal state NOT_FOUND, exclude only closed tasks immediately, and never alter recorded URLs. Existing land/finish exact-PR reads use the same proof query as a replacement, not an additional read. Finish requires the supported project origin to match the recorded URL's repository before using its PR as merge proof; unsupported or foreign origins retain the previous project-context branch lookup. Neither absence nor a foreign merged PR can authorize branch deletion. Parser, CLI, permission, budget, request-cap, ten-minute refresh and offline persistence fixtures cover this amendment.
+
 ## Risks / Trade-offs
 
-- [Cached facts can remain unknown or stale] → Keep unknown/open entries; no extra status refresh calls. Recorded links still short-circuit discovery, so historical PRs without learned closure may remain visible until an existing lifecycle read learns it. This is intentionally conservative, not a claim of a fixed absolute row bound.
+- [Cached facts can remain unknown or stale] → Keep unknown/open entries; only bounded closed-PR fleet verification is added. A budget-exhausted or unproven read retains the row. Open facts refresh at most every ten minutes; terminal facts are not re-verified. This remains conservative, not a claim of a fixed absolute row bound.
 - [Observation writes race done/finish] → Atomic narrow updates coordinated with task writers; test interleavings and preserve authoritative lifecycle data.
 - [Windows filesystem cost exceeds budget] → Measure thousands of state files and introduce a derived summary index only if needed; never fall back to prose scans.
 - [Network discovery can take up to its existing ten seconds] → The sub-second target covers local fleet projection, not GitHub latency; retain existing two-second subprocess and ten-second shared limits.
