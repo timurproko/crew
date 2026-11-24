@@ -1,0 +1,1 @@
+{"data":{"repository":{"nameWithOwner":"timurproko/crew","pullRequests":{"totalCount":11},"pullRequest":null}},"errors":[{"type":"NOT_FOUND","path":["repository","pullRequest"],"locations":[{"line":1,"column":134}],"message":"Could not resolve to a PullRequest with the number of 36."}]}

@@ -290,7 +290,9 @@ const prTime = value => {
   const time = Date.parse(value);
   return Number.isFinite(time) && new Date(time).toISOString().slice(0, 19) === value.slice(0, 19) ? value : null;
 };
-export function prObservation(pr, url = pr?.url ?? pr?.html_url, observedAt = now()) {
+// REST url is the API address; html_url is the browser URL. GraphQL/CLI url
+// is already a browser URL, so it is only the fallback when html_url is absent.
+export function prObservation(pr, url = pr?.html_url ?? pr?.url, observedAt = now()) {
   url = canonicalPrUrl(url);
   if (!url) return null;
   const mergedAt = prTime(pr?.mergedAt ?? pr?.merged_at), closedAt = prTime(pr?.closedAt ?? pr?.closed_at);
@@ -2032,6 +2034,9 @@ function reviewLabels(h, id, action = 'start') {
     };
     const pr = JSON.parse(api('GET', `${repo}/pulls/${m[4]}`, [], null, 2000));
     if (!['open', 'closed'].includes(pr?.state)) throw new Error('PR state unreadable');
+    if (check && pr.number === Number(m[4]) && canonicalPrUrl(pr.html_url)?.toLowerCase() === canonicalPrUrl(url)?.toLowerCase()) {
+      rememberTaskPr(h, task, prObservation(pr, pr.html_url));
+    }
     const open = pr.state === 'open' && !pr.merged_at;
     const currentHead = typeof pr.head?.sha === 'string' && /^[a-f0-9]{40,64}$/.test(pr.head.sha) ? pr.head.sha : null;
     let recorded;
@@ -2482,7 +2487,7 @@ export function discoverTaskPrs(tasks, projects, { execute = run, clock = () => 
           || typeof pr.base?.repo?.full_name !== 'string' || pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase()) fail('invalid-response');
       }
       if (prs.length !== 1) fail('ambiguous-pr');
-      observe(task, prObservation(prs[0]));
+      observe(task, prObservation(prs[0], canonicalPrUrl(prs[0].html_url)));
       return prResult('known', canonicalPrUrl(prs[0].html_url), 'github');
     } catch (error) {
       // Only our stable reason codes escape; filesystem/runner errors reveal no paths,
@@ -2582,6 +2587,7 @@ function cmdFleetStatus(h, discover) {
         if (savedPrFacts(t)?.state === 'OPEN') openChecked[t.id] = { url: canonicalPrUrl(t.pr), at: new Date(Date.now()).toISOString() };
       },
       observe: (task, facts) => {
+      if (!facts) return;
       if (verifyIds.has(task.id)) {
         if (facts.state === 'OPEN') openChecked[task.id] = { url: facts.url, at: facts.observedAt };
         else delete openChecked[task.id];

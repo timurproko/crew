@@ -12,6 +12,16 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
 const slash = p => p.replace(/\\/g, '/');
 const WINDOWS = process.platform === 'win32';
+const githubFixture = name => JSON.parse(fs.readFileSync(path.join(here, 'docs', 'fixtures', 'github', name), 'utf8'));
+// Keep the ENTIRE recorded wire shape. Only identity/time values are adapted for
+// isolated repositories; notably REST url (API) and html_url (web) both remain.
+function recordedRestPr(number = 12, branch = 'feature/draft', source = 'pull-list-open.json') {
+  const captured = githubFixture(source), original = Array.isArray(captured) ? captured[0] : captured;
+  const text = JSON.stringify(original).replaceAll('timurproko/crew', 'acme/demo')
+    .replace(new RegExp(`/(pulls?)/${original.number}(?![0-9])`, 'g'), `/$1/${number}`);
+  const pr = JSON.parse(text); pr.number = number; pr.head.ref = branch;
+  return pr;
+}
 
 // Pure helpers.
 assert.ok(validId('readme-lines') && validId('a1') && !validId('Bad') && !validId('-x') && !validId('a'.repeat(41)) && !validId('../x'));
@@ -893,26 +903,28 @@ function prDiscoveryFixture(name) {
   fs.writeFileSync(fakeGh, `import fs from 'node:fs';
 const a = process.argv.slice(2), log = ${JSON.stringify(log)}, control = JSON.parse(fs.readFileSync(${JSON.stringify(control)}, 'utf8'));
 fs.writeFileSync(log, JSON.stringify([...JSON.parse(fs.readFileSync(log, 'utf8')), a]));
-if (control.fail) { console.error('private authentication error'); process.exit(1); }
+if (control.fail) { console.log(${JSON.stringify(JSON.stringify(githubFixture('rest-permission.json')))}); console.error(${JSON.stringify(githubFixture('rest-permission.json.meta').stderr)}); process.exit(1); }
 if (control.malformed) { console.log('not json'); process.exit(0); }
 if (control.oversized) { process.stdout.write('x'.repeat(1100000)); process.exit(0); }
 if (control.sleep) { setInterval(()=>{},1000); }
 else if (a[0] === 'repo') console.log(JSON.stringify(control.repository ?? {nameWithOwner:'acme/demo',url:'https://github.com/acme/demo'}));
 else if (a[0] === 'api' && a.includes('graphql')) {
  const owner = a.find(x=>x.startsWith('owner='))?.slice(6), name = a.find(x=>x.startsWith('name='))?.slice(5), number = a.find(x=>x.startsWith('number='))?.slice(7);
- console.log(JSON.stringify(control.verification ?? {data:{repository:{nameWithOwner:owner+'/'+name,pullRequests:{totalCount:11},pullRequest:{url:'https://github.com/'+owner+'/'+name+'/pull/'+number,state:'OPEN',mergedAt:null,closedAt:null}}}}));
+ const proof = ${JSON.stringify(githubFixture('graphql-open.json'))};
+ proof.data.repository.nameWithOwner = owner+'/'+name; proof.data.repository.pullRequest.url = 'https://github.com/'+owner+'/'+name+'/pull/'+number;
+ console.log(JSON.stringify(control.verification ?? proof));
  process.exit(control.verificationCode ?? 0);
 } else if (a[0] === 'api') {
  const branch = a.find(x=>x.startsWith('head='))?.slice('head=acme:'.length);
- console.log(JSON.stringify(control.response ?? [{number:12,html_url:'https://github.com/acme/demo/pull/12',draft:true,head:{ref:branch,repo:{full_name:'acme/demo'}},base:{repo:{full_name:'acme/demo'}}}]));
+ const recorded = ${JSON.stringify(recordedRestPr())};
+ console.log(JSON.stringify(control.response ?? [{...recorded,head:{...recorded.head,ref:branch}}]));
 } else process.exit(1);
 `);
   const call = (args, terminal) => crew(args, { cwd: home, terminal, env: { CREW_GH: fakeGh } });
   return { dir, repo, copy, home, task, save, call, log, control, fakeGh,
     projects: { demo: { path: repo } }, set: value => fs.writeFileSync(control, JSON.stringify(value)) };
 }
-const discoveryPr = (branch = 'feature/draft', number = 12) => ({ number, html_url: `https://github.com/acme/demo/pull/${number}`, draft: true,
-  head: { ref: branch, repo: { full_name: 'acme/demo' } }, base: { repo: { full_name: 'acme/demo' } } });
+const discoveryPr = (branch = 'feature/draft', number = 12) => recordedRestPr(number, branch);
 
 // Unit runner: real fixture paths, no processes; records every limit, repo and branch.
 function discoveryRunner(f, { origin = 'https://github.com/acme/demo.git', prs = [discoveryPr()], repo = {nameWithOwner:'acme/demo',url:'https://github.com/acme/demo'}, before = () => {} } = {}) {
@@ -1123,6 +1135,52 @@ else if (a[0]==='pr' && a[1]==='list') console.log('[]'); else process.exit(1);`
   assert.deepEqual(calls[0].slice(0,2), ['pr','list'], 'foreign/unsupported identities retain the existing project-context proof');
 };
 
+gapTests['recorded-rest-discovery'] = () => {
+  const f = prDiscoveryFixture('recorded-rest'), wire = discoveryPr();
+  const captured = githubFixture('pull-list-open.json')[0];
+  assert.deepEqual(Object.keys(wire).sort(), Object.keys(captured).sort(), 'all recorded list fields are retained');
+  assert.deepEqual(Object.keys(wire.head.repo).sort(), Object.keys(captured.head.repo).sort());
+  assert.ok(wire._links && wire.head.repo.owner);
+  assert.equal(wire.url, 'https://api.github.com/repos/acme/demo/pulls/12');
+  assert.equal(wire.html_url, 'https://github.com/acme/demo/pull/12');
+  assert.equal(prObservation(wire).url, wire.html_url, 'REST API url must not shadow the web URL');
+  const observations = [];
+  const runner = discoveryRunner(f, { prs: [wire] });
+  const found = discoverTaskPrs([f.task], f.projects, { ...runner, observe: (task, facts) => observations.push(facts) });
+  assert.deepEqual(found, [{ status: 'known', url: wire.html_url, source: 'github', reason: null }]);
+  assert.equal(observations[0]?.url, wire.html_url); assert.equal(observations[0]?.state, 'OPEN');
+  f.set({ response: [wire] });
+  const record = () => JSON.parse(fs.readFileSync(path.join(f.home, 'tasks', 'draft', 'task.json')));
+  for (const state of ['working', 'closed']) {
+    f.save({ ...f.task, state });
+    let r = f.call(['status', '--json', '--view', 'fleet', '--discover-prs']); assert.equal(r.code, 0, r.out);
+    const task = JSON.parse(r.out).tasks.find(t => t.id === 'draft');
+    assert.equal(task?.prDiscovery.status, 'known', `real REST shape must discover the ${state} unrecorded PR`);
+    assert.equal(task.prDiscovery.url, wire.html_url); assert.equal(record().prFacts.state, 'OPEN');
+    assert.equal(record().pr, undefined, 'discovery does not land the task');
+  }
+  f.save(f.task);
+  let r = f.call(['status', '--json', '--discover-prs']); assert.equal(r.code, 0, r.out);
+  assert.equal(record().prFacts.url, wire.html_url, 'legacy discovery also saves real REST observations');
+  const merged = recordedRestPr(12, 'feature/draft', 'pull-get-merged.json');
+  merged.merged_at = merged.closed_at = new Date(Date.now() - 25 * 3600000).toISOString();
+  f.save({ ...f.task, state: 'closed' }); f.set({ response: [merged] });
+  r = f.call(['status', '--json', '--view', 'fleet', '--discover-prs']); assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(r.out).tasks.length, 0); assert.equal(record().prFacts.state, 'MERGED');
+  assert.equal(record().prFacts.mergedAt, merged.merged_at);
+  // Search envelopes and actual REST failures are not PR-list responses and may
+  // never turn into a fake success, terminal fact or confirmed absence.
+  const search = discoveryRunner(f, { prs: githubFixture('pull-search.json') });
+  assert.equal(discoverTaskPrs([f.task], f.projects, search)[0].reason, 'invalid-response');
+  for (const name of ['rest-not-found.json', 'rest-permission.json', 'rest-authentication.json']) {
+    const base = discoveryRunner(f), seen = [];
+    const result = discoverTaskPrs([f.task], f.projects, { execute: (command, args, options) => args.includes('api')
+      ? { code: 1, stdout: JSON.stringify(githubFixture(name)), stderr: githubFixture(`${name}.meta`).stderr }
+      : base.execute(command, args, options), observe: (task, facts) => seen.push(facts) });
+    assert.equal(result[0].status, 'unavailable'); assert.equal(seen.length, 0);
+  }
+};
+
 gapTests['pr-discovery'] = () => {
   const f = prDiscoveryFixture('contract'), discover = (tasks, options) => discoverTaskPrs(tasks, f.projects, options);
   const known = { status: 'known', url: 'https://github.com/acme/demo/pull/12', source: 'github', reason: null };
@@ -1328,7 +1386,7 @@ gapTests['fleet-not-found'] = () => {
   const f = prDiscoveryFixture('not-found'), args = ['status', '--json', '--view', 'fleet', '--discover-prs'];
   fs.rmSync(path.join(f.home, 'tasks', 'draft'), { recursive: true });
   const repository = { nameWithOwner: 'timurproko/crew', pullRequests: { totalCount: 11 }, pullRequest: null };
-  const missing = { data: { repository }, errors: [{ type: 'NOT_FOUND', path: ['repository', 'pullRequest'] }] };
+  const missing = githubFixture('graphql-not-found.json');
   const ids = ['crew-gaps-and-docs', 'wait-recovers-errors', 'layout-and-selfrepair'];
   ids.forEach((id, i) => f.save({ ...f.task, id, state: 'closed', pr: `https://github.com/timurproko/crew/pull/${36 + i}`, worktree: 'returned' }));
   f.save({ ...f.task, id: 'live', pr: 'https://github.com/timurproko/crew/pull/999' });
@@ -1350,7 +1408,7 @@ gapTests['fleet-not-found'] = () => {
   assert.equal(calls().length, 3, 'terminal facts and legacy/offline status add no requests');
   const url = 'https://github.com/timurproko/crew/pull/36';
   f.save({ ...f.task, id: 'uncertain', state: 'closed', pr: url });
-  for (const payload of [{ message: 'Not Found' }, { data: { repository: null } },
+  for (const payload of [githubFixture('rest-not-found.json'), githubFixture('rest-permission.json'), githubFixture('rest-authentication.json'), githubFixture('graphql-unreadable.json'),
     { data: { repository: { ...repository, pullRequests: null } } },
     { data: { repository }, errors: [{ type: 'FORBIDDEN', path: ['repository', 'pullRequest'] }] },
     { data: { repository }, errors: [{ type: 'RATE_LIMITED', path: ['repository'] }] },
@@ -1365,7 +1423,7 @@ gapTests['fleet-not-found'] = () => {
     f.set(control); r = f.call(args); assert.equal(r.code, 0, r.out);
     assert.ok(JSON.parse(r.out).tasks.some(t => t.id === 'uncertain'));
   }
-  const opened = { data: { repository: { ...repository, pullRequest: { url, state: 'OPEN', mergedAt: null, closedAt: null } } } };
+  const opened = githubFixture('graphql-open.json'); opened.data.repository.pullRequest.url = url;
   f.set({ verification: opened });
   const script = path.join(f.dir, 'clock.mjs'), clock = Date.now();
   fs.writeFileSync(script, `import cp from 'node:child_process'; import {syncBuiltinESMExports} from 'node:module';
@@ -1592,7 +1650,8 @@ else if(endpoint.endsWith('/contents/labels/base.json')) {
 else if(method==='GET' && endpoint.includes('/pulls/')) {
   if(s.prDenied) fail('PR state unavailable');
   if(s.prDelay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,s.prDelay);
-  console.log(JSON.stringify(s.prResponse ?? {state:s.prState ?? 'open',merged_at:s.mergedAt ?? null,head:{sha:s.head}}));
+  const recorded = ${JSON.stringify(recordedRestPr(42, 'feature/ship', 'pull-get-open.json'))};
+  console.log(JSON.stringify(s.prResponse ?? {...recorded,state:s.prState ?? 'open',merged_at:s.mergedAt ?? null,head:{...recorded.head,sha:s.head}}));
 }
 else if(method==='GET' && endpoint.includes('/issues/')) console.log(JSON.stringify([s.labels.map(name=>({name}))]));
 else if(method==='GET') { const name=decodeURIComponent(endpoint.split('/').at(-1)); if(!s.defined.includes(name)) fail('shared label not defined'); console.log(JSON.stringify({name})); }
@@ -1848,9 +1907,33 @@ gapTests['review-label-plain-land-head'] = () => {
   assert.equal(f.task('ship').reviewVerdict.stale, true);
   assert.equal(f.task('ship').reviewVerdict.currentHead, moved);
   assert.equal(f.task('ship').pr, 'https://github.com/acme/demo/pull/42');
+  assert.equal(f.task('ship').prFacts.state, 'OPEN', 'first plain land also persists its existing approval-freshness read');
+  assert.equal(f.task('ship').prFacts.url, 'https://github.com/acme/demo/pull/42');
   assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
   assert.equal(f.writes().length, 0, 'Land reports freshness without writing labels');
 };
+gapTests['plain-land-lifecycle-facts'] = () => {
+  const f = reviewLabelsFixture('plain-land-facts');
+  const url = 'https://github.com/acme/demo/pull/42';
+  const ship = f.parent('ship', { pr: url, landed: '2020-01-01T00:00:00Z' }, 'Done.');
+  const head = git('-C', ship.worktree, 'rev-parse', 'HEAD').trim();
+  const open = recordedRestPr(42, 'feature/ship', 'pull-get-open.json');
+  f.save({ ...ship, state: 'closed', prFacts: prObservation(open),
+    reviewVerdict: { verdict: 'APPROVE', head, currentHead: head, stale: false, needsReview: false } });
+  assert.ok(JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.some(t => t.id === ship.id));
+  const merged = recordedRestPr(42, 'feature/ship', 'pull-get-merged.json');
+  merged.head.sha = head; merged.merged_at = merged.closed_at = new Date(Date.now() - 25 * 3600000).toISOString();
+  f.control({ head, prResponse: merged }); const before = f.calls().length;
+  const r = f.call(['land', ship.id]); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(ship.id).prFacts.state, 'MERGED', 'repeated plain land must persist the state learned by approval freshness');
+  assert.equal(f.task(ship.id).prFacts.mergedAt, merged.merged_at);
+  assert.equal(f.task(ship.id).prFacts.closedAt, merged.closed_at); assert.equal(f.task(ship.id).pr, url);
+  assert.equal(f.task(ship.id).state, 'closed');
+  assert.equal(f.calls().slice(before).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1, 'reuse the existing read without another request');
+  assert.equal(f.writes().length, 0, 'plain land freshness is still label-read-only');
+  assert.ok(!JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.some(t => t.id === ship.id), 'offline fleet must omit the now-known old merge');
+};
+
 gapTests['review-label-pr-state-failures'] = () => {
   const f = reviewLabelsFixture('pr-state-failures');
   for (const [id, patch] of [['denied', { prDenied: true }], ['invalid', { prResponse: { state: 'unknown' } }], ['timeout', { prDelay: 5000 }]]) {

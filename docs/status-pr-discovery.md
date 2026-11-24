@@ -87,7 +87,11 @@ combined stdout/stderr acceptance limit, and a ten-second shared monotonic disco
 budget. Timeouts kill the child; Crew does not retry. Repository resolutions are cached
 only within one invocation, not written to disk. Verified PR observations are durable:
 the existing discovery response supplies lifecycle facts without another request. Existing
-land/finish PR reads also save state and timestamps when available. Observation updates
+land/finish PR reads also save state and timestamps when available, including the
+existing approval-freshness GET used by first and repeated plain land. REST observations
+use the validated web `html_url`, never the API `url`; GraphQL/CLI `url` is already a web
+URL. Complete recorded wire responses and endpoint provenance live in
+[the GitHub fixtures](fixtures/github/README.md). Observation updates
 preserve current task lifecycle fields and do not change `updated`; cache-write failures
 never fail status. Observation saves never wait for a task lock, skip when lifecycle work
 is pending, and abandon Windows sharing-error replacement retries so lifecycle commands
