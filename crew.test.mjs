@@ -1143,7 +1143,23 @@ function reviewLabelsFixture(name, overrides = {}) {
     'review-changes-needed': { name: changes, previousNames: [oldChanges] },
   } };
   fs.writeFileSync(state, JSON.stringify({ labels: ['unrelated'], defined: [under, approved, changes], manifest })); fs.writeFileSync(log, '[]');
-  const env = { CREW_GH: fakeGh, CREW_REVIEW_LABELS_REPO: 'timurproko/MyWorkflows', ...overrides }, f = gapFixture(`labels-${name}`, env);
+  // Core is the fake launcher. Installation probes and quota reads must be fake too,
+  // especially relaunch, which checks even a single explicitly named replacement.
+  const bin = path.join(dir, 'agents'), quota = path.join(dir, 'quota.mjs'), quotaLog = path.join(dir, 'quota.jsonl');
+  fs.mkdirSync(bin);
+  for (const agent of ['a1', 'pi', 'claude']) fs.writeFileSync(path.join(bin, agent), '');
+  const launcher = path.join(bin, 'claude-as.sh'); fs.writeFileSync(launcher, '#!/bin/sh\nexit 1\n');
+  fs.writeFileSync(quotaLog, '');
+  fs.writeFileSync(quota, `import fs from 'node:fs';
+const args=process.argv.slice(2), providers=args[args.indexOf('--provider')+1].split(',');
+fs.appendFileSync(${JSON.stringify(quotaLog)},JSON.stringify(args)+'\\n');
+console.log(JSON.stringify({providers:providers.map(provider=>({provider,quotaSemantics:{status:'known',effectiveAvailability:[{scope:'all_models',effectivePercentRemaining:80}]}}))}));`);
+  const env = { CREW_GH: fakeGh, CREW_REVIEW_LABELS_REPO: 'timurproko/MyWorkflows', CREW_AGENT_PATH: bin,
+    CREW_TOOL_QUOTA_AXI: quota, CREW_NO_QUOTA: '0', CREW_CLAUDE_LAUNCHER: launcher, CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '', ...overrides };
+  const f = gapFixture(`labels-${name}`, env);
+  fs.mkdirSync(path.join(f.home, 'config'));
+  fs.writeFileSync(path.join(f.home, 'config', 'crew-dispatch.json'), JSON.stringify({ default: [{ harness: 'pi' }] }));
+  const quotaReads = () => fs.readFileSync(quotaLog, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
   fs.writeFileSync(fakeGh, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process';
 const a=process.argv.slice(2), file=${JSON.stringify(state)}, s=JSON.parse(fs.readFileSync(file,'utf8')), log=${JSON.stringify(log)};
 let task; try { task=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json','utf8')); } catch {}
@@ -1182,7 +1198,7 @@ else fail('unexpected fake request');`);
   const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
   const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
   const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
-  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, parent, start, done, writes, warnings };
+  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, parent, start, done, writes, warnings, quotaReads };
 }
 gapTests['review-label-manifest'] = () => {
   const f = reviewLabelsFixture('manifest', { CREW_REVIEW_LABELS_REPO: 'another/palette' });
@@ -1377,7 +1393,11 @@ gapTests['review-label-current-head'] = () => {
   }
   f.parent('relaunch'); f.control({ noPr: false, prState: 'open', labels: ['unrelated', f.approved] });
   f.save({ ...f.task('relaunch'), state: 'working' });
-  r = f.call(['relaunch', 'relaunch', '--agent', 'a1']); assert.equal(r.code, 0, r.out);
+  const quotaAt = f.quotaReads().length;
+  r = f.call(['relaunch', 'relaunch', '--agent', 'a1', '--model', 'openai-codex/review-label-test']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task('relaunch').agent, 'a1');
+  assert.equal(f.task('relaunch').launch.model, 'openai-codex/review-label-test');
+  assert.deepEqual(f.quotaReads().slice(quotaAt), [['--provider', 'codex', '--max-age', '2m', '--json']], 'Relaunch reads only the fake candidate quota');
   assert.deepEqual(f.control().labels, ['unrelated', f.changes]);
   f.parent('failed-send'); f.control({ labels: ['unrelated', f.approved] });
   setTerminal(f.task('failed-send').terminal, { sendError: true }); at = f.calls().length;
