@@ -1712,7 +1712,7 @@ function returnCopy(task, project, { force = false, scratch = null } = {}) {
     const clean = run('git', ['-C', task.worktree, 'clean', '-ff', '-d', '-X'], { timeout: 60000 });
     if (clean.code !== 0) return { ok: false, partial: true, why: `ignored scratch cleanup failed (${lastLine(clean.stderr)})` };
     const after = snapshotCopy(task.worktree, { scratch: true });
-    if (!after || after.incomplete || Object.keys(after.files).length || after.head !== scratch.head || after.operations.length)
+    if (!after || after.incomplete || Object.keys(after.files).length || after.head !== scratch.head || after.operations.length || commitsOnlyInCopy(task.worktree, seen).length)
       return { ok: false, scratch: true, discarded, why: 'protected work changed during ignored scratch cleanup' };
   }
   const back = releaseCopy(task, project, { force: force || Boolean(scratch) });
@@ -1778,9 +1778,9 @@ const projectOf = (h, task) => (task.projectPath ? { path: task.projectPath } : 
 // read-only by its brief; what it leaves behind is scratch. Derive protection from the exact
 // snapshot that will become the accepted baseline, never an earlier clean inspection.
 // { dirty: files or null when git could not tell, keep }.
-// Closure proof is scoped to this repository, branch and exact current head.
-// Unknown/open PRs get no exception. A deleted remote branch is safe only when
-// the exact closed PR head itself proves publication. No cached fact authorizes it.
+// Closure proof is scoped to this repository, branch and current head.
+// Unknown/open PRs get no exception. A deleted remote branch still needs fresh
+// PR-head equality or merged-history containment proof, never a cached fact.
 function closedPrScratch(h, task) {
   const url = canonicalPrUrl(task.pr ?? task.prFacts?.url), project = projectOf(h, task);
   if (task.kind !== 'ship' || !url || !project?.path || !fs.existsSync(path.join(task.worktree, '.git'))) return null;
@@ -1803,7 +1803,7 @@ function closedPrScratch(h, task) {
   const repository = remote[3].replace(/\.git\/?$/i, '').replace(/\/$/, '');
   if (host !== 'github.com' || !/^[a-z0-9-]+\/[a-z0-9_.-]+$/i.test(repository)
     || !url.toLowerCase().startsWith(`https://github.com/${repository.toLowerCase()}/pull/`)) return null;
-  const found = readPrAtUrl(url, 'headRefOid headRefName headRepository { nameWithOwner }', { cwd: project.path, timeout: 2000 });
+  const found = readPrAtUrl(url, 'headRefOid headRefName headRepository { nameWithOwner } mergeCommit { oid }', { cwd: project.path, timeout: 2000 });
   const pr = found?.pr;
   if (!pr || !['OPEN', 'MERGED', 'CLOSED'].includes(pr.state) || pr.headRefName !== branchOf(task)
     || pr.headRepository?.nameWithOwner?.toLowerCase() !== repository.toLowerCase()) return null;
@@ -1814,10 +1814,14 @@ function closedPrScratch(h, task) {
     return ahead ? { state: pr.state, why: `${ahead} unpushed commits` } : null;
   }
   const head = git('rev-parse', '--verify', 'HEAD');
-  if (head.code !== 0 || pr.headRefOid !== head.stdout.trim()) return { state: pr.state, why: 'unpublished work or a local head not covered by the closed PR' };
   const behind = unpushedCommits(git, branchOf(task));
   if (behind === undefined) return { state: pr.state, why: 'publication that could not be checked against origin' };
   if (behind > 0) return { state: pr.state, why: `${behind} unpushed commits` };
+  // Auto-deletion of a merged source branch is not unpublished work. Its exact
+  // PR head or merge commit can also prove that an older local HEAD was published.
+  const contained = head.code === 0 && pr.headRefOid !== head.stdout.trim() && pr.state === 'MERGED' && behind === null && [pr.headRefOid, pr.mergeCommit?.oid].some(sha =>
+    /^[a-f0-9]{40,64}$/i.test(sha ?? '') && git('merge-base', '--is-ancestor', head.stdout.trim(), sha).code === 0);
+  if (head.code !== 0 || (pr.headRefOid !== head.stdout.trim() && !contained)) return { state: pr.state, why: 'unpublished work or a local head not covered by the closed PR' };
   return { head: head.stdout.trim(), state: pr.state };
 }
 function workInCopy(task, snapshot) {
@@ -2408,10 +2412,13 @@ function cmdLand(args) {
     if (remote.code !== 0) no('the project has no `origin`, so it has no pull request to record.');
     const behind = unpushedCommits(git, branchOf(task));
     if (behind === undefined) no('the project\'s origin could not be reached. Try again.', 4);
-    if (behind === null) no(`its branch ${branchOf(task)} is not pushed. Tell the worker: crew tell ${id} "push your branch and open the draft pull request as the change-delivery skill says"`);
     if (behind) no(`its copy has ${behind} commit${behind === 1 ? '' : 's'} that the pushed branch ${branchOf(task)} lacks. Tell the worker: crew tell ${id} "push your last commits to the pull request"`);
     const found = pullRequestOf(task, branchOf(task), { firstLine: true });
     if (!found) no(`the worker has not opened its pull request yet. Tell it: crew tell ${id} "open the draft pull request as the change-delivery skill says and put Implementation: <its link> in the first line of your report"`);
+    if (behind === null) {
+      const proof = closedPrScratch(h, { ...task, pr: found });
+      if (proof?.state !== 'MERGED' || proof.why) no(`its branch ${branchOf(task)} is not pushed. Tell the worker: crew tell ${id} "push your branch and open the draft pull request as the change-delivery skill says"`);
+    }
     saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
     const shown = pullRequestState(h, task, found);
     console.log(`delivered ${id}: ${found}${shown ? ` (${shown})` : ''}. It follows the repository's delivery workflow: its bot marks it ready; merging is the person's decision.`);

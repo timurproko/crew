@@ -816,9 +816,18 @@ const world=JSON.parse(fs.readFileSync(${JSON.stringify(world)}));
 fs.writeFileSync(${JSON.stringify(moves)},JSON.stringify([...JSON.parse(fs.readFileSync(${JSON.stringify(moves)})),{id,pr:t.pr,landed:t.landed,live:world.terminals[t.terminal]?.state==='live',copy:fs.existsSync(t.worktree+'/.git')}]));
 fs.writeFileSync(file,fs.readFileSync(file,'utf8').replace('- [ ] '+id+' - work (in flight)','- [x] '+id+' - work (done '+url+')'));
 console.log('ok: done '+id+' -> Done');`);
-  for (const kind of ['workflow', 'gate']) for (const state of ['MERGED', 'OPEN']) {
-    const id = `${kind}-${state.toLowerCase()}`, t = f.spawn(id, { recordPr: kind !== 'gate' }), url = 'https://github.com/acme/demo/pull/12';
+  for (const kind of ['workflow', 'gate']) for (const mode of kind === 'workflow' ? ['MERGED', 'OPEN', 'MERGED-DELETED', 'MERGED-ANCESTOR', 'MERGED-CONTAINED'] : ['MERGED', 'OPEN']) {
+    const state = mode.startsWith('MERGED') ? 'MERGED' : mode;
+    const id = `${kind}-${mode.toLowerCase()}`, t = f.spawn(id, { recordPr: kind !== 'gate' }), url = 'https://github.com/acme/demo/pull/12';
     f.pr({ state }); fs.writeFileSync(t.report, `Implementation: ${url}\n`);
+    if (mode === 'MERGED-ANCESTOR' || mode === 'MERGED-CONTAINED') {
+      const head = git('-C', t.worktree, 'rev-parse', 'HEAD').trim();
+      const published = commit(t.worktree, { 'published-later.txt': 'merged on GitHub' }, 'published later');
+      git('-C', t.worktree, 'push', '-q', 'origin', `HEAD:${t.branch}`);
+      git('-C', t.worktree, 'reset', '--hard', '-q', head);
+      f.pr(mode === 'MERGED-ANCESTOR' ? { headRefOid: published } : { headRefOid: 'a'.repeat(40), mergeCommit: { oid: published } });
+    }
+    if (mode !== 'MERGED' && state === 'MERGED') git('-C', t.worktree, 'push', '-q', 'origin', '--delete', t.branch);
     f.save({ ...f.task(id), ...(kind === 'workflow' ? { workflow: 'delivery', stage: 'implementation' } : { gate: 'no-mistakes' }) });
     assert.equal(f.task(id).landed, undefined);
     if (kind === 'gate') assert.equal(f.task(id).pr, undefined, 'Normal gate reporting keeps its URL only in the report');
@@ -837,6 +846,22 @@ console.log('ok: done '+id+' -> Done');`);
     }
     r = f.call(['land', id], { CREW_TOOL_TASKS_AXI: tasks }); assert.equal(r.code, 0, r.out);
     assert.equal(JSON.parse(fs.readFileSync(moves)).length, before + 1, 'Repeated land does not repeat backlog completion');
+  }
+};
+gapTests['missing-branch-refusals'] = () => {
+  const f = leftoversFixture('missing-branch-refusals');
+  for (const mode of ['OPEN', 'CLOSED', 'UNPUSHED', 'UNAVAILABLE', 'WRONG-HEAD']) {
+    const t = f.spawn(mode.toLowerCase());
+    f.save({ ...f.task(t.id), workflow: 'delivery', stage: 'implementation' });
+    if (mode === 'OPEN' || mode === 'CLOSED') f.pr({ state: mode, mergedAt: null });
+    if (mode === 'UNPUSHED') commit(t.worktree, { 'private.txt': 'not published' }, 'private work');
+    if (mode === 'UNAVAILABLE') f.pr({ down: true });
+    if (mode === 'WRONG-HEAD') f.pr({ headRefOid: 'f'.repeat(40) });
+    git('-C', t.worktree, 'push', '-q', 'origin', '--delete', t.branch);
+    const before = readWorld().log.length, r = f.call(['land', t.id]);
+    assert.equal(r.code, 6, r.out); assert.match(r.out, /is not pushed/); assert.equal(f.task(t.id).landed, undefined);
+    assert.ok(!readWorld().log.slice(before).some(a => ['kill', 'rm'].includes(a[0])));
+    assert.equal(readWorld().terminals[t.terminal].state, 'live'); assert.ok(fs.existsSync(path.join(t.worktree, '.artifacts', 'KEEP')));
   }
 };
 gapTests['closed-delivery'] = () => {
@@ -863,6 +888,24 @@ gapTests['closed-clean-race'] = () => {
   const r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
   assert.equal(r.code, 0, r.out); assert.match(r.out, /kept for now.*protected work changed.*discarded ignored scratch/);
   assert.equal(fs.readFileSync(late, 'utf8'), 'mine'); assert.ok(f.task(t.id).copyToReturn);
+};
+
+gapTests['closed-clean-reflog'] = () => {
+  const f = leftoversFixture('clean-reflog'), t = f.spawn('late'), preload = path.join(f.dir, 'clean.cjs'), orphan = path.join(f.dir, 'orphan.txt');
+  fs.writeFileSync(preload, `const fs=require('node:fs'),cp=require('node:child_process'),orig=cp.spawnSync;let injected=false;
+cp.spawnSync=(p,a,o)=>{const r=orig(p,a,o);if(!injected&&p==='git'&&a.includes('clean')&&r.status===0){injected=true;
+const git=(...args)=>{const out=orig('git',['-C',${JSON.stringify(t.worktree)},...args],{encoding:'utf8'});if(out.status!==0)throw Error(out.stderr);return out.stdout.trim()};
+git('checkout','-q','--detach');git('-c','user.name=t','-c','user.email=t@example.invalid','commit','--allow-empty','-q','-m','orphan during ignored cleanup');
+fs.writeFileSync(${JSON.stringify(orphan)},git('rev-parse','HEAD'));git('checkout','-q',${JSON.stringify(t.branch)});}return r};require('node:module').syncBuiltinESMExports();`);
+  const head = git('-C', t.worktree, 'rev-parse', 'HEAD').trim();
+  let r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
+  assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(path.join(t.worktree, '.git')), 'A reset to the original HEAD must not hide a new orphan commit');
+  const sha = fs.readFileSync(orphan, 'utf8'); assert.ok(sha && sha !== head);
+  assert.equal(git('-C', t.worktree, 'rev-parse', 'HEAD').trim(), head);
+  assert.equal(git('-C', t.worktree, 'for-each-ref', '--contains', sha, '--format=%(refname)', 'refs/heads', 'refs/tags').trim(), '');
+  assert.ok(git('-C', t.worktree, 'reflog', 'show', '--format=%H', 'HEAD').includes(sha));
+  assert.ok(f.task(t.id).copyToReturn); assert.match(r.out, /kept for now.*protected work changed/);
+  r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(t.worktree)); assert.match(r.out, /commits made since finish/);
 };
 
 gapTests['owned-late-publication'] = () => {

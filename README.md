@@ -309,7 +309,9 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
 For every kind, first land requires a reported worker, an existing copy, and clean tracked
 and untracked files, even when it only records a link. An already-landed open PR can return early.
 Land records the PR link, landed timestamp and backlog completion before any merged-task
-cleanup, including a gate's PR URL resolved from its report. When land freshly verifies the
+cleanup, including a gate's PR URL resolved from its report. A workflow PR whose source
+branch was auto-deleted can still land when fresh merged-PR head/history proof covers the
+local head; branch absence alone never authorizes delivery. When land freshly verifies the
 task's exact PR merged, it uses finish's guarded cleanup, including on repeated land, without implicit force. Busy workers, protected work or unrelated
 terminals still prevent unsafe cleanup. Finish and merged-task land include one cleanup line
 saying which ignored roots or local changes/scratch were discarded, or `discarded none` when
@@ -580,11 +582,12 @@ For a ship whose exact PR is freshly proved merged or closed, finish treats Git-
 untracked contents as disposable scratch only after checking repository, branch and head
 identity and publication. Tracked changes, non-ignored untracked files, unpushed commits,
 Git operations/locks and foreign terminals still protect the copy. A deleted remote branch
-is not proof by itself: its verified closed PR must hold the exact local head. Closed but
-unmerged branches stay. This exception discards ignored KEEP markers, screenshots, sockets
+is not proof by itself: its verified closed PR must hold the exact local head, or a merged
+PR's head or merge commit must contain it. Closed but unmerged branches stay. This exception discards ignored KEEP markers, screenshots, sockets
 and nested probe repositories without reading their contents or following symlinks. It
 also applies on deferred return after rechecking safety; ignored-only changes do not hold
-an eligible copy indefinitely. Unknown or open PRs retain the existing KEEP/force rules.
+an eligible copy indefinitely. After ignored cleanup, reflog history is checked again so a
+new orphan commit remains protected even if HEAD was reset to its original value. Unknown or open PRs retain the existing KEEP/force rules.
 
 Outside that narrow exception, finish records changed and untracked file times and the keep marker before stopping. The
 non-forced ship refusal uses that same inspection, not an earlier clean result. Ignored
