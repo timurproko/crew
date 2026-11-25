@@ -1112,6 +1112,8 @@ export function briefText({ id, kind, task, worktree, project, report, tools = [
     `# Task ${id} (${kind})`, '', task.trim(), '',
     '## Rules',
     `- Work only inside \`${worktree}\`. It is your own copy of the project \`${project}\`; nobody else uses it.`,
+    `- Output exception: keep proof pictures and scratch outside the working copy, in your crew task folder \`${slash(path.dirname(report))}\`. This folder is allowed for reports and disposable output, not project edits.`,
+    '- Stop every disposable app instance or server you started before writing your report and running `crew done`.',
     ...(kind === 'scout'
       ? ['- This is a read-only investigation: do not change project files, commit, push or open a pull request.']
       : gate

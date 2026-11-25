@@ -31,12 +31,12 @@ assert.deepEqual(Object.keys(AGENTS), ['a1', 'pi', 'claude']);
 const brief = briefText({ id: 't1', kind: 'scout', task: 'Count lines.', worktree: 'W', project: 'p', report: 'R' });
 assert.match(brief, /read-only investigation/); assert.match(brief, /crew done t1/); assert.match(brief, /`R`/);
 assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' }), /commit them/);
-// A plain and a gated ship brief stay exactly what they were before the shared delivery workflow
-// was known; a scout's brief does not change for a workflow project; the gate wins over it.
+// Delivery instructions stay distinct; all briefs share external scratch and instance hygiene.
+// A scout's brief does not change for a workflow project; the gate wins over it.
 {
   const ship = { id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' };
   const ends = '- When you are finished, write your result to `R` in Markdown, with the answer in the first lines.\n- Then run `crew done t1` and stop. Do not start any other work.\n- If you cannot finish, write what blocked you to the same file and still run the command.\n';
-  const start = '# Task t1 (ship)\n\nx\n\n## Rules\n- Work only inside `W`. It is your own copy of the project `p`; nobody else uses it.\n';
+  const start = '# Task t1 (ship)\n\nx\n\n## Rules\n- Work only inside `W`. It is your own copy of the project `p`; nobody else uses it.\n- Output exception: keep proof pictures and scratch outside the working copy, in your crew task folder `.`. This folder is allowed for reports and disposable output, not project edits.\n- Stop every disposable app instance or server you started before writing your report and running `crew done`.\n';
   assert.equal(briefText(ship), `${start}- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.\n${ends}`);
   const gated = `${start}- Make your changes on the branch already checked out here and commit them.\n- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file I --skip ci\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. A wait that runs out is not a failure: run the same command again to go on. Do not push or open a pull request any other way.\n- The gate ends when the pull request is open. Its checks are not watched here: the person reads them on the pull request.\n- Put the pull request link the gate gives you in the first lines of your report. If the gate stops on something only a person can decide, say exactly what in the report.\n${ends}`;
   assert.equal(briefText({ ...ship, gate: 'I', gateSkip: ['ci'] }), gated);
@@ -45,6 +45,12 @@ assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', proje
   const flow = briefText({ ...ship, workflow: true, branch: 'fix/t1' });
   for (const line of ['load the `change-delivery` skill', 'Run `delivery update`', '`delivery start fix/t1` returns this same folder', 'then STOP', '`Plan: <pull request link>`', '`Implementation: <pull request link>`', 'Never mark the pull request ready and never merge it.', 'crew done t1']) assert.ok(flow.includes(line), line);
   assert.ok(!flow.includes('Do not push or open a pull request'), flow);
+}
+
+for (const options of [{ kind: 'scout' }, { kind: 'ship' }, { kind: 'ship', workflow: true }, { kind: 'ship', gate: 'intent' }]) {
+  const text = briefText({ id: 'hygiene', task: 'Work or review.', worktree: '/copies/work', project: 'demo', report: '/crew/tasks/hygiene/report.md', ...options });
+  assert.match(text, /Output exception:.*proof pictures and scratch outside the working copy.*`\/crew\/tasks\/hygiene`/);
+  assert.match(text, /Stop every disposable app instance or server you started before writing your report/);
 }
 
 // Claude account choice: only for Claude, only through the launcher, never an unchecked value.
@@ -734,6 +740,10 @@ gapTests['owned-review'] = () => {
   assert.deepEqual(review.terminals.map(t => t.address), [review.terminal]);
   r = f.call(['relaunch', review.id, '--agent', 'pi', '--model', 'next-reviewer'], { CREW_AGENT_PATH: bin }); assert.equal(r.code, 0, r.out);
   const next = f.task(review.id); assert.equal(next.terminals.length, 2);
+  const reviewerBrief = fs.readFileSync(next.brief, 'utf8');
+  assert.ok(reviewerBrief.includes(slash(path.dirname(next.report))));
+  assert.match(reviewerBrief, /Stop every disposable app instance/);
+  assert.ok(readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1).includes(`Read the brief at ${next.brief}`), 'Replacement rereads the hygiene rules');
   let w = readWorld(); w.terminals[review.terminal] = old; w.terminals[next.terminal].cwd = t.worktree; fs.writeFileSync(world, JSON.stringify(w));
   r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out); assert.ok(f.task(t.id).copyToReturn);
   assert.equal(readWorld().terminals[next.terminal].state, 'live', 'Parent finish never adopts a separate review task');

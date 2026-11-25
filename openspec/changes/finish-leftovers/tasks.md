@@ -18,8 +18,8 @@
 
 ## 3. Worker briefs move disposable work outside the copy
 
-- [ ] 3.1 Add the task-folder scratch/proof destination and disposable-instance shutdown rule to shared brief generation; assert the destination is outside the working copy and explicitly allowed by the brief.
-- [ ] 3.2 Cover ordinary, workflow, gate, scout and reviewer brief output and replacement reuse, update README guidance, and run the focused brief checks.
+- [x] 3.1 Add the task-folder scratch/proof destination and disposable-instance shutdown rule to shared brief generation; assert the destination is outside the working copy and explicitly allowed by the brief.
+- [x] 3.2 Cover ordinary, workflow, gate, scout and reviewer brief output and replacement reuse, update README guidance, and run the focused brief checks.
 
 ## 4. Finish and merged land explain discarded contents once
 

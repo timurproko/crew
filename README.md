@@ -91,7 +91,9 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
   space/tab labels. The agent starts with one instruction as its command-line argument
   ("read the brief…"), so nothing is typed into it.
 - **Report.** The worker writes `tasks/<id>/report.md` and runs `crew done` from its own
-  terminal.
+  terminal. Its brief directs proof pictures and scratch to that same external task folder,
+  not the working copy, and requires stopping disposable apps/servers it started before reporting.
+  The task folder is an explicit output exception to the working-copy-only project-edit rule.
   `crew wait` reads the task file once a second.
   Every few seconds it asks Core about ended terminals, missing agents, quota/login stops on non-working screens, provider errors, idle workers, and questions or permissions that need a person, as described under work under way below.
 - **Finish.** A worker still working is never closed without `--force`. A1 leaves through
