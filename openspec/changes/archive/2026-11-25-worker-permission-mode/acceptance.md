@@ -28,7 +28,7 @@ The maintainer integration decision accepts these scenarios:
     "A normal end, an interrupt or a late error is never restarted, and bypassPermissions or dontAsk are never used.",
     "A1 and Pi launches and the person's crew-dispatch.json are unchanged."
   ],
-  "archiveDigest": "f4e088d327d13d7052cbef1a1744eb88f49169e1f2b93b830668498d080a83ae",
+  "archiveDigest": "5ebd1e2fd1c95eabf49027a0469653f5a98a2896beefc0a7c679963aa9c09570",
   "specDigest": "aec234ef562b6c542777f0edffd8aef8f1ef964f97cf0ece384ecf97a6512266",
   "tasksDigest": "0b20ca88bc6aff417394912c982ac346dc9387dc157810b4dd75cf93d609d4c9",
   "evidenceDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
