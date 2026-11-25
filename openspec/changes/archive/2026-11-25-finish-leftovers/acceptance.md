@@ -18,7 +18,7 @@ The maintainer integration decision accepts these scenarios:
   "archive": "openspec/changes/archive/2026-11-25-finish-leftovers/",
   "acceptanceManifest": "openspec/changes/archive/2026-11-25-finish-leftovers/acceptance.md",
   "finalizedDate": "2026-11-25",
-  "specBaseSha": "2175750ea2fbfb054943d6f851e53326256af8af",
+  "specBaseSha": "3aced287df4e7adee714b7753942eb6f39959d2a",
   "acceptanceScenarios": [
     "Verified merged or closed task PRs permit ignored-only scratch disposal without force, including KEEP, sockets and nested probes.",
     "Unpublished commits, tracked changes, non-ignored files, open-PR scratch and unrelated terminals retain their protective refusals.",
