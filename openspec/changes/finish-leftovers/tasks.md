@@ -2,12 +2,12 @@
 
 ## 1. Verified closed-PR scratch cleanup preserves protected work
 
-- [ ] 1.1 Add isolated regressions reproducing merged/closed ignored KEEP, picture, unreadable-socket and nested-probe leftovers; show the current implementation cannot complete non-forced cleanup for the protected examples before changing it.
-- [ ] 1.2 Establish exact repository/branch/head closure and publication proof, including deleted remote branches; cover open, wrong-repository, wrong-branch, stale-head, absent and unreadable PRs and failed Git/publication reads with conservative regression assertions.
-- [ ] 1.3 Add the narrow ignored-only inspection/disposal path for initial finish, post-stop comparison and deferred/closed-task retry; assert ignored sockets are never recursively inspected and nested ignored repositories can be removed without following outside symlinks.
-- [ ] 1.4 Cover refusal for unpushed commits, staged and unstaged tracked changes, non-ignored untracked files, and open/unmerged PR scratch with KEEP; assert refusal occurs before any stop/removal, and retain explicit-force behavior outside the exception.
-- [ ] 1.5 Retain post-stop and deferred protections for late real work, history, operations/locks, foreign holders and Core uncertainty; add targeted assertions for each and for ignored-only changes no longer blocking an eligible task.
-- [ ] 1.6 Update README's finish/snapshot contract and run the targeted cleanup regressions, checking merged branches can be dropped only under existing merge proof and closed-unmerged branches remain.
+- [x] 1.1 Add isolated regressions reproducing merged/closed ignored KEEP, picture, unreadable-socket and nested-probe leftovers; show the current implementation cannot complete non-forced cleanup for the protected examples before changing it.
+- [x] 1.2 Establish exact repository/branch/head closure and publication proof, including deleted remote branches; cover open, wrong-repository, wrong-branch, stale-head, absent and unreadable PRs and failed Git/publication reads with conservative regression assertions.
+- [x] 1.3 Add the narrow ignored-only inspection/disposal path for initial finish, post-stop comparison and deferred/closed-task retry; assert ignored sockets are never recursively inspected and nested ignored repositories can be removed without following outside symlinks.
+- [x] 1.4 Cover refusal for unpushed commits, staged and unstaged tracked changes, non-ignored untracked files, and open/unmerged PR scratch with KEEP; assert refusal occurs before any stop/removal, and retain explicit-force behavior outside the exception.
+- [x] 1.5 Retain post-stop and deferred protections for late real work, history, operations/locks, foreign holders and Core uncertainty; add targeted assertions for each and for ignored-only changes no longer blocking an eligible task.
+- [x] 1.6 Update README's finish/snapshot contract and run the targeted cleanup regressions, checking merged branches can be dropped only under existing merge proof and closed-unmerged branches remain.
 
 ## 2. Finish closes every recorded crew-started terminal safely
 

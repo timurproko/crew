@@ -559,7 +559,17 @@ branch is dropped. A copy deleted by hand is pruned from git. A failed automatic
 reported but does not fail the triggering command. An explicit `crew finish <closed-id> --force`
 does refuse if Core is silent, a terminal holds the copy, or the return fails.
 
-Finish records changed and untracked file times and the keep marker before stopping. The
+For a ship whose exact PR is freshly proved merged or closed, finish treats Git-ignored
+untracked contents as disposable scratch only after checking repository, branch and head
+identity and publication. Tracked changes, non-ignored untracked files, unpushed commits,
+Git operations/locks and foreign terminals still protect the copy. A deleted remote branch
+is not proof by itself: its verified closed PR must hold the exact local head. Closed but
+unmerged branches stay. This exception discards ignored KEEP markers, screenshots, sockets
+and nested probe repositories without reading their contents or following symlinks. It
+also applies on deferred return after rechecking safety; ignored-only changes do not hold
+an eligible copy indefinitely. Unknown or open PRs retain the existing KEEP/force rules.
+
+Outside that narrow exception, finish records changed and untracked file times and the keep marker before stopping. The
 non-forced ship refusal uses that same inspection, not an earlier clean result. Ignored
 entries get a stat-only walk, without following symlinks or reading contents. Each ignored
 root stores file count, newest modification time, total size and a metadata digest, so edits,
@@ -583,8 +593,8 @@ unanswered Core query. Unconfirmed worker stops and terminal removals are shown 
 never free; reading status never returns a copy. JSON's `copyToReturn` has `why`, `kept`,
 `pending` and `free`. Plain status ends with a count of waiting copies.
 
-Protective refusals come before stopping: uncommitted ship work, a failed work inspection,
-`.artifacts/KEEP`, a busy worker without `--force`, or an unanswered initial Core query leave
+Protective refusals come before stopping: uncommitted ship work, a failed protected-work inspection,
+`.artifacts/KEEP` outside the verified closed-PR scratch exception, a busy worker without `--force`, or an unanswered initial Core query leave
 the worker and copy intact. Before immediate return, the whole snapshot is compared after
 stopping and terminal removal, including ignored files and scout scratch, even with `--force`.
 Work written while leaving postpones return rather than refusing with the worker gone. A silent

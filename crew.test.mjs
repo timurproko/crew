@@ -596,6 +596,105 @@ gapTests['platform-paths'] = () => {
     assert.ok(!fs.existsSync(t.worktree));
   }
 };
+// Real Git, isolated origin, verified fake GitHub: never contacts the person's accounts.
+function leftoversFixture(name) {
+  const f = gapFixture(`leftovers-${name}`), origin = path.join(f.dir, 'origin.git');
+  git('init', '-q', '--bare', origin);
+  git('-C', f.repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git');
+  git('-C', f.repo, 'config', `url.${slash(origin)}.insteadOf`, 'https://github.com/acme/demo.git');
+  git('-C', f.repo, 'config', 'user.name', 't'); git('-C', f.repo, 'config', 'user.email', 't@example.invalid');
+  commit(f.repo, { '.gitignore': 'scratch/\n.artifacts/\n' }, 'ignore scratch');
+  const control = path.join(f.dir, 'pr.json'), gh = path.join(f.dir, 'gh.mjs');
+  fs.writeFileSync(gh, `import fs from 'node:fs'; const pr = JSON.parse(fs.readFileSync(${JSON.stringify(control)}));
+if (pr.down) process.exit(1);
+if (process.argv.includes('graphql')) console.log(JSON.stringify({data:{repository:{nameWithOwner:'acme/demo',pullRequests:{totalCount:1},pullRequest:pr}}}));
+else console.log(JSON.stringify(pr.state === 'MERGED' ? [pr] : []));`);
+  const call = (args, env = {}) => f.call(args, { CREW_GH: gh, ...env });
+  const spawn = id => {
+    const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']);
+    const head = commit(t.worktree, { 'change.txt': id }, 'work');
+    git('-C', t.worktree, 'push', '-q', 'origin', `HEAD:${t.branch}`);
+    const pr = { url: 'https://github.com/acme/demo/pull/12', state: 'MERGED', headRefOid: head, headRefName: t.branch,
+      headRepository: { nameWithOwner: 'acme/demo' }, mergedAt: '2026-01-01T00:00:00Z', closedAt: '2026-01-01T00:00:00Z' };
+    fs.writeFileSync(control, JSON.stringify(pr));
+    f.save({ ...t, state: 'reported', pr: pr.url });
+    fs.mkdirSync(path.join(t.worktree, '.artifacts')); fs.writeFileSync(path.join(t.worktree, '.artifacts', 'KEEP'), '');
+    fs.writeFileSync(path.join(t.worktree, '.artifacts', 'proof.png'), 'picture');
+    return t;
+  };
+  const pr = patch => fs.writeFileSync(control, JSON.stringify({ ...JSON.parse(fs.readFileSync(control)), ...patch }));
+  return { ...f, origin, control, call, spawn, pr };
+}
+gapTests['closed-scratch'] = () => {
+  const f = leftoversFixture('scratch');
+  for (const state of ['MERGED', 'CLOSED']) {
+    const t = f.spawn(state.toLowerCase()); f.pr({ state, ...(state === 'CLOSED' ? { mergedAt: null } : {}) });
+    const probe = path.join(t.worktree, '.artifacts', 'gh-probe'); git('init', '-q', probe); commit(probe, { note: 'throwaway' }, 'probe');
+    const outside = path.join(f.dir, `outside-${state}`); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'keep'), 'mine');
+    fs.symlinkSync(outside, path.join(t.worktree, '.artifacts', 'link'), WINDOWS ? 'junction' : 'dir');
+    const socket = path.join(t.worktree, '.artifacts', 'herdr-app.sock'); fs.writeFileSync(socket, 'unreadable socket placeholder');
+    const preload = path.join(f.dir, 'unreadable.cjs');
+    fs.writeFileSync(preload, `const fs=require('node:fs'),orig=fs.lstatSync; fs.lstatSync=(p,...a)=>{if(String(p).endsWith('herdr-app.sock')) throw Error('socket cannot be statted');return orig(p,...a)};`);
+    const r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
+    assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(path.join(t.worktree, '.git')), r.out);
+    assert.equal(fs.readFileSync(path.join(outside, 'keep'), 'utf8'), 'mine');
+    assert.equal(Boolean(git('-C', f.repo, 'branch', '--list', t.branch).trim()), state === 'CLOSED', 'Closed is not merged');
+  }
+};
+gapTests['closed-refusals'] = () => {
+  const f = leftoversFixture('refusals');
+  const unchanged = (t, pattern) => {
+    const before = readWorld().log.length, r = f.call(['finish', t.id]);
+    assert.equal(r.code, 6, r.out); assert.match(r.out, pattern);
+    assert.ok(!readWorld().log.slice(before).some(a => ['kill', 'rm'].includes(a[0])), 'Refusal must precede stopping');
+    assert.equal(readWorld().terminals[t.terminal].state, 'live');
+  };
+  for (const mode of ['tracked', 'staged', 'untracked', 'unpushed']) {
+    const t = f.spawn(mode);
+    if (mode === 'unpushed') commit(t.worktree, { 'private.txt': 'not published' }, 'private');
+    else { fs.writeFileSync(path.join(t.worktree, mode === 'untracked' ? 'mine.txt' : 'change.txt'), 'mine'); if (mode === 'staged') git('-C', t.worktree, 'add', 'change.txt'); }
+    unchanged(t, /uncommitted|unpushed|unpublished|head/i);
+  }
+  for (const [mode, patch] of Object.entries({ open: { state: 'OPEN' }, stale: { headRefOid: 'a'.repeat(40) }, branch: { headRefName: 'feature/other' }, foreign: { headRepository: { nameWithOwner: 'other/repo' } }, down: { down: true }, absent: { state: 'NOT_FOUND' } })) {
+    const t = f.spawn(mode); f.pr(patch); unchanged(t, /keep|head|unpublished/i);
+  }
+  const wrong = f.spawn('wrong-url'); f.save({ ...f.task(wrong.id), pr: 'https://github.com/other/repo/pull/12' }); unchanged(wrong, /keep/);
+  const forced = f.spawn('forced'); f.pr({ state: 'OPEN' }); assert.equal(f.call(['finish', forced.id, '--force']).code, 0);
+};
+
+gapTests['closed-safety'] = () => {
+  const f = leftoversFixture('safety'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
+  const deleted = f.spawn('deleted'); git('-C', deleted.worktree, 'push', '-q', 'origin', '--delete', deleted.branch);
+  let r = f.call(['finish', deleted.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(deleted.worktree), r.out);
+  const held = f.spawn('held'); f.guest(held);
+  r = f.call(['finish', held.id]); assert.equal(r.code, 0, r.out); assert.ok(f.task(held.id).copyToReturn);
+  assert.equal(readWorld().terminals['guest-leftovers-safety'].state, 'live');
+  fs.writeFileSync(path.join(held.worktree, '.artifacts', 'later.png'), 'more scratch');
+  const saved = f.task(held.id); saved.copyToReturn.left.incomplete = 'could not read .artifacts/old.sock'; f.save(saved);
+  f.leave(); r = f.call(['finish', held.id]); assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(held.worktree), r.out);
+  for (const name of ['tracked', 'nonignored']) {
+    const t = f.spawn(`late-${name}`), file = path.join(t.worktree, name === 'tracked' ? 'change.txt' : 'late.txt');
+    patch({ writeOnKill: file }); r = f.call(['finish', t.id]); patch({ writeOnKill: null });
+    assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(file)); assert.ok(f.task(t.id).copyToReturn);
+    r = f.call(['finish', t.id]); assert.ok(fs.existsSync(file), r.out);
+    assert.equal(f.call(['finish', t.id, '--force']).code, 0);
+  }
+  for (const op of ['MERGE_HEAD', 'locked']) {
+    const t = f.spawn(`op-${op.toLowerCase().replace('_', '-')}`);
+    const dir = git('-C', t.worktree, 'rev-parse', '--absolute-git-dir').trim(), marker = path.join(dir, op);
+    fs.writeFileSync(marker, op === 'locked' ? 'keep' : git('-C', t.worktree, 'rev-parse', 'HEAD'));
+    r = f.call(['finish', t.id]); assert.equal(r.code, 6, r.out); assert.equal(readWorld().terminals[t.terminal].state, 'live'); fs.rmSync(marker);
+  }
+  const silent = f.spawn('silent'); patch({ silentLs: true }); r = f.call(['finish', silent.id]); patch({ silentLs: false });
+  assert.equal(r.code, 4, r.out); assert.equal(readWorld().terminals[silent.terminal].state, 'live');
+  for (const command of ['ls-remote', 'fetch', 'rev-list']) {
+    const t = f.spawn(`failed-${command}`), preload = path.join(f.dir, `${command}.cjs`);
+    fs.writeFileSync(preload, `const cp=require('node:child_process'),orig=cp.spawnSync;cp.spawnSync=(p,a,o)=>p==='git'&&a.includes(${JSON.stringify(command)})?{status:1,stdout:'',stderr:'injected git failure'}:orig(p,a,o);require('node:module').syncBuiltinESMExports();`);
+    r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
+    assert.equal(r.code, 6, r.out); assert.equal(readWorld().terminals[t.terminal].state, 'live'); assert.ok(fs.existsSync(t.worktree));
+  }
+};
+
 gapTests.ignored = () => {
   const f = gapFixture('ignored'), count = Math.max(12001, Number(process.env.CREW_TEST_IGNORED_FILES) || 12001);
   const fill = t => { fs.mkdirSync(path.join(t.worktree, 'scratch')); for (let i = 0; i < count; i++) fs.writeFileSync(path.join(t.worktree, 'scratch', `${i}.txt`), 'old'); fs.utimesSync(path.join(t.worktree, 'scratch'), 1700000000, 1700000000); };

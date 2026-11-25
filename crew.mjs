@@ -1662,7 +1662,25 @@ function describeHolders(holders, folder) {
 // Hands a closed worker's copy back the way it was made: through the delivery workflow, the
 // legacy treehouse pool, or git. Never refuses: { ok, said, leftover } or { ok: false, why },
 // so finish can refuse with `why` and the later sweep can report it and go on.
-function returnCopy(task, project, { force = false } = {}) {
+function returnCopy(task, project, { force = false, scratch = null } = {}) {
+  let discarded = [];
+  if (scratch) {
+    // Only the verified closed-PR path may bypass ignored KEEP/nested-repository
+    // protection. Recheck protected files and HEAD after terminal removal.
+    const seen = snapshotCopy(task.worktree, { scratch: true });
+    if (!seen || seen.incomplete || Object.keys(seen.files).length || seen.head !== scratch.head || seen.operations.length)
+      return { ok: false, why: 'protected work changed before ignored scratch cleanup' };
+    const roots = gitStatus(task.worktree, '--ignored');
+    if (!roots) return { ok: false, why: 'ignored scratch could not be listed' };
+    discarded = roots.filter(e => e.code === '!!').map(e => e.file);
+    // -X is ignored-only; the second -f permits ignored probe repositories.
+    // Git does not follow directory symlinks or remove tracked files.
+    const clean = run('git', ['-C', task.worktree, 'clean', '-ff', '-d', '-X'], { timeout: 60000 });
+    if (clean.code !== 0) return { ok: false, why: `ignored scratch cleanup failed (${lastLine(clean.stderr)}); some ignored scratch may have been discarded` };
+  }
+  return { ...releaseCopy(task, project, { force: force || Boolean(scratch) }), discarded };
+}
+function releaseCopy(task, project, { force = false } = {}) {
   if (task.via === 'delivery') {
     // The shared delivery workflow made the copy, so it takes it back: a pool slot is returned,
     // a plain folder removed. Crew has already refused unsaved ship work and a keep marker,
@@ -1716,6 +1734,43 @@ const projectOf = (h, task) => (task.projectPath ? { path: task.projectPath } : 
 // read-only by its brief; what it leaves behind is scratch. Derive protection from the exact
 // snapshot that will become the accepted baseline, never an earlier clean inspection.
 // { dirty: files or null when git could not tell, keep }.
+// Closure proof is scoped to this repository, branch and exact current head.
+// Unknown/open PRs get no exception. A deleted remote branch is safe only when
+// the exact closed PR head itself proves publication. No cached fact authorizes it.
+function closedPrScratch(h, task) {
+  const url = canonicalPrUrl(task.pr ?? task.prFacts?.url), project = projectOf(h, task);
+  if (task.kind !== 'ship' || !url || !project?.path || !fs.existsSync(path.join(task.worktree, '.git'))) return null;
+  const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 2000 });
+  const parent = (...a) => run('git', ['-C', project.path, ...a], { timeout: 2000 });
+  const common = git('rev-parse', '--path-format=absolute', '--git-common-dir');
+  const original = parent('rev-parse', '--path-format=absolute', '--git-common-dir');
+  if (common.code !== 0 || original.code !== 0 || comparablePath(common.stdout.trim()) !== comparablePath(original.stdout.trim())
+    || git('symbolic-ref', '-q', 'HEAD').stdout.trim() !== `refs/heads/${branchOf(task)}`) return null;
+  const origin = git('config', '--get', 'remote.origin.url').stdout.trim();
+  if (origin !== parent('config', '--get', 'remote.origin.url').stdout.trim()) return null;
+  const remote = /^(https:\/\/|ssh:\/\/git@|git@)([a-z0-9][a-z0-9.-]*)(?:\/|:)([^\s]+)$/i.exec(origin);
+  if (!remote) return null;
+  let host = remote[2].toLowerCase();
+  if (host !== 'github.com' && remote[1] !== 'https://') {
+    const config = run('ssh', ['-G', host], { timeout: 2000 });
+    if (config.code !== 0) return null;
+    host = /^hostname\s+(\S+)\s*$/mi.exec(config.stdout)?.[1]?.toLowerCase();
+  }
+  const repository = remote[3].replace(/\.git\/?$/i, '').replace(/\/$/, '');
+  if (host !== 'github.com' || !/^[a-z0-9-]+\/[a-z0-9_.-]+$/i.test(repository)
+    || !url.toLowerCase().startsWith(`https://github.com/${repository.toLowerCase()}/pull/`)) return null;
+  const found = readPrAtUrl(url, 'headRefOid headRefName headRepository { nameWithOwner }', { cwd: project.path, timeout: 2000 });
+  const pr = found?.pr;
+  if (!pr || !['MERGED', 'CLOSED'].includes(pr.state) || pr.headRefName !== branchOf(task)
+    || pr.headRepository?.nameWithOwner?.toLowerCase() !== repository.toLowerCase()) return null;
+  rememberTaskPr(h, task, found.facts);
+  const head = git('rev-parse', '--verify', 'HEAD');
+  if (head.code !== 0 || pr.headRefOid !== head.stdout.trim()) return { why: 'unpublished work or a local head not covered by the closed PR' };
+  const behind = unpushedCommits(git, branchOf(task));
+  if (behind === undefined) return { why: 'publication that could not be checked against origin' };
+  if (behind > 0) return { why: `${behind} unpushed commits` };
+  return { head: head.stdout.trim(), state: pr.state };
+}
 function workInCopy(task, snapshot) {
   const dirty = task.kind === 'ship' ? snapshot ? Object.keys(snapshot.files) : null : [];
   return { dirty, keep: snapshot ? snapshot.keep !== null : fs.existsSync(path.join(task.worktree, '.artifacts', 'KEEP')) };
@@ -1740,7 +1795,7 @@ const listFiles = files => `${files.slice(0, 5).join(', ')}${files.length > 5 ? 
 // digest includes names and individual metadata: count/max/size alone can hide a rename,
 // a same-size edit below the newest timestamp, or two changes whose sizes cancel out.
 // Never follow symlinks or read contents. A slow/unreadable walk is uncertainty, not clean.
-export function snapshotCopy(folder, { budgetMs = 30000 } = {}) {
+export function snapshotCopy(folder, { budgetMs = 30000, scratch = false } = {}) {
   const deadline = performance.now() + budgetMs;
   const stamp = p => { try { return fs.lstatSync(path.join(folder, p)).mtimeMs; } catch { return null; } };
   // An existing copy without its Git marker is uninspectable, not empty. A copy already
@@ -1757,7 +1812,7 @@ export function snapshotCopy(folder, { budgetMs = 30000 } = {}) {
       files[file] = stamp(file);
       if (files[file] === null && !code.includes('D')) throw new Error(`could not read ${file}`);
     }
-    for (const { file } of roots.filter(e => e.code === '!!')) {
+    for (const { file } of roots.filter(e => !scratch && e.code === '!!')) {
       const hash = createHash('sha256'), summary = { files: 0, newestMtimeMs: 0, totalSize: 0 };
       const walk = name => {
         checkTime();
@@ -1781,7 +1836,7 @@ export function snapshotCopy(folder, { budgetMs = 30000 } = {}) {
     }
     checkTime();
   } catch (error) { incomplete = error.message; }
-  return { files, ignoredVersion: 1, ignored, incomplete, keep: stamp(path.join('.artifacts', 'KEEP')), ...historyOf(folder) };
+  return { files, ignoredVersion: 1, ignored, incomplete, keep: scratch ? null : stamp(path.join('.artifacts', 'KEEP')), ...historyOf(folder) };
 }
 // Where the copy's history stood: its HEAD and branch, how many entries its own HEAD reflog
 // has (a linked copy's reflog is its own and goes with it), and which git operations are
@@ -1812,9 +1867,9 @@ function commitsOnlyInCopy(folder, before) {
 // is new or changed since finish's snapshot, or a keep marker that was not there then. Only
 // `crew finish <id> --force` on the closed task discards that. { kept, leftovers }: `kept`
 // says why it waits (or null), `leftovers` that finish's accepted files are still there.
-function checkWaitingCopy(task, before = task.copyToReturn?.left, { discardUnseen = false } = {}) {
-  const seen = snapshotCopy(task.worktree);
-  const uncertain = !seen ? 'it could not be checked for work written since finish' : !before ? 'the original snapshot could not be read' : before.ignoredVersion !== 1 ? 'its older snapshot did not inspect ignored files' : before.incomplete ?? seen.incomplete;
+function checkWaitingCopy(task, before = task.copyToReturn?.left, { discardUnseen = false, scratch = false } = {}) {
+  const seen = snapshotCopy(task.worktree, { scratch });
+  const uncertain = !seen ? 'it could not be checked for work written since finish' : !before ? 'the original snapshot could not be read' : !scratch && before.ignoredVersion !== 1 ? 'its older snapshot did not inspect ignored files' : (scratch ? null : before.incomplete) ?? seen.incomplete;
   // Only this invocation's explicit force authorizes discarding unseen contents. A failed
   // comparison is not proof of new work; without that authority it still protects the copy.
   if (uncertain) return { kept: discardUnseen ? null : { why: 'uncommitted work', text: !seen ? uncertain : `changes cannot be determined: ${uncertain}` }, leftovers: true, unseen: discardUnseen ? uncertain : null };
@@ -1822,11 +1877,11 @@ function checkWaitingCopy(task, before = task.copyToReturn?.left, { discardUnsee
   // JSON-parsed older snapshots have ordinary-object dictionaries. Copy their own keys
   // into prototype-free records before comparing, without changing the saved format.
   const beforeFiles = Object.assign(Object.create(null), before.files), beforeIgnored = Object.assign(Object.create(null), before.ignored);
-  const ignored = new Set([...Object.keys(beforeIgnored), ...Object.keys(seen.ignored)]);
+  const ignored = new Set(scratch ? [] : [...Object.keys(beforeIgnored), ...Object.keys(seen.ignored)]);
   const added = [...Object.keys(seen.files).filter(file => !Object.hasOwn(beforeFiles, file) || beforeFiles[file] !== seen.files[file]),
     ...[...ignored].filter(file => JSON.stringify(beforeIgnored[file]) !== JSON.stringify(seen.ignored[file]))];
   if (added.length) return { kept: { why: 'uncommitted work', text: `it has work written since finish (${listFiles(added)})` }, leftovers: true };
-  const started = seen.operations.filter(name => !(before.operations ?? []).includes(name));
+  const started = seen.operations.filter(name => scratch || !(before.operations ?? []).includes(name));
   if (started.length) return { kept: { why: 'operation in progress', text: `it has ${started.map(name => OPERATIONS[name]).join(' and ')} since finish` }, leftovers: true };
   const commits = commitsOnlyInCopy(task.worktree, before);
   if (commits.length) return { kept: { why: 'commits', text: `it has commits made since finish that no branch holds (${listFiles(commits.map(sha => sha.slice(0, 8)))})` }, leftovers: true };
@@ -1877,6 +1932,8 @@ function returnWaiting(h, task, { force = false } = {}) {
   const { copyToReturn, ...rest } = task, project = projectOf(h, task);
   // A new explicit force accepts what is here now, not work written during the stop/removal
   // it is about to retry. Keep the original durable baseline if more work appears meanwhile.
+  const scratch = !force && fs.existsSync(task.worktree) ? closedPrScratch(h, task) : null;
+  if (scratch?.why) return { state: 'kept', line: `the working copy of ${task.id} waits: ${scratch.why}` };
   const accepted = force ? snapshotCopy(task.worktree) : copyToReturn.left;
   if (copyToReturn.stopPending) {
     // The stop was requested but not confirmed. Reapply idle/busy protection before any
@@ -1905,10 +1962,10 @@ function returnWaiting(h, task, { force = false } = {}) {
   const holders = otherTerminalsIn(task.worktree, task.terminal);
   if (holders === null) return { state: 'silent', line: `${CORE_SILENT} the terminals in ${task.worktree}; the working copy of ${task.id} was kept. Try again.` };
   if (holders.length) return { state: 'held', line: `the working copy of ${task.id} is still held by ${describeHolders(holders, task.worktree)}; nothing was removed.` };
-  const check = checkWaitingCopy(task, accepted, { discardUnseen: force });
+  const check = checkWaitingCopy(task, accepted, { discardUnseen: force, scratch: Boolean(scratch) });
   if (check.kept) return { state: 'kept', line: `the working copy of finished task ${task.id} waits: ${check.kept.text}. ${force ? 'The copy changed during this forced attempt; stop writes to it before retrying force.' : `\`crew finish ${task.id} --force\` discards its present contents and returns the copy.`}` };
   // What is left was accepted at finish (or now): discarding it is what was asked.
-  const back = returnCopy(task, project, { force: check.leftovers });
+  const back = returnCopy(task, project, { force: check.leftovers, scratch });
   if (!back.ok) return { state: 'failed', line: `the working copy of ${task.id} was not returned yet: ${back.why}` };
   saveTask(h, { ...rest, copyReturned: now() });
   return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${check.unseen ? '; discarded unseen after explicit --force' : ''}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}` };
@@ -1942,12 +1999,15 @@ function cmdFinish(args) {
   if (fs.existsSync(task.worktree) && otherTerminalsIn(task.worktree, task.terminal) === null) refuse(`${CORE_SILENT} the terminals in ${task.worktree}; nothing was removed. Try again.`, 4);
   // Establish the accepted baseline first, and derive the protective refusal from it.
   // A separate earlier clean result must never authorize dirty work found by this snapshot.
-  const left = snapshotCopy(task.worktree);
+  const scratch = !force ? closedPrScratch(h, task) : null;
+  const left = snapshotCopy(task.worktree, { scratch: Boolean(scratch && !scratch.why) });
   const work = force ? { dirty: [], keep: false } : workInCopy(task, left);
   if (work.dirty === null) refuse(`Could not check ${task.worktree} for uncommitted work; nothing was removed. Pass --force to discard it unseen.`, 6);
   if (work.dirty.length) refuse(`Task ${id} has uncommitted work in ${task.worktree} (${listFiles(work.dirty)}). Nothing was removed. Commit it there, or pass --force to discard it.`, 6);
   // A copy marked to keep (the shared delivery workflow's marker) is not removed unasked.
+  if (scratch?.why) refuse(`Task ${id} has ${scratch.why}; nothing was removed.`, 6);
   if (work.keep) refuse(`Task ${id} is marked to keep by .artifacts/KEEP in ${task.worktree}. Nothing was removed. Delete the marker, or pass --force.`, 6);
+  if (scratch && left.operations.length) refuse(`Task ${id} has a protected Git operation or lock; nothing was removed.`, 6);
   let attempted = false, result;
   try { result = stopWorker(task, { force, onStop: () => { attempted = true; } }); }
   catch (error) {
@@ -1969,9 +2029,9 @@ function cmdFinish(args) {
   // leaving, including ignored files and scout scratch. Even force accepted only the pre-stop
   // contents. Known changes postpone return with the original baseline. An uninspectable
   // copy needs explicit discard-unseen authority; never infer that authority for a retry.
-  const comparison = reason ? null : checkWaitingCopy(waiting, left, { discardUnseen: force });
+  const comparison = reason ? null : checkWaitingCopy(waiting, left, { discardUnseen: force, scratch: Boolean(scratch) });
   reason ??= comparison?.kept?.text ?? null;
-  const back = reason ? null : returnCopy(task, project, { force });
+  const back = reason ? null : returnCopy(task, project, { force, scratch });
   reason ??= back && !back.ok ? back.why : null;
   forget();
   if (reason) {
@@ -2199,7 +2259,8 @@ function unpushedCommits(git, branch) {
   const listed = git('ls-remote', '--exit-code', '--heads', 'origin', branch);
   if (listed.code === 2) return null;
   if (listed.code !== 0 || git('fetch', '--quiet', 'origin', branch).code !== 0) return undefined;
-  return Number(git('rev-list', '--count', 'FETCH_HEAD..HEAD').stdout.trim()) || 0;
+  const count = git('rev-list', '--count', 'FETCH_HEAD..HEAD');
+  return count.code === 0 && /^\d+$/.test(count.stdout.trim()) ? Number(count.stdout.trim()) : undefined;
 }
 // "draft, 2 of 3 outcomes ticked" from one read of the pull request; null when GitHub does not answer.
 function pullRequestState(h, task, url) {
