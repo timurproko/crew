@@ -91,7 +91,9 @@ The coordinator's rules are the home's `AGENTS.md` (`CLAUDE.md` points at it), w
   space/tab labels. The agent starts with one instruction as its command-line argument
   ("read the brief…"), so nothing is typed into it.
 - **Report.** The worker writes `tasks/<id>/report.md` and runs `crew done` from its own
-  terminal.
+  terminal. Its brief directs proof pictures and scratch to that same external task folder,
+  not the working copy, and requires stopping disposable apps/servers it started before reporting.
+  The task folder is an explicit output exception to the working-copy-only project-edit rule.
   `crew wait` reads the task file once a second.
   Every few seconds it asks Core about ended terminals, missing agents, quota/login stops on non-working screens, provider errors, idle workers, and questions or permissions that need a person, as described under work under way below.
 - **Finish.** A worker still working is never closed without `--force`. A1 leaves through
@@ -393,7 +395,16 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
 - `crew review` and `crew tell` work the same way for a workflow project's implementation.
 
 For every kind, first land requires a reported worker, an existing copy, and clean tracked
-and untracked files, even when it only records a link. An already-landed PR can return early.
+and untracked files, even when it only records a link. An already-landed open PR can return early.
+Land records the PR link, landed timestamp and backlog completion before any merged-task
+cleanup, including a gate's PR URL resolved from its report. A workflow PR whose source
+branch was auto-deleted can still land when fresh merged-PR head/history proof covers the
+local head; branch absence alone never authorizes delivery. When land freshly verifies the
+task's exact PR merged, it uses finish's guarded cleanup, including on repeated land, without implicit force. Busy workers, protected work or unrelated
+terminals still prevent unsafe cleanup. Finish and merged-task land include one cleanup line
+saying which ignored roots or local changes/scratch were discarded, or `discarded none` when
+nothing was removed. A failed partial discard is identified as incomplete rather than reported
+as a successful return; reports and unmerged branches stay retained.
 
 ### Advisory review labels
 
@@ -627,7 +638,15 @@ per machine.
 
 ## Finish and other terminals
 
-`crew finish` hands a working copy back only when the task's own terminal was the only one in it. Handing a pool
+`crew finish` stops and removes every terminal recorded as started by crew for that task,
+not just the current worker: spawn, relaunch and automatic hand-over retain terminal history.
+Reviewers retain their own task's history; finishing a ship does not adopt its reviewer.
+Each owned worker keeps the idle/busy and graceful-exit checks, and unconfirmed stops or
+removals keep the copy pending for retry. Legacy records still own their recorded current
+terminal, without bulk migration or guessing missing historical addresses from labels.
+Crew never closes an unrecorded terminal based on its cwd or matching labels.
+
+`crew finish` hands a working copy back only after all of its owned terminals are gone and no foreign terminal holds it. Handing a pool
 slot back ends every process whose working folder is in the slot (treehouse does that so the next task gets a
 quiet folder), and on Windows a shell keeps the folder it was opened in even after `cd`. A terminal a person
 opened from a worker's tab, with their own agent in it, would be ended with the worker. So finish asks Core for
@@ -647,7 +666,21 @@ branch is dropped. A copy deleted by hand is pruned from git. A failed automatic
 reported but does not fail the triggering command. An explicit `crew finish <closed-id> --force`
 does refuse if Core is silent, a terminal holds the copy, or the return fails.
 
-Finish records changed and untracked file times and the keep marker before stopping. The
+For a ship whose exact PR is freshly proved merged or closed, finish treats Git-ignored
+untracked contents as disposable scratch only after checking repository, branch and head
+identity and publication. Tracked changes, non-ignored untracked files, unpushed commits,
+Git operations/locks and foreign terminals still protect the copy. A deleted remote branch
+is not proof by itself: its verified closed PR must hold the exact local head, or a merged
+PR's head or merge commit must contain it. This containment proof also permits a retained
+published source branch when there are zero unpushed commits. Closed but unmerged branches
+stay. This exception discards ignored KEEP markers, screenshots, sockets
+and nested probe repositories without reading their contents or following symlinks. It
+also applies on deferred return after rechecking safety; ignored-only changes do not hold
+an eligible copy indefinitely. After ignored cleanup, reflog history is checked again against
+the original accepted finish/retry snapshot, never a newer pre-clean observation. A new
+orphan commit remains protected even if HEAD was reset to its original value. Unknown or open PRs retain the existing KEEP/force rules.
+
+Outside that narrow exception, finish records changed and untracked file times and the keep marker before stopping. The
 non-forced ship refusal uses that same inspection, not an earlier clean result. Ignored
 entries get a stat-only walk, without following symlinks or reading contents. Each ignored
 root stores file count, newest modification time, total size and a metadata digest, so edits,
@@ -671,8 +704,8 @@ unanswered Core query. Unconfirmed worker stops and terminal removals are shown 
 never free; reading status never returns a copy. JSON's `copyToReturn` has `why`, `kept`,
 `pending` and `free`. Plain status ends with a count of waiting copies.
 
-Protective refusals come before stopping: uncommitted ship work, a failed work inspection,
-`.artifacts/KEEP`, a busy worker without `--force`, or an unanswered initial Core query leave
+Protective refusals come before stopping: uncommitted ship work, a failed protected-work inspection,
+`.artifacts/KEEP` outside the verified closed-PR scratch exception, a busy worker without `--force`, or an unanswered initial Core query leave
 the worker and copy intact. Before immediate return, the whole snapshot is compared after
 stopping and terminal removal, including ignored files and scout scratch, even with `--force`.
 Work written while leaving postpones return rather than refusing with the worker gone. A silent
