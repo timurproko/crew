@@ -24,7 +24,7 @@ The maintainer integration decision accepts these scenarios:
     "A project `.xrbuild` registers, lists, spawns and removes next to a project `xrbuild` under its exact name.",
     "Branch and working-copy names of a leading-dot project's tasks come from the task id, never the project name."
   ],
-  "archiveDigest": "2a254501f39181920dba1f304a02088d97b07e113ffc902da464a163bce578eb",
+  "archiveDigest": "a0fa7efe221d24c7dee01ab7e9ab57ef48b7f2ef755e531938e43ba3e4137e39",
   "specDigest": "b36e37dda65f11df5a351aa48131b010dc0fcb51a4352519f412029fcd5dc431",
   "tasksDigest": "f3854d91f2e4a011ed2179bb2ddb8784aacc634d40082242c95f6de8552f152f",
   "evidenceDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
