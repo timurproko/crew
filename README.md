@@ -117,10 +117,15 @@ Removal and `--replace` still refuse unfinished tasks and finished tasks with co
 to return; changing a path also requires `--replace`. Unreadable task references fail closed.
 
 Project names use 1–40 lowercase ASCII letters, digits, dashes and dots, starting with a
-letter or digit, with no consecutive dots or trailing dot. For example:
+letter or digit, or with one dot followed by one, with no consecutive dots or trailing dot.
+The 40 characters include a leading dot. A dot folder such as `.xrbuild` can then be
+registered next to the project `xrbuild`. Crew never puts a project name into a branch
+name or a plain working copy's name; a delivery copy is named by delivery after the
+repository folder. For example:
 
 ```bash
 crew project add agentnumberone.dev D:/Git/agentnumberone.dev
+crew project add .xrbuild D:/Git/xrbuild/.xrbuild
 crew spawn inspect-site --project agentnumberone.dev "Inspect the site."
 ```
 

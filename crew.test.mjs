@@ -786,8 +786,8 @@ gapTests['project-names'] = () => {
   const f = gapFixture('project-names'), name = 'agentnumberone.dev', repo = path.join(f.dir, name);
   git('clone', '-q', f.repo, repo);
   const settings = args => crew(args, { cwd: f.home });
-  for (const good of ['a', '0', 'a-', 'a.b', 'constructor', 'a'.repeat(38) + '.x', name]) assert.equal(projectNameError(good), null, good);
-  const invalid = [['', /required/], ['a'.repeat(41), /at most 40/], ['Bad', /start with/], ['-bad', /start with/], ['.bad', /start with/], ['a/b', /only lowercase/], ['a_b', /only lowercase/], ['a b', /only lowercase/], ['aé', /ASCII/], ['a..b', /consecutive dots/], ['a.', /trailing dot/]];
+  for (const good of ['a', '0', 'a-', 'a.b', 'constructor', 'a'.repeat(38) + '.x', '.bad', '.a', '.0', '.xrbuild', '.' + 'a'.repeat(39), name]) assert.equal(projectNameError(good), null, good);
+  const invalid = [['', /required/], ['a'.repeat(41), /at most 40/], ['Bad', /start with/], ['-bad', /start with/], ['.', /start with/], ['..a', /start with/], ['.-a', /start with/], ['.A', /start with/], ['.' + 'a'.repeat(40), /at most 40/], ['a/b', /only lowercase/], ['a_b', /only lowercase/], ['a b', /only lowercase/], ['aé', /ASCII/], ['a..b', /consecutive dots/], ['a.', /trailing dot/]];
   for (const [bad, reason] of invalid) {
     assert.match(projectNameError(bad), reason);
     for (const args of [['project', 'add', bad, repo], ['project', 'remove', bad], ['spawn', 'invalid-name', '--project', bad, 'Task'], ['agents', '--project', bad, '--json']]) {
@@ -826,6 +826,26 @@ gapTests['project-names'] = () => {
   assert.equal(settings(['project', 'add', name, f.repo, '--replace']).code, 0);
   assert.equal(settings(['project', 'remove', name]).code, 0); assert.ok(fs.existsSync(repo));
   assert.ok(settings(['project', 'list']).out.includes('agentnumberone-dev\t'));
+};
+gapTests['project-leading-dot'] = () => {
+  const f = gapFixture('project-leading-dot'), name = '.xrbuild', repo = path.join(f.dir, 'xrbuild', name);
+  git('clone', '-q', f.repo, repo);
+  const settings = args => crew(args, { cwd: f.home });
+  assert.equal(projectNameError('.x'), null); assert.match(projectNameError('.-x'), /one dot followed by one/);
+  assert.equal(settings(['project', 'add', 'xrbuild', f.repo, '--workflow', 'plain']).code, 0);
+  let r = settings(['project', 'add', name, repo, '--workflow', 'plain']); assert.equal(r.code, 0, r.out);
+  const list = settings(['project', 'list']).out;
+  assert.ok(list.includes(`${name}	${slash(repo)}	workflow plain`), list); assert.ok(list.includes(`xrbuild	${slash(f.repo)}	`), 'Dotted and plain names stay distinct');
+  r = f.call(['spawn', 'dot-lead', '--project', name, '--kind', 'ship', 'Task']); assert.equal(r.code, 0, r.out);
+  const t = f.task('dot-lead'); assert.equal(t.project, name); assert.equal(t.branch, 'feature/dot-lead');
+  assert.equal(git('-C', t.worktree, 'branch', '--show-current').trim(), t.branch);
+  assert.equal(path.basename(t.worktree), 'dot-lead');
+  for (const value of [t.branch, slash(t.worktree)]) assert.ok(!value.includes(name), `${value} must not contain the project name`);
+  for (const s of JSON.parse(f.call(['status', '--json']).out).tasks) assert.equal(s.project, name);
+  r = settings(['project', 'remove', name]); assert.equal(r.code, 2); assert.match(r.out, /unfinished tasks/);
+  setTerminal(t.terminal, { status: { app: 'pi', state: 'idle' } }); r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out);
+  r = settings(['project', 'remove', name]); assert.equal(r.code, 0, r.out); assert.ok(fs.existsSync(repo));
+  const after = settings(['project', 'list']).out; assert.ok(!after.includes(`${name}	`), after); assert.ok(after.includes('xrbuild	'), after);
 };
 gapTests['project-pool'] = () => {
   const f = gapFixture('project-pool'), name = 'agentnumberone.dev', repo = path.join(f.dir, name);
