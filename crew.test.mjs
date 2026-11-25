@@ -618,14 +618,15 @@ if (pr.down) process.exit(1);
 if (process.argv.includes('graphql')) console.log(JSON.stringify({data:{repository:{nameWithOwner:'acme/demo',pullRequests:{totalCount:1},pullRequest:pr}}}));
 else console.log(JSON.stringify(pr.state === 'MERGED' ? [pr] : []));`);
   const call = (args, env = {}) => f.call(args, { CREW_GH: gh, ...env });
-  const spawn = id => {
+  const spawn = (id, { recordPr = true } = {}) => {
     const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']);
     const head = commit(t.worktree, { 'change.txt': id }, 'work');
     git('-C', t.worktree, 'push', '-q', 'origin', `HEAD:${t.branch}`);
     const pr = { url: 'https://github.com/acme/demo/pull/12', state: 'MERGED', headRefOid: head, headRefName: t.branch,
       headRepository: { nameWithOwner: 'acme/demo' }, mergedAt: '2026-01-01T00:00:00Z', closedAt: '2026-01-01T00:00:00Z' };
     fs.writeFileSync(control, JSON.stringify(pr));
-    f.save({ ...t, state: 'reported', pr: pr.url });
+    fs.writeFileSync(t.report, `Implementation: ${pr.url}\n`);
+    f.save({ ...t, state: 'reported', ...(recordPr ? { pr: pr.url } : {}) });
     fs.mkdirSync(path.join(t.worktree, '.artifacts')); fs.writeFileSync(path.join(t.worktree, '.artifacts', 'KEEP'), '');
     fs.writeFileSync(path.join(t.worktree, '.artifacts', 'proof.png'), 'picture');
     return t;
@@ -805,6 +806,38 @@ gapTests['merged-land-summary'] = () => {
   assert.equal(readWorld().terminals[open.terminal].state, 'live'); assert.ok(fs.existsSync(path.join(open.worktree, '.artifacts', 'KEEP')));
   const empty = f.spawn('empty'); fs.rmSync(path.join(empty.worktree, '.artifacts'), { recursive: true });
   r = f.call(['finish', empty.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /discarded none/);
+};
+gapTests['merged-land-bookkeeping'] = () => {
+  const f = leftoversFixture('land-bookkeeping'), backlog = path.join(f.home, 'backlog.md'), tasks = path.join(f.dir, 'tasks.mjs'), moves = path.join(f.dir, 'moves.json');
+  fs.writeFileSync(moves, '[]');
+  fs.writeFileSync(tasks, `import fs from 'node:fs'; const a=process.argv.slice(2), id=a[1], file=a[a.indexOf('--file')+1], url=a[a.indexOf('--pr')+1];
+const t=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+id+'/task.json'));
+const world=JSON.parse(fs.readFileSync(${JSON.stringify(world)}));
+fs.writeFileSync(${JSON.stringify(moves)},JSON.stringify([...JSON.parse(fs.readFileSync(${JSON.stringify(moves)})),{id,pr:t.pr,landed:t.landed,live:world.terminals[t.terminal]?.state==='live',copy:fs.existsSync(t.worktree+'/.git')}]));
+fs.writeFileSync(file,fs.readFileSync(file,'utf8').replace('- [ ] '+id+' - work (in flight)','- [x] '+id+' - work (done '+url+')'));
+console.log('ok: done '+id+' -> Done');`);
+  for (const kind of ['workflow', 'gate']) for (const state of ['MERGED', 'OPEN']) {
+    const id = `${kind}-${state.toLowerCase()}`, t = f.spawn(id, { recordPr: kind !== 'gate' }), url = 'https://github.com/acme/demo/pull/12';
+    f.pr({ state }); fs.writeFileSync(t.report, `Implementation: ${url}\n`);
+    f.save({ ...f.task(id), ...(kind === 'workflow' ? { workflow: 'delivery', stage: 'implementation' } : { gate: 'no-mistakes' }) });
+    assert.equal(f.task(id).landed, undefined);
+    if (kind === 'gate') assert.equal(f.task(id).pr, undefined, 'Normal gate reporting keeps its URL only in the report');
+    fs.writeFileSync(backlog, `- [ ] ${id} - work (in flight)\n`);
+    const before = JSON.parse(fs.readFileSync(moves)).length;
+    let r = f.call(['land', id], { CREW_TOOL_TASKS_AXI: tasks }); assert.equal(r.code, 0, r.out);
+    const saved = f.task(id); assert.ok(saved.landed, 'First land is recorded before merged cleanup'); assert.equal(saved.pr, url);
+    assert.equal(fs.readFileSync(backlog, 'utf8'), `- [x] ${id} - work (done ${url})\n`);
+    const moved = JSON.parse(fs.readFileSync(moves)); assert.equal(moved.length, before + 1);
+    assert.deepEqual(moved.at(-1), { id, pr: url, landed: saved.landed, live: true, copy: true }, 'Bookkeeping must precede terminal/copy cleanup');
+    if (state === 'MERGED') {
+      assert.equal(saved.state, 'closed'); assert.ok(!readWorld().terminals[t.terminal]); assert.ok(!fs.existsSync(t.worktree));
+      assert.match(r.out, /discarded ignored scratch/); assert.ok(r.out.indexOf('backlog: done') < r.out.indexOf('finished '), r.out);
+    } else {
+      assert.equal(saved.state, 'reported'); assert.equal(readWorld().terminals[t.terminal].state, 'live'); assert.ok(fs.existsSync(path.join(t.worktree, '.artifacts', 'KEEP')));
+    }
+    r = f.call(['land', id], { CREW_TOOL_TASKS_AXI: tasks }); assert.equal(r.code, 0, r.out);
+    assert.equal(JSON.parse(fs.readFileSync(moves)).length, before + 1, 'Repeated land does not repeat backlog completion');
+  }
 };
 gapTests['closed-delivery'] = () => {
   const f = leftoversFixture('delivery'), tool = path.join(f.dir, 'delivery.mjs'), control = path.join(f.dir, 'delivery-down');

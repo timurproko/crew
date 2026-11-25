@@ -2389,7 +2389,6 @@ function cmdLand(args) {
   if (dirty.code !== 0 || dirty.stdout.trim()) no(`its working copy has uncommitted files (${dirty.stdout.trim().split(/\r?\n/).slice(0, 5).map(l => l.slice(3)).join(', ')}). Tell the worker to commit them: crew tell ${id} "..."`);
   // Keep first-land local refusals ahead of GitHub reads and cleanup.
   if (task.workflow && task.stage === 'plan') no(`its last report is a plan awaiting approval, not an implementation. Read the plan, then: crew tell ${id} "approved, implement", or send it back with what to change.`);
-  if (finishMergedTask(h, task)) return;
   const remote = git('remote', 'get-url', 'origin');
   if (task.gate === 'no-mistakes') {
     // The gate reviewed, pushed and opened the pull request while the worker drove it; what
@@ -2399,6 +2398,7 @@ function cmdLand(args) {
     saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
     console.log(`delivered ${id} through no-mistakes: ${found}. Merging it is the person's decision.`);
     backlogMove(h, id, 'done', ['--pr', found]);
+    finishMergedTask(h, loadTask(h, id));
     return;
   }
   if (task.workflow) {
@@ -2416,6 +2416,7 @@ function cmdLand(args) {
     const shown = pullRequestState(h, task, found);
     console.log(`delivered ${id}: ${found}${shown ? ` (${shown})` : ''}. It follows the repository's delivery workflow: its bot marks it ready; merging is the person's decision.`);
     backlogMove(h, id, 'done', ['--pr', found]);
+    finishMergedTask(h, loadTask(h, id));
     return;
   }
   if (remote.code !== 0) no(`the project has no \`origin\` to push to. The work stays on branch ${branchOf(task)} in ${project.path}.`);
@@ -2443,6 +2444,7 @@ function cmdLand(args) {
   reviewLabels(h, id, 'check');
   console.log(`delivered ${id}: ${url} (against ${base}, ${subjects.length} commit${subjects.length === 1 ? '' : 's'}). Merging it is the person's decision.`);
   backlogMove(h, id, 'done', ['--pr', url]);
+  finishMergedTask(h, loadTask(h, id));
 }
 
 function githubEnvironment(remote) {
