@@ -65,7 +65,18 @@ fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
 fs.writeFileSync(fake, `
 import fs from 'node:fs';
 const file = ${JSON.stringify(world)}, w = JSON.parse(fs.readFileSync(file, 'utf8')), a = process.argv.slice(2);
-w.log.push(a); const save = () => fs.writeFileSync(file, JSON.stringify(w));
+w.log.push(a); const save = () => {
+  // Readers in race tests must see one complete fake-Core snapshot, not a truncate/write.
+  const tmp = file + '.' + process.pid + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(w));
+  const deadline = Date.now() + 1000;
+  for (;;) {
+    try { fs.renameSync(tmp, file); return; }
+    catch (error) {
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || Date.now() >= deadline) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+  }
+};
 if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forEach((v, i) => { if (v === '--label') { const [k, ...r] = a[i + 1].split('='); labels[k] = r.join('='); } });
   w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; save(); console.log(JSON.stringify({ address })); }
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
