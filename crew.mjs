@@ -2362,7 +2362,7 @@ function cmdReview(args) {
   if (!AGENTS[legacy]) refuse(`Unknown agent: ${legacy}. Known: ${Object.keys(AGENTS).join(', ')}`);
   let n = 1, reviewId = `${id}-review`.slice(0, 40);
   while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
-  const reviewHead = reviewHeadOf(task), target = reviewHead ?? branchOf(task);
+  const reviewHead = pullRequestReviewHead(task), target = reviewHead ?? branchOf(task);
   const text = [
     `Review the work of task ${id}. It is the branch \`${branchOf(task)}\` of this repository; you are on the commit it started from.`,
     '', `- Review the fixed head \`${target}\` with \`git log HEAD..${target}\` and \`git diff HEAD...${target}\`. Read the changed files whole where the diff is not enough.`,
@@ -2383,6 +2383,42 @@ const gh = (args, options) => (GH.endsWith('.mjs') ? run(process.execPath, [GH, 
 function reviewHeadOf(task) {
   const r = run('git', ['-C', task.worktree, 'rev-parse', branchOf(task)], { timeout: 2000 });
   return r.code === 0 && /^[a-f0-9]{40,64}$/.test(r.stdout.trim()) ? r.stdout.trim() : null;
+}
+// An open pull request is reviewed at its own head: in a delivery-workflow repository a bot
+// pushes after the worker, so the local branch can be behind it. The ship copy is
+// fast-forwarded to that head; a copy that cannot be is refused. Without a readable open
+// pull request the local head is reviewed, and the staleness rule judges it later.
+function pullRequestReviewHead(task) {
+  const local = reviewHeadOf(task);
+  const first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
+  let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr;
+  if (!url) {
+    const found = gh(['pr', 'view', branchOf(task), '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 2000 });
+    if (found.code !== 0) return local;
+    url = found.stdout.trim();
+  }
+  const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pulls?\/(\d+)\/?$/.exec(url);
+  if (!m) return local;
+  const read = gh(['api', '--hostname', m[1], '--method', 'GET', `repos/${m[2]}/${m[3]}/pulls/${m[4]}`], { timeout: 2000 });
+  let pr = null;
+  try { if (read.code === 0) pr = JSON.parse(read.stdout); } catch { /* unreadable: review the local head */ }
+  const head = pr?.head?.sha;
+  if (pr?.state !== 'open' || pr.merged_at || typeof head !== 'string' || !/^[a-f0-9]{40,64}$/.test(head) || head === local) return local;
+  const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 60000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+  const where = `The pull request ${url} is at ${head.slice(0, 12)} but the ship copy ${task.worktree} (branch ${branchOf(task)}) is at ${local?.slice(0, 12) ?? 'an unreadable head'}`;
+  if (!local) refuse(`${where}; nothing was reviewed.`);
+  if (git('cat-file', '-e', `${head}^{commit}`).code !== 0) {
+    const fetched = git('fetch', '--quiet', 'origin', `refs/pull/${m[4]}/head`);
+    if (git('cat-file', '-e', `${head}^{commit}`).code !== 0) refuse(`${where}, and its head could not be fetched: ${lastLine(fetched.stderr || fetched.stdout) || 'not found on origin'}. Nothing was reviewed.`);
+  }
+  if (git('merge-base', '--is-ancestor', local, head).code === 0) {
+    const merged = git('merge', '--ff-only', '--quiet', head);
+    if (merged.code !== 0 || reviewHeadOf(task) !== head) refuse(`${where}; the local copy is behind and could not be fast-forwarded: ${lastLine(merged.stderr || merged.stdout) || 'the branch is not checked out there'}. Nothing was reviewed.`);
+    console.log(`crew: fast-forwarded ${branchOf(task)} in the ship copy to the pull request head ${head.slice(0, 12)}`);
+    return head;
+  }
+  const ahead = git('merge-base', '--is-ancestor', head, local).code === 0;
+  refuse(`${where}; the local copy is ${ahead ? 'ahead of the pull request: push it first' : 'diverged from the pull request: reconcile them first'}. Nothing was reviewed.`);
 }
 function staleApproval(id) {
   console.log(`crew: ${id}: approval is for an older head (or its head could not be verified); task needs another review`);

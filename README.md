@@ -433,7 +433,12 @@ Workflow, gate and plain projects use the same hooks; Plan reports skip label op
 Plain branches without a PR at review time still record review evidence, but skip labels.
 Status remains read-only.
 
-Reviewers are given a fixed branch-head SHA, recorded as `reviewHead`. A valid verdict records
+Reviewers are given a fixed branch-head SHA, recorded as `reviewHead`. When the task has an
+open PR, that SHA is the PR's head, not the local branch: a delivery bot may push a
+finalization commit after the worker. Before launching, `crew review` fetches that head
+(`refs/pull/<n>/head` from `origin`) and fast-forwards the ship copy to it; when the copy is
+ahead of the PR, diverged from it, or cannot be fast-forwarded, the review is refused and
+nothing is launched. Without a readable open PR the local head is reviewed. A valid verdict records
 `reviewVerdict` on both the reviewer and ship task: verdict, reviewed `head`, observed
 `currentHead`, `stale`, `needsReview`, timestamp and reviewer ID (and PR link when known).
 For a PR, that same state read supplies its current head. An `APPROVE` for a different or
