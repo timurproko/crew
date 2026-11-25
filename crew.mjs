@@ -395,6 +395,55 @@ function requireOwner(h, operation = 'control work in this home') {
   refuse(`This session does not hold crew home ${slash(h.dir)}. Run \`crew start\` first to ${operation}.`, 3);
 }
 
+// Account identity is the owner's verified *current session*, never the launch hint or
+// ~/.claude.json (the engine can rewrite that from stale memory after a switch).
+const EMAIL = /^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+const accountEmail = value => typeof value === 'string' && value.trim().length <= 100 && EMAIL.test(value.trim()) ? value.trim().toLowerCase() : null;
+export function coordinatorIdentity(owner, { env = process.env, core, time = Date.now() } = {}) {
+  const mine = owner?.terminal && owner.terminal === (env.CREW_TERMINAL || env.HC_TERMINAL_ID);
+  const configDir = mine && env.CLAUDE_CONFIG_DIR ? path.resolve(env.CLAUDE_CONFIG_DIR) : owner?.coordinator?.configDir ?? null;
+  const result = { terminal: owner?.terminal ?? null, harness: null, account: null, status: 'unknown', source: null, reason: 'no home owner', configDir, observedAt: null };
+  const unknown = reason => ({ ...result, reason });
+  if (!owner?.terminal) return unknown('no home owner');
+  const seen = core ?? probe(owner.terminal);
+  if (['absent', 'finished'].includes(seen.state)) return unknown('owner terminal is not live');
+  const app = String(seen.t?.status?.app ?? seen.t?.agent ?? '').split(/[\\/]/).pop().replace(/\.exe$/i, '').toLowerCase();
+  if (['a1', 'pi', 'codex'].includes(app)) return { ...result, harness: app, status: 'non-claude', source: 'core', reason: `${app} is not a Claude coordinator`, configDir: null };
+  if (['claude', 'claude-code'].includes(app)) result.harness = 'claude';
+  const fresh = at => Number.isFinite(at) && time - at <= 60000 && at <= time + 5000;
+  const reports = [], labels = seen.t?.labels ?? {}, labelAt = Number(labels['custom.claude.at']);
+  if (seen.state === 'live' && labels['custom.claude.session'] && fresh(labelAt)) {
+    const state = labels['custom.claude.state'], account = accountEmail(labels['custom.claude.email']);
+    reports.push({ at: labelAt, account: ['ok', 'mismatch'].includes(state) ? account : null,
+      source: 'owner-terminal', reason: state === 'switching' ? 'account switch is in progress' : 'owner terminal has no verified Claude account' });
+  }
+  let marker = null;
+  if (configDir) {
+    marker = readJson(path.join(configDir, 'account-switcher-session.json'));
+    const status = readJson(path.join(configDir, 'account-switcher-status.json'));
+    if (status?.isolated === true && fresh(status.at)) {
+      reports.push({ at: status.at, account: ['ok', 'mismatch'].includes(status.state) && status.expiresAt > time ? accountEmail(status.apiEmail) : null,
+        source: 'session-status', reason: 'session has no verified current Claude account' });
+    }
+  }
+  if (!reports.length) return unknown('no fresh verified owner-session metadata');
+  const verified = reports.filter(r => r.account), latest = reports.reduce((a, b) => a.at > b.at ? a : b);
+  if (!verified.length) return unknown(latest.reason);
+  const best = verified.reduce((a, b) => a.at > b.at ? a : b);
+  if (reports.some(r => !r.account && r.at >= best.at)) return unknown(latest.reason);
+  if (Number.isFinite(marker?.at) && marker.at > best.at) return unknown('account selection is newer than verification');
+  if (new Set(verified.map(r => r.account)).size > 1) return unknown('owner-session identity reports disagree');
+  return { ...result, harness: 'claude', account: best.account, status: 'known', source: best.source, reason: null, observedAt: best.at };
+}
+function currentCoordinator(h) {
+  const owner = readJson(h.owner), identity = coordinatorIdentity(owner);
+  // Inspectors never write, and a replaced owner must not inherit this observation.
+  if (owner?.terminal === me() && JSON.stringify(readJson(h.owner)) === JSON.stringify(owner)) {
+    writeJson(h.owner, { ...owner, coordinator: identity });
+  }
+  return identity;
+}
+
 // --- Claude Code folder trust ---------------------------------------------------
 // Claude Code asks "do you trust this folder?" for every new path whose project carries
 // Claude settings, and a worker's copy is always a new path, so every Claude worker would
@@ -675,7 +724,8 @@ function cmdStart() {
   const { owner, live, unknown } = ownerState(h);
   if (owner && unknown && owner.terminal !== mine) refuse(`${CORE_SILENT} the owner terminal ${owner.terminal}, so crew home ${slash(h.dir)} was not taken over. Try again.`, 4);
   if (owner && live && owner.terminal !== mine) refuse(ownershipRefusal(h, owner, 'take ownership of this home'), 3);
-  writeJson(h.owner, { terminal: mine, since: now(), previous: owner && owner.terminal !== mine ? owner.terminal : undefined });
+  const nextOwner = { terminal: mine, since: now(), previous: owner && owner.terminal !== mine ? owner.terminal : undefined };
+  writeJson(h.owner, { ...nextOwner, coordinator: coordinatorIdentity(nextOwner) });
   // The rules file belongs to the tool: a newer crew may have changed what a coordinator does.
   const rules = path.join(h.coordinator, 'AGENTS.md');
   if (fs.existsSync(rules) && fs.readFileSync(rules, 'utf8') !== COORDINATOR_RULES) {
@@ -833,6 +883,7 @@ function claudeAccounts(env = process.env) {
 // the configured chain follows it as its fallback; `--no-fallback` keeps only the first.
 // `legacy` is the agent crew used before there was any configuration.
 function workChain(h, role, flags, legacy, project = null, env = process.env) {
+  const coordinator = currentCoordinator(h);
   const config = dispatchConfig(h), own = ownEntry(config.projects, project) ?? null;
   // The project's own list comes before the general one, a role's list before a default.
   const [configured, from] = own?.roles[role]?.length ? [own.roles[role], `projects.${project}.roles.${role}`] : own?.default.length ? [own.default, `projects.${project}`]
@@ -857,7 +908,7 @@ function workChain(h, role, flags, legacy, project = null, env = process.env) {
     const each = profile.harness === 'claude' && !profile.account && accounts.length ? accounts.map(account => ({ ...profile, account })) : [profile];
     for (const c of each) { if (!seen.has(pickKey(c))) { seen.add(pickKey(c)); candidates.push(c); } }
   }
-  return { candidates, config, source: flags.rule !== undefined ? `rule ${flags.rule}` : named ? 'named' : from };
+  return { candidates, config, coordinator, source: flags.rule !== undefined ? `rule ${flags.rule}` : named ? 'named' : from };
 }
 
 // The provider an A1 or Pi profile without a model spends from: the agent's own saved default.

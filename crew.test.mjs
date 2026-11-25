@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -97,7 +97,7 @@ fs.mkdirSync(fakeUser);
 const claudeConfig = path.join(root, 'claude.json');
 fs.writeFileSync(claudeConfig, JSON.stringify({ theme: 'dark', projects: { 'C:/mine': { hasTrustDialogAccepted: true, history: [1] } } }));
 function crew(args, { terminal, cwd = homeDir, env: extra = {}, script = path.join(here, 'crew.mjs') } = {}) {
-  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '',
+  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '', CLAUDE_CONFIG_DIR: '', CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '',
     // No tool of the machine the suite runs on is seen, unless a test names a fake one.
     CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...extra };
   delete env.CREW_HOME;
@@ -122,6 +122,66 @@ console.log = () => { throw new TypeError('injected project list failure'); }; m
 
 // Run a focused regression with --gaps=ignored (or all new regressions with --gaps).
 const gapTests = {};
+function identityFixture(name) {
+  const dir = path.join(root, `identity-${name}`), home = path.join(dir, 'home'), session = path.join(dir, 'session'), inspector = path.join(dir, 'inspector'), owner = `identity-${name}`;
+  fs.mkdirSync(session, { recursive: true }); fs.mkdirSync(inspector);
+  const write = (file, value, folder = session) => fs.writeFileSync(path.join(folder, file), JSON.stringify(value));
+  const status = (email, patch = {}, folder = session) => write('account-switcher-status.json', { email: 'stale@example.test', isolated: true, state: 'ok', apiEmail: email, at: Date.now(), expiresAt: Date.now() + 3600000, ...patch }, folder);
+  const labels = (email, patch = {}) => ({ 'custom.claude.email': email, 'custom.claude.state': 'ok', 'custom.claude.at': String(Date.now()), 'custom.claude.session': 'fake-process-instance', ...patch });
+  const w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', status: { app: 'claude-code', state: 'working' }, labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+  const env = { CLAUDE_CONFIG_DIR: session, CREW_CLAUDE_ACCOUNT: 'launch@example.test', CREW_WORKTREES: path.join(dir, 'copies') };
+  const call = (args, extra = {}, terminal = owner) => crew(args, { cwd: home, terminal, env: { ...env, ...extra } });
+  let r = call(['init', home]); assert.equal(r.code, 0, r.out);
+  const ownerFile = path.join(home, 'owner.json');
+  return { dir, home, session, inspector, owner, ownerFile, env, call, write, status, labels, record: () => JSON.parse(fs.readFileSync(ownerFile, 'utf8')) };
+}
+gapTests['coordinator-identity'] = () => {
+  const f = identityFixture('authority');
+  f.status('ONE@EXAMPLE.TEST');
+  f.write('account-switcher-session.json', { email: 'one@example.test', at: Date.now() - 1000 });
+  // These are deliberately unusable. Detection must not parse or change credentials/config.
+  fs.writeFileSync(path.join(f.session, '.credentials.json'), 'not credentials');
+  fs.writeFileSync(path.join(f.session, '.claude.json'), '{"oauthAccount":{"emailAddress":"stale@example.test"}}');
+  let r = f.call(['start']); assert.equal(r.code, 0, r.out);
+  let saved = f.record(); assert.equal(saved.terminal, f.owner); assert.ok(saved.since);
+  assert.equal(saved.coordinator.account, 'one@example.test'); assert.equal(saved.coordinator.source, 'session-status');
+  assert.equal(saved.coordinator.configDir, f.session);
+  f.status('two@example.test', { state: 'mismatch' });
+  r = f.call(['agents', '--json']); assert.equal(r.code, 0, r.out); JSON.parse(r.out);
+  assert.equal(f.record().coordinator.account, 'two@example.test', 'A new selection rereads session metadata');
+  assert.equal(f.record().since, saved.since);
+  assert.equal(fs.readFileSync(path.join(f.session, '.credentials.json'), 'utf8'), 'not credentials');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.session, '.claude.json'), 'utf8')).oauthAccount.emailAddress, 'stale@example.test');
+  f.status('inspector@example.test', {}, f.inspector);
+  const before = fs.readFileSync(f.ownerFile, 'utf8');
+  r = f.call(['agents', '--json'], { CLAUDE_CONFIG_DIR: f.inspector }, 'other'); assert.equal(r.code, 0, r.out);
+  assert.equal(fs.readFileSync(f.ownerFile, 'utf8'), before, 'Inspection cannot rewrite the owner');
+  const time = Date.now(), owner = f.record(), core = { state: 'live', t: { status: { app: 'claude-code' }, labels: {} } };
+  const detect = (patch = {}, env = {}) => coordinatorIdentity(owner, { time, env, core: patch });
+  assert.equal(coordinatorIdentity(owner, { time, env: { CREW_TERMINAL: 'other', CLAUDE_CONFIG_DIR: f.inspector }, core }).account, 'two@example.test');
+  assert.equal(coordinatorIdentity(null, { time, env: f.env, core }).status, 'unknown');
+  for (const app of ['a1', 'pi', 'codex']) assert.equal(detect({ ...core, t: { status: { app }, labels: f.labels('one@example.test') } }).status, 'non-claude');
+  for (const state of ['absent', 'finished']) assert.equal(detect({ state }).status, 'unknown');
+  for (const patch of [{ at: time - 60001 }, { at: time + 5001 }, { state: 'unknown' }, { state: 'unavailable' }, { isolated: false }, { apiEmail: 'not an email' }, { expiresAt: time - 1 }]) {
+    f.status('one@example.test', { at: time, ...patch });
+    assert.equal(coordinatorIdentity(owner, { time, env: {}, core }).status, 'unknown', JSON.stringify(patch));
+  }
+  fs.writeFileSync(path.join(f.session, 'account-switcher-status.json'), '{broken');
+  assert.equal(coordinatorIdentity(owner, { time, env: {}, core }).status, 'unknown');
+  f.status('one@example.test', { at: time });
+  const withLabels = labels => ({ ...core, t: { ...core.t, labels } });
+  assert.equal(detect(withLabels(f.labels('other@example.test', { 'custom.claude.at': String(time) }))).status, 'unknown', 'Conflicting fresh verification is not guessed through');
+  assert.equal(detect(withLabels(f.labels('one@example.test', { 'custom.claude.state': 'switching', 'custom.claude.at': String(time) }))).status, 'unknown');
+  f.write('account-switcher-session.json', { email: 'two@example.test', at: time + 1 });
+  assert.equal(coordinatorIdentity(owner, { time, env: {}, core }).status, 'unknown', 'New intent invalidates old confirmation');
+  f.write('account-switcher-session.json', { email: 'two@example.test', at: time - 1 });
+  const oldOwner = { terminal: f.owner, since: saved.since };
+  const verified = coordinatorIdentity(oldOwner, { time, env: {}, core: withLabels(f.labels('API@EXAMPLE.TEST', { 'custom.claude.at': String(time), 'custom.claude.state': 'mismatch' })) });
+  assert.equal(verified.account, 'api@example.test'); assert.equal(verified.source, 'owner-terminal');
+  assert.equal(coordinatorIdentity(oldOwner, { time, env: { CREW_CLAUDE_ACCOUNT: 'hint@example.test' }, core }).status, 'unknown', 'Hints alone are not identity');
+  const log = readWorld().log;
+  assert.ok(!log.some(a => ['send', 'kill'].includes(a[0]) && a.includes(f.owner)), 'No coordinator input or process mutation');
+};
 gapTests['repair-scope'] = () => {
   for (const file of ['crew.mjs', 'crew.test.mjs', 'README.md', 'bin/crew', 'bin/crew.cmd', 'docs/guide.md']) assert.ok(repairFile(file), file);
   for (const file of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', 'package.json', 'scripts/build.mjs', 'LICENSE', '.gitignore', '.gitattributes', 'openspec/specs/tool-maintenance/spec.md', 'crew/crew.mjs', 'other.mjs', 'bin-other/file']) assert.ok(!repairFile(file), file);

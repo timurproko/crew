@@ -2,9 +2,9 @@
 
 ## 1. Coordinator identity is recorded and refreshed from the owner's verified session metadata
 
-- [ ] 1.1 Add the conservative owner-bound identity resolver and persist non-secret source metadata at crew start; fake-Core/disposable-home tests prove owner binding, preserved owner fields and no credential or session mutations.
-- [ ] 1.2 Re-read verified status/labels before new selection, reject stale or transitioning evidence and positively identify non-Claude owners; targeted fixtures prove picker changes, API mismatch precedence, stale launch hints, missing/corrupt sources, older owner records and inspector isolation.
-- [ ] 1.3 Document identity authority, the 60-second freshness policy and unknown/non-Claude fallback in README; examples agree with resolver fixtures and no live home is edited.
+- [x] 1.1 Add the conservative owner-bound identity resolver and persist non-secret source metadata at crew start; fake-Core/disposable-home tests prove owner binding, preserved owner fields and no credential or session mutations.
+- [x] 1.2 Re-read verified status/labels before new selection, reject stale or transitioning evidence and positively identify non-Claude owners; targeted fixtures prove picker changes, API mismatch precedence, stale launch hints, missing/corrupt sources, older owner records and inspector isolation.
+- [x] 1.3 Document identity authority, the 60-second freshness policy and unknown/non-Claude fallback in README; examples agree with resolver fixtures and no live home is edited.
 
 ## 2. Coordinator policies resolve isolated worker lists and agents explains the selected account and source
 

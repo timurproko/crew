@@ -261,6 +261,23 @@ Claude profile.
   `crew status --json` also includes `nudges` history, the worker's `continuations` count, and its active `recovery` record.
   Both status forms only read; they never send recovery messages.
 
+### Coordinator identity
+
+`crew start` records the owner terminal and non-secret identity/source metadata in
+`owner.json`. New worker selection re-reads that owner's account-switcher metadata, so
+changing the coordinator's account in the session picker takes effect without restarting
+crew. An inspector's own account never substitutes for the owner's.
+
+The authority is the switcher's API-verified identity: fresh `custom.claude.*` labels
+on the owner terminal or `account-switcher-status.json` in its private `CLAUDE_CONFIG_DIR`.
+Reports must be at most 60 seconds old (up to five seconds of future clock skew); switching,
+conflicting, logged-out or unverified reports are unknown. The launch environment's
+`CREW_CLAUDE_ACCOUNT`, the selected-account marker and `.claude.json` alone are not proof:
+they can describe the launch login, an unconfirmed choice or stale engine memory. Crew
+never reads credentials or switches the coordinator's login to discover its identity.
+Non-Claude coordinators (a1/Codex and pi), cloud/unverifiable sessions and unknown accounts
+use the global dispatch policy rather than guessing another account.
+
 ## Delivering a code change
 
 How a ship task is delivered depends on the project. There are three kinds, and the kind is
