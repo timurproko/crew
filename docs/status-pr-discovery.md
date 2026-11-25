@@ -96,8 +96,9 @@ preserve current task lifecycle fields and do not change `updated`; cache-write 
 never fail status. Observation saves never wait for a task lock, skip when lifecycle work
 is pending, and abandon Windows sharing-error replacement retries so lifecycle commands
 take priority. An already-started atomic replacement cannot be preempted: lifecycle
-writers allow two seconds total to acquire their intent/task locks, covering the supported
-one-second replacement retry window plus scheduling margin. Exhausted contention returns
+writers normally allow two seconds total to acquire their intent/task locks, covering the
+supported one-second replacement retry window plus scheduling margin. `crew done` allows
+30 seconds so a replacement worker can report while relaunch is still publishing its terminal. Exhausted contention returns
 retryable exit 6 with `task-busy:` rather than an internal-error exit 70; locks are never
 stolen. Retry after the writer finishes, and do not remove a lock while its writer may
 still be running. Missing/failed reads do not invent closure or erase usable facts.
@@ -176,8 +177,12 @@ with the same proof query where applicable; finish uses an exact URL for branch 
 only when the supported project origin matches that URL's repository, otherwise retaining
 its existing project-context branch lookup. Missing or foreign PRs never authorize branch deletion.
 
-Fleet never reads task prose or copy-return state and never probes individual worker
-terminals. The home owner's liveness is still checked. Its derived version-1 index at
+Fleet never reads task prose or copy-return state. The home owner's liveness is still
+checked. The sole worker-probe exception is a task with the exact older wait/relaunch
+terminal-ended failure: Core may prove one live worker with the same task/home labels
+and working-copy root, yielding a working view with its current terminal. Ambiguous or
+unanswered checks retain the failure. This projection does not rewrite the task; the
+replacement's `crew done` persists its correct terminal. Its derived version-1 index at
 `<home>/state/status-fleet-index.json` stores only small state summaries. Every invocation
 checks task IDs and file identity/size/mtime/ctime, reloading changed source files; deleted
 or unreadable sources cannot be resurrected by an old summary. Missing/invalid indexes

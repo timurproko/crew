@@ -723,6 +723,150 @@ console.log(JSON.stringify({providers: families.map(provider => q[provider] === 
   assert.equal(f.call(['finish', task.id, '--force']).code, 0);
 };
 
+gapTests['wait-relaunch'] = async () => {
+  const f = gapFixture('wait-relaunch'), task = f.spawn('racing', ['--agent', 'pi']);
+  const bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
+  setTerminal(task.terminal, { status: { state: 'working', app: 'pi' } });
+  const ready = path.join(f.dir, 'ready'), release = path.join(f.dir, 'release'), script = path.join(f.dir, 'wait.mjs');
+  // Stop after wait has loaded the OLD task, before Core answers its terminal probe.
+  fs.writeFileSync(script, `import fs from 'node:fs'; import cp from 'node:child_process'; import { syncBuiltinESMExports } from 'node:module';
+const original = cp.spawnSync; let paused = false;
+cp.spawnSync = function(command, args, options) {
+ if (!paused && args[0] === ${JSON.stringify(fake)} && args[1] === 'get' && args.at(-1) === ${JSON.stringify(task.terminal)}) {
+  paused = true; fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
+  while (!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+ }
+ return original(command, args, options);
+}; syncBuiltinESMExports();
+const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
+  const waiter = projectProcess(f, ['wait', task.id, '--timeout', '15'], { script, terminal: `owner-wait-relaunch`, env: { CREW_RECOVERY_SECONDS: '0.02' } });
+  try {
+    await until(() => fs.existsSync(ready));
+    const r = f.call(['relaunch', task.id, '--agent', 'pi', '--model', 'replacement'], { CREW_AGENT_PATH: bin }); assert.equal(r.code, 0, r.out);
+    const moved = f.task(task.id); assert.notEqual(moved.terminal, task.terminal);
+    fs.writeFileSync(release, 'go');
+    await until(() => f.task(task.id).state === 'failed' || readWorld().log.some(a => a[0] === 'get' && a.at(-1) === moved.terminal));
+    assert.equal(f.task(task.id).state, 'working', 'An old terminal probe must not overwrite the relaunched task');
+    for (const args of [['status', '--json'], ['status', '--json', '--view', 'fleet']]) {
+      const shown = JSON.parse(f.call(args).out).tasks.find(t => t.id === task.id);
+      assert.equal(shown.state, 'working'); assert.equal(shown.terminal, moved.terminal);
+    }
+    fs.writeFileSync(task.report, 'Completed by the replacement.');
+    const done = crew(['done', task.id], { cwd: f.home, terminal: moved.terminal }); assert.equal(done.code, 0, done.out);
+    const result = await waiter.result; assert.equal(result.code, 0, result.out);
+    assert.match(result.out, /== racing: reported/); assert.match(result.out, /Completed by the replacement/);
+    assert.equal(f.task(task.id).terminal, moved.terminal); assert.equal(f.task(task.id).fallbacks.length, 1);
+  } finally { fs.writeFileSync(release, 'go'); waiter.child.kill(); await waiter.result; }
+};
+
+gapTests['stale-handover'] = async () => {
+  const f = gapFixture('stale-handover'), task = f.spawn('racing', ['--agent', 'pi']);
+  const bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
+  setTerminal(task.terminal, { status: { state: 'error', app: 'pi' }, screen: 'usage limit reached' });
+  const ready = path.join(f.dir, 'ready'), release = path.join(f.dir, 'release'), script = path.join(f.dir, 'wait.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs'; import cp from 'node:child_process'; import { syncBuiltinESMExports } from 'node:module';
+const original = cp.spawnSync; let paused = false;
+cp.spawnSync = function(command, args, options) {
+ const result = original(command, args, options);
+ if (!paused && args[0] === ${JSON.stringify(fake)} && args[1] === 'read' && args[2] === ${JSON.stringify(task.terminal)}) {
+  paused = true; fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
+  while (!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+ }
+ return result;
+}; syncBuiltinESMExports();
+const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
+  const waiter = projectProcess(f, ['wait', task.id, '--timeout', '15'], { script, terminal: 'owner-stale-handover', env: { CREW_RECOVERY_SECONDS: '0.02', CREW_AGENT_PATH: bin } });
+  try {
+    await until(() => fs.existsSync(ready));
+    const r = f.call(['relaunch', task.id, '--agent', 'pi', '--model', 'replacement'], { CREW_AGENT_PATH: bin }); assert.equal(r.code, 0, r.out);
+    const moved = f.task(task.id); setTerminal(moved.terminal, { status: { state: 'working', app: 'pi' } });
+    fs.writeFileSync(release, 'go');
+    // A stale quota observation must not hand the replacement over or settle as blocked.
+    await until(() => readWorld().log.some(a => a[0] === 'get' && a.at(-1) === moved.terminal));
+    fs.writeFileSync(task.report, 'Replacement kept working.');
+    const done = crew(['done', task.id], { cwd: f.home, terminal: moved.terminal }); assert.equal(done.code, 0, done.out);
+    const result = await waiter.result; assert.equal(result.code, 0, result.out); assert.match(result.out, /== racing: reported/);
+    assert.equal(f.task(task.id).fallbacks.length, 1); assert.equal(f.task(task.id).terminal, moved.terminal);
+  } finally { fs.writeFileSync(release, 'go'); waiter.child.kill(); await waiter.result; }
+};
+
+gapTests['relaunch-in-flight'] = async () => {
+  const f = gapFixture('relaunch-in-flight'), task = f.spawn('racing', ['--agent', 'pi']);
+  const bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
+  const ready = path.join(f.dir, 'started'), release = path.join(f.dir, 'release'), script = path.join(f.dir, 'relaunch.mjs');
+  // The replacement is alive, but hc run has not yet returned its address to crew.
+  fs.writeFileSync(script, `import fs from 'node:fs'; import cp from 'node:child_process'; import { syncBuiltinESMExports } from 'node:module';
+const original = cp.spawnSync;
+cp.spawnSync = function(command, args, options) {
+ const result = original(command, args, options);
+ if (args[0] === ${JSON.stringify(fake)} && args[1] === 'run') {
+  fs.writeFileSync(${JSON.stringify(ready)}, JSON.parse(result.stdout).address);
+  while (!fs.existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+ }
+ return result;
+}; syncBuiltinESMExports();
+const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
+  const owner = 'owner-relaunch-in-flight';
+  const launch = projectProcess(f, ['relaunch', task.id, '--agent', 'pi', '--model', 'replacement'], { script, terminal: owner, env: { CREW_AGENT_PATH: bin } });
+  let waiter, done;
+  try {
+    await until(() => fs.existsSync(ready));
+    const address = fs.readFileSync(ready, 'utf8'), before = readWorld().log.length;
+    waiter = projectProcess(f, ['wait', task.id, '--timeout', '15'], { terminal: owner, env: { CREW_RECOVERY_SECONDS: '0.02' } });
+    let ended = false; waiter.result.then(() => { ended = true; });
+    await until(() => ended || readWorld().log.slice(before).filter(a => a[0] === 'get' && a.at(-1) === task.terminal).length >= 2);
+    assert.equal(f.task(task.id).state, 'working', 'Wait must not fail the old terminal while replacement is in flight');
+    fs.writeFileSync(task.report, 'Fast replacement report.');
+    const doneReady = path.join(f.dir, 'done-ready'), doneScript = path.join(f.dir, 'done.mjs');
+    fs.writeFileSync(doneScript, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const open = fs.openSync; fs.openSync = (file, ...args) => {
+ if (String(file).endsWith('task.json.lifecycle.lock')) fs.writeFileSync(${JSON.stringify(doneReady)}, 'ready');
+ return open(file, ...args);
+}; main(process.argv.slice(2));`);
+    done = projectProcess(f, ['done', task.id], { script: doneScript, terminal: address });
+    await until(() => fs.existsSync(doneReady));
+    fs.writeFileSync(release, 'go');
+    const launched = await launch.result; assert.equal(launched.code, 0, launched.out);
+    const reported = await done.result; assert.equal(reported.code, 0, reported.out);
+    const result = await waiter.result; assert.equal(result.code, 0, result.out); assert.match(result.out, /Fast replacement report/);
+    assert.equal(f.task(task.id).state, 'reported'); assert.equal(f.task(task.id).terminal, address);
+    const stale = crew(['done', task.id], { cwd: f.home, terminal: task.terminal }); assert.equal(stale.code, 3, stale.out);
+  } finally {
+    fs.writeFileSync(release, 'go'); await launch.result;
+    if (done) { done.child.kill(); await done.result; }
+    if (waiter) { waiter.child.kill(); await waiter.result; }
+  }
+};
+
+gapTests['relaunch-load-repair'] = () => {
+  const f = gapFixture('relaunch-load-repair'), old = f.spawn('racing', ['--agent', 'pi']);
+  const bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
+  const r = f.call(['relaunch', old.id, '--agent', 'pi', '--model', 'replacement'], { CREW_AGENT_PATH: bin }); assert.equal(r.code, 0, r.out);
+  const moved = f.task(old.id), error = 'The worker terminal ended without a report.';
+  const broken = { ...old, state: 'failed', error };
+  const check = (state, terminal = old.terminal) => {
+    for (const args of [['status', '--json'], ['status', '--json', '--view', 'fleet']]) {
+      const result = f.call(args), shown = JSON.parse(result.out).tasks.find(t => t.id === old.id);
+      assert.equal(shown.state, state, result.out); assert.equal(shown.terminal, terminal);
+    }
+  };
+  f.save(broken);
+  const patch = values => { const w = readWorld(); Object.assign(w, values); fs.writeFileSync(world, JSON.stringify(w)); };
+  patch({ silent: true }); check('failed'); patch({ silent: false });
+  setTerminal(moved.terminal, { labels: { 'crew.task': old.id, 'crew.home': 'another-home' } }); check('failed');
+  const labels = readWorld().terminals[moved.terminal].labels;
+  setTerminal(moved.terminal, { labels: { ...labels, 'crew.home': String(JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8')).tag) } });
+  const w = readWorld(); w.terminals.duplicate = { ...w.terminals[moved.terminal], address: 'duplicate' }; fs.writeFileSync(world, JSON.stringify(w));
+  check('failed'); const clean = readWorld(); delete clean.terminals.duplicate; fs.writeFileSync(world, JSON.stringify(clean));
+  check('working', moved.terminal);
+  assert.match(f.call(['status']).out, new RegExp(`racing\\tworking.*\\t${moved.terminal}`));
+  assert.equal(f.task(old.id).state, 'failed', 'Status recovery is read-only');
+  f.save({ ...broken, error: 'Another failure' }); check('failed'); f.save(broken);
+  fs.writeFileSync(old.report, 'Recovered replacement report.');
+  const done = crew(['done', old.id], { cwd: f.home, terminal: moved.terminal }); assert.equal(done.code, 0, done.out);
+  assert.equal(f.task(old.id).state, 'reported'); assert.equal(f.task(old.id).terminal, moved.terminal); assert.equal(f.task(old.id).error, undefined);
+};
+
 gapTests['review-stop-race'] = () => {
   const f = gapFixture('review-race'), patch = p => { const w = readWorld(); Object.assign(w, p); fs.writeFileSync(world, JSON.stringify(w)); };
   const lost = [];
@@ -1596,7 +1740,7 @@ gapTests.status = () => {
   assert.equal(f.call(['finish', ship.id]).code, 0); assert.equal(f.call(['finish', scout.id]).code, 0);
 };
 
-// Advisory label integration has no lifecycle recovery: fake GitHub records the
+// Advisory label integration: fake GitHub records the
 // already-saved task state at every request, including label mutations.
 function reviewLabelsFixture(name, overrides = {}) {
   const dir = path.join(root, `labels-${name}`); fs.mkdirSync(dir);
@@ -1636,9 +1780,10 @@ if(s.network) fail('network unavailable');
 if(a[0]==='pr') { if(s.noPr) fail('no pull requests found for branch'); console.log('https://github.com/acme/demo/pull/42'); process.exit(0); }
 // Hold a start lookup until real done has saved its verdict and finished its requests.
 const duringEndpoint={variables:'/actions/variables',manifest:'/contents/labels/base.json',labels:'/issues/42/labels',definition:'/labels/'+encodeURIComponent(${JSON.stringify(under)})}[s.duringAt];
-if(s.duringVerdict && task?.state==='working' && endpoint.endsWith(duringEndpoint)) {
-  const verdict=s.duringVerdict; s.duringVerdict=null; fs.writeFileSync(file,JSON.stringify(s)); fs.writeFileSync(task.report,verdict);
-  const done=spawnSync(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},'done',task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TERMINAL:task.terminal},encoding:'utf8'});
+if((s.duringVerdict || s.duringFinish) && task?.state==='working' && endpoint.endsWith(duringEndpoint)) {
+  const verdict=s.duringVerdict, finish=s.duringFinish; s.duringVerdict=null; s.duringFinish=false; fs.writeFileSync(file,JSON.stringify(s));
+  if(verdict) fs.writeFileSync(task.report,verdict);
+  const done=spawnSync(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},finish?'finish':'done',task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TERMINAL:finish?process.env.CREW_TERMINAL:task.terminal},encoding:'utf8'});
   if(done.status!==0) fail(done.stdout+done.stderr);
 }
 if(endpoint.endsWith('/actions/variables')) { if(s.variablesDenied) fail('variables unreadable'); console.log(JSON.stringify([{variables:s.enabled===undefined ? [] : [{name:'DELIVERY_LABELS_ENABLED',value:s.enabled}]}])); }
@@ -1667,6 +1812,78 @@ else fail('unexpected fake request');`);
   const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
   return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, parent, start, done, writes, warnings, quotaReads };
 }
+gapTests['review-label-abandon'] = () => {
+  const f = reviewLabelsFixture('abandon');
+  for (const [id, prior, expected] of [['rework', f.changes, f.changes], ['approved', f.approved, f.approved], ['none', null, null], ['legacy', f.oldChanges, f.changes]]) {
+    f.parent(id); f.control({ labels: ['unrelated', ...(prior ? [prior] : [])] });
+    const { task } = f.start(id);
+    // Include a cancellation while the launch still has its preparing record.
+    if (id === 'rework') f.save({ ...task, state: 'preparing' });
+    const r = f.call(['finish', task.id]); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.control().labels, ['unrelated', ...(expected ? [expected] : [])], 'Unfinished review restores its recorded prior verdict, or none');
+  }
+  f.parent('overlap'); f.control({ labels: ['unrelated', f.changes] });
+  const a = f.start('overlap').task, b = f.start('overlap', '-2').task;
+  assert.equal(f.call(['finish', a.id]).code, 0); assert.deepEqual(f.control().labels, ['unrelated', f.under], 'Activity stays while another local reviewer runs');
+  assert.equal(f.call(['finish', b.id]).code, 0); assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'The last abandoned reviewer restores the inherited prior state');
+  f.parent('legacy-record'); const legacy = f.start('legacy-record').task; delete legacy.reviewLabelBefore; f.save(legacy);
+  assert.equal(f.call(['finish', legacy.id]).code, 0); assert.deepEqual(f.control().labels, ['unrelated'], 'An older reviewer without a snapshot leaves no managed label');
+  f.parent('failed'); f.control({ labels: ['unrelated', f.changes] }); const failed = f.start('failed').task;
+  setTerminal(failed.terminal, { state: 'finished' });
+  let r = f.call(['wait', failed.id, '--timeout', '2'], { CREW_RECOVERY_SECONDS: '0' }); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Observed reviewer death clears activity');
+  f.parent('exhausted'); f.control({ labels: ['unrelated'] }); const exhausted = f.start('exhausted').task;
+  setTerminal(exhausted.terminal, { status: { state: 'error', app: 'pi' }, screen: 'usage limit reached' });
+  r = f.call(['wait', exhausted.id, '--timeout', '2'], { CREW_RECOVERY_SECONDS: '0' }); assert.equal(r.code, 7, r.out);
+  assert.deepEqual(f.control().labels, ['unrelated'], 'Exhausted reviewer handover clears activity');
+  f.parent('verdict'); f.control({ labels: ['unrelated', f.changes] }); const verdict = f.start('verdict').task;
+  assert.equal(f.done(verdict, 'APPROVE').code, 0); const before = f.writes().length;
+  assert.equal(f.call(['finish', verdict.id]).code, 0); assert.equal(f.writes().length, before, 'A completed verdict is never restored to its previous state');
+};
+
+gapTests['review-label-cancel-start'] = () => {
+  const f = reviewLabelsFixture('cancel-start');
+  for (const duringAt of ['variables', 'manifest', 'labels', 'definition']) {
+    f.parent(duringAt); f.control({ labels: ['unrelated', f.changes], duringFinish: true, duringAt });
+    const { task, result } = f.start(duringAt); assert.equal(f.warnings(result).length, 0, result.out);
+    assert.equal(task.state, 'closed');
+    assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Cancelling during a start lookup cannot leave or re-add activity');
+  }
+};
+
+gapTests['review-label-exclusive-actions'] = () => {
+  const f = reviewLabelsFixture('exclusive-actions');
+  f.parent(); f.control({ labels: ['unrelated', f.approved, f.changes] }); const { task } = f.start();
+  let r = f.call(['tell', 'ship', 'Fix the implementation while review runs.']); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Tell invalidates activity, not just approval');
+  assert.equal(f.call(['finish', task.id]).code, 0);
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Late reviewer cleanup must not undo a follow-up');
+  f.parent('handover'); const active = f.start('handover').task;
+  f.save({ ...f.task('handover'), state: 'working' });
+  r = f.call(['relaunch', 'handover', '--agent', 'a1', '--model', 'openai-codex/test']); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Relaunch invalidates an active review');
+  assert.equal(f.call(['finish', active.id]).code, 0);
+  for (const stale of [false, true]) {
+    const id = stale ? 'stale-land' : 'fresh-land', ship = f.parent(id, { pr: 'https://github.com/acme/demo/pull/42' });
+    const head = f.control().head;
+    f.save({ ...ship, reviewVerdict: { verdict: 'APPROVE', head, currentHead: head, stale: false, needsReview: false } });
+    f.control({ head: stale ? 'b'.repeat(40) : head, labels: ['unrelated', f.under, f.oldUnder, f.approved, f.changes] });
+    r = f.call(['land', id]); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.control().labels, ['unrelated', stale ? f.changes : f.approved], 'Land normalizes conflicting assignments, even manually added labels');
+  }
+};
+
+gapTests['review-label-closed-no-writes'] = () => {
+  const f = reviewLabelsFixture('closed-no-writes');
+  for (const mergedAt of [null, '2026-11-24T14:11:45Z']) {
+    const id = mergedAt ? 'merged' : 'closed'; f.parent(id); f.control({ prState: 'open', mergedAt: null, labels: ['unrelated', f.changes] });
+    const { task } = f.start(id); f.control({ prState: 'closed', mergedAt }); const labels = f.control().labels, before = f.writes().length;
+    assert.equal(f.done(task, 'APPROVE').code, 0); assert.equal(f.call(['finish', task.id]).code, 0);
+    assert.equal(f.call(['tell', id, 'Continue.']).code, 0);
+    assert.equal(f.writes().length, before); assert.deepEqual(f.control().labels, labels, 'Closed and merged PRs are never changed');
+  }
+};
+
 gapTests['review-label-manifest'] = () => {
   const f = reviewLabelsFixture('manifest', { CREW_REVIEW_LABELS_REPO: 'another/palette' });
   const manifest = { version: 1, labels: {
@@ -1774,7 +1991,7 @@ gapTests['review-label-swaps'] = () => {
   // Accepted overlap limitation: the first verdict clears activity while the other runs.
   f.parent('overlap'); const a = f.start('overlap').task, b = f.start('overlap', '-2').task;
   assert.equal(f.done(a, 'APPROVE').code, 0); assert.ok(!f.control().labels.includes(f.under)); assert.equal(f.task(b.id).state, 'working');
-  n = f.calls().length; assert.equal(f.call(['start']).code, 0); assert.equal(f.call(['stop', b.id]).code, 0); assert.equal(f.call(['finish', b.id]).code, 0); assert.equal(f.calls().length, n, 'Other lifecycle commands never reconcile labels');
+  n = f.writes().length; assert.equal(f.call(['start']).code, 0); assert.equal(f.call(['stop', b.id]).code, 0); assert.equal(f.call(['finish', b.id]).code, 0); assert.equal(f.writes().length, n, 'Abandoning the other reviewer preserves a completed verdict');
   assert.ok(!fs.existsSync(path.join(f.home, 'state', 'review-labels')));
   assert.ok(JSON.parse(f.call(['status', '--json']).out).tasks.every(t => !('reviewLabel' in t)));
 };
@@ -1804,7 +2021,7 @@ gapTests['review-label-pr-state'] = () => {
     const done = f.done(during.task, verdict);
     assert.equal(done.code, 0, done.out); assert.equal(f.warnings(done).length, 0);
     assert.equal(f.task(during.task.id).state, 'reported');
-    assert.deepEqual(f.control().labels, ['unrelated'], 'Late verdict clears managed assignments instead of swapping');
+    assert.deepEqual(f.control().labels, ['unrelated', f.under, f.oldUnder, f.approved, f.changes, f.oldChanges], 'Late verdict leaves closed PR labels untouched');
     assert.equal(stateReads(at).length, 1);
     assert.ok(!f.calls().slice(at).some(c => c.method === 'POST'));
   }
@@ -1910,7 +2127,7 @@ gapTests['review-label-plain-land-head'] = () => {
   assert.equal(f.task('ship').prFacts.state, 'OPEN', 'first plain land also persists its existing approval-freshness read');
   assert.equal(f.task('ship').prFacts.url, 'https://github.com/acme/demo/pull/42');
   assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
-  assert.equal(f.writes().length, 0, 'Land reports freshness without writing labels');
+  assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Land marks a stale approval as Rework');
 };
 gapTests['plain-land-lifecycle-facts'] = () => {
   const f = reviewLabelsFixture('plain-land-facts');
@@ -1930,7 +2147,7 @@ gapTests['plain-land-lifecycle-facts'] = () => {
   assert.equal(f.task(ship.id).prFacts.closedAt, merged.closed_at); assert.equal(f.task(ship.id).pr, url);
   assert.equal(f.task(ship.id).state, 'closed');
   assert.equal(f.calls().slice(before).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1, 'reuse the existing read without another request');
-  assert.equal(f.writes().length, 0, 'plain land freshness is still label-read-only');
+  assert.equal(f.writes().length, 0, 'plain land never writes labels on a merged PR');
   assert.ok(!JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.some(t => t.id === ship.id), 'offline fleet must omit the now-known old merge');
 };
 
@@ -1989,7 +2206,7 @@ gapTests['review-label-failures'] = () => {
   f.control({ defined: [f.under, f.approved, f.changes] }); f.parent('remove'); const review = f.start('remove').task;
   f.control({ removeDenied: true, addDenied: true }); n = f.calls().length; r = f.done(review, 'APPROVE'); assert.equal(r.code, 0, r.out); assert.equal(f.warnings(r).length, 1, 'Multiple errors produce one warning line');
   assert.equal(f.task(review.id).state, 'reported'); assert.ok(f.control().labels.includes(f.under));
-  assert.equal(f.calls().slice(n).filter(c => c.method === 'DELETE').length, 1); assert.equal(f.calls().slice(n).filter(c => c.method === 'POST').length, 1);
+  assert.equal(f.calls().slice(n).filter(c => c.method === 'DELETE').length, 1); assert.equal(f.calls().slice(n).filter(c => c.method === 'POST').length, 0, 'Failed removal must not add a conflicting verdict');
   f.control({ addDenied: false, enabled: 'true', labels: ['unrelated', f.approved, f.changes] }); f.parent('old-verdict'); const failedSwap = f.start('old-verdict'); assert.equal(f.warnings(failedSwap.result).length, 1); assert.equal(failedSwap.task.state, 'working');
   f.control({ removeDenied: false }); n = f.calls().length; assert.equal(f.call(['start']).code, 0); assert.equal(f.calls().length, n, 'No retry after failure');
 };
