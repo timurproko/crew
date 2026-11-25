@@ -11,10 +11,10 @@
 
 ## 2. Finish closes every recorded crew-started terminal safely
 
-- [ ] 2.1 Record additive terminal launch history at spawn, explicit relaunch, automatic hand-over and review launch/replacement; extend fixture assertions to check every acknowledged address survives publication and existing done/relaunch races.
-- [ ] 2.2 Finish and remove the deduplicated owned-terminal set with each launch's stop protocol; cover earlier/later surviving terminals and graceful A1 exits, plus a busy owned terminal refusing non-forced cleanup.
-- [ ] 2.3 Persist and retry per-terminal pending cleanup without returning a held copy; cover failed stop/removal, silent Core, already-closed retry, and existing current-terminal-only records.
-- [ ] 2.4 Assert foreign terminals stay live even with force or matching cwd/labels, and finishing a ship does not adopt its separate review task's terminal; update README ownership wording and run targeted ownership and race regressions.
+- [x] 2.1 Record additive terminal launch history at spawn, explicit relaunch, automatic hand-over and review launch/replacement; extend fixture assertions to check every acknowledged address survives publication and existing done/relaunch races.
+- [x] 2.2 Finish and remove the deduplicated owned-terminal set with each launch's stop protocol; cover earlier/later surviving terminals and graceful A1 exits, plus a busy owned terminal refusing non-forced cleanup.
+- [x] 2.3 Persist and retry per-terminal pending cleanup without returning a held copy; cover failed stop/removal, silent Core, already-closed retry, and existing current-terminal-only records.
+- [x] 2.4 Assert foreign terminals stay live even with force or matching cwd/labels, and finishing a ship does not adopt its separate review task's terminal; update README ownership wording and run targeted ownership and race regressions.
 
 ## 3. Worker briefs move disposable work outside the copy
 

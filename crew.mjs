@@ -297,9 +297,17 @@ function taskTransaction(h, id, action, { observation = false, waitMs = 2000 } =
     } finally { release(lock, fd); }
   } finally { if (intent !== null) release(priority, intent); }
 }
+// Historical addresses are ownership evidence, not a cwd/label-based adoption list.
+function ownedTerminals(task) {
+  const records = new Map((task.terminals ?? []).map(t => [t.address, t]));
+  if (task.terminal && !records.has(task.terminal)) records.set(task.terminal, { address: task.terminal, agent: task.agent });
+  return [...records.values()];
+}
+const launchedTerminals = (task, address, agent) => [...ownedTerminals(task).filter(t => t.address !== address), { address, agent, started: now() }];
 const saveTask = (h, task) => taskTransaction(h, task.id, current => {
   const prFacts = current?.prFacts;
-  writeJson(taskFile(h, task.id), { ...task, ...(prFacts ? { prFacts } : {}), updated: now() });
+  const terminals = [...new Map([...(current?.terminals ?? []), ...(task.terminals ?? [])].map(t => [t.address, t])).values()];
+  writeJson(taskFile(h, task.id), { ...task, ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), updated: now() });
 });
 
 const prTime = value => {
@@ -1235,14 +1243,14 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   if (started.code !== 0 || !address) {
     if (delivered) runTool('delivery', ['finish', worktree, '--force'], { cwd: project.path, timeout: 120000 });
     else run('git', ['-C', project.path, 'worktree', 'remove', '--force', worktree]);
-    saveTask(h, { ...record, state: 'failed', error: JSON.stringify(started.value).slice(0, 400) });
+    saveTask(h, { ...record, state: 'failed', ...(address ? { terminals: launchedTerminals(record, address, pick.harness) } : {}), error: JSON.stringify(started.value).slice(0, 400) });
     refuse(`Core did not start the worker terminal: ${JSON.stringify(started.value)}`, 5);
   }
   // The worker is already running and may have reported before this line (a fast failure
   // report, or a slow answer from Core). Add the terminal to what is on disk now rather than
   // writing the record this command started with over a report or cancellation.
   const current = readJson(taskFile(h, id)) ?? record;
-  saveTask(h, { ...current, state: current.state === 'preparing' ? 'working' : current.state, terminal: address, spawned: now() });
+  saveTask(h, { ...current, state: current.state === 'preparing' ? 'working' : current.state, terminal: address, terminals: launchedTerminals(current, address, pick.harness), spawned: now() });
   const detail = pickLabel(pick) !== pick.harness || chosen.available ? `; ${pickLabel(pick)}${chosen.available ? `, ${chosen.available} more can take over` : ''}` : '';
   console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}`);
   backlogMove(h, id, 'start');
@@ -1302,11 +1310,11 @@ function replaceWorker(h, task, reason, flags) {
   const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, instruction });
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
-    store({ ...task, state: 'failed', terminal: null, error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
+    store({ ...task, state: 'failed', terminal: null, terminals: address ? launchedTerminals(task, address, pick.harness) : ownedTerminals(task), error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
     refuse(`Core did not start the next worker for ${task.id}: ${JSON.stringify(started.value)}. Its working copy is kept: ${task.worktree}`, 5);
   }
   const { error, ...kept } = task;
-  store({ ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
+  store({ ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, terminals: launchedTerminals(task, address, pick.harness), relaunched: now(),
     fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
   return { pick, rest, address };
 }
@@ -1545,10 +1553,10 @@ function a1Api(type, target) {
 // `stopped: true` is returned only for something that was observed: Core says the terminal
 // is finished or gone, or A1 itself says the session no longer exists. A Core that does not
 // answer is never read as "gone".
-function stopWorker(task, { force = false, onStop = null } = {}) {
+function workerToStop(task, force) {
   let { state, t } = probe(task.terminal);
   if (state === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was stopped or removed. Try again.`, 4);
-  if (state !== 'live') return { stopped: true, how: 'terminal already gone' };
+  if (state !== 'live') return { state, t };
   // A worker reports from inside its last turn; give that turn a moment to end before
   // deciding it is still busy.
   for (let i = 0; task.state === 'reported' && !force && state === 'live' && t.status?.state === 'working' && i < (Number(process.env.CREW_SETTLE_SECONDS) || 45); i++) {
@@ -1556,9 +1564,31 @@ function stopWorker(task, { force = false, onStop = null } = {}) {
     ({ state, t } = probe(task.terminal));
   }
   if (state === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was stopped or removed. Try again.`, 4);
+  if (state === 'live' && t.status?.state === 'working' && !force) refuse(`Task ${task.id} is still working. Wait for it, or pass --force to cancel it.`, 6);
+  return { state, t };
+}
+function stopTaskWorkers(task, { force = false, onStop = null } = {}) {
+  const workers = ownedTerminals(task).map(t => ({ ...task, terminal: t.address, agent: t.agent }));
+  // Refuse a busy or unobservable owned worker before stopping any of the set.
+  for (const worker of workers) workerToStop(worker, force);
+  const pending = [], results = [];
+  let attempted = false;
+  for (const worker of workers) {
+    try {
+      const result = stopWorker(worker, { force, onStop: () => { attempted = true; onStop?.(); } });
+      results.push(result.how);
+      if (!result.stopped) pending.push(worker.terminal);
+    } catch (error) {
+      if (!(error instanceof Refusal) || !attempted) throw error;
+      pending.push(worker.terminal); results.push(error.message);
+    }
+  }
+  return { stopped: !pending.length, pending, how: workers.length === 1 ? results[0] : `${workers.length - pending.length} of ${workers.length} owned terminals stopped${pending.length ? '; stops pending' : ''}` };
+}
+function stopWorker(task, { force = false, onStop = null } = {}) {
+  const { state, t } = workerToStop(task, force);
   if (state !== 'live') return { stopped: true, how: 'terminal already gone' };
   const working = t.status?.state === 'working';
-  if (working && !force) refuse(`Task ${task.id} is still working. Wait for it, or pass --force to cancel it.`, 6);
   if (AGENTS[task.agent]?.exit === 'a1-api' && t.status?.app === 'a1' && t.labels?.['a1.session'] && t.labels?.['a1.runtime']) {
     const target = { sessionId: t.labels['a1.session'], runtimeId: t.labels['a1.runtime'] };
     const reply = a1Api('session.exit', target);
@@ -1913,6 +1943,13 @@ function returnWaitingCopies(h, { skip = null } = {}) {
 // Called only after a proved worker stop (or its persisted retry). A1's API exit can leave
 // the wrapper shell live: end that shell too. Unknown answers still postpone removal.
 function removeStoppedTerminal(task) {
+  for (const owned of ownedTerminals(task)) {
+    const pending = removeOneStoppedTerminal({ ...task, terminal: owned.address });
+    if (pending) return pending;
+  }
+  return null;
+}
+function removeOneStoppedTerminal(task) {
   try {
     let seen = probe(task.terminal).state;
     if (seen === 'live') { hc(['kill', task.terminal]); seen = probe(task.terminal).state; }
@@ -1939,7 +1976,9 @@ function returnWaiting(h, task, { force = false } = {}) {
     // The stop was requested but not confirmed. Reapply idle/busy protection before any
     // further lifecycle action; uncertainty never grants permission to discard the copy.
     try {
-      const result = stopWorker(task, { force });
+      const result = stopTaskWorkers(task, { force });
+      copyToReturn.pendingTerminals = result.pending;
+      saveTask(h, task);
       if (!result.stopped) return { state: 'held', line: `The working copy of ${task.id} is kept: its worker stop is not confirmed (${result.how}). The next crew finish or crew start retries it.` };
       copyToReturn.stopPending = false;
       saveTask(h, task);
@@ -2009,7 +2048,7 @@ function cmdFinish(args) {
   if (work.keep) refuse(`Task ${id} is marked to keep by .artifacts/KEEP in ${task.worktree}. Nothing was removed. Delete the marker, or pass --force.`, 6);
   if (scratch && left.operations.length) refuse(`Task ${id} has a protected Git operation or lock; nothing was removed.`, 6);
   let attempted = false, result;
-  try { result = stopWorker(task, { force, onStop: () => { attempted = true; } }); }
+  try { result = stopTaskWorkers(task, { force, onStop: () => { attempted = true; } }); }
   catch (error) {
     if (!attempted || !(error instanceof Refusal)) throw error;
     result = { stopped: false, how: error.message };
@@ -2019,7 +2058,7 @@ function cmdFinish(args) {
   const forget = () => (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) && forgetClaudeFolder(task.worktree);
   const closed = { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state };
   // Record the remaining work before asking Core again, so an interrupted removal is retried.
-  const waiting = { ...closed, copyToReturn: { since: now(), heldBy: [], left, stopPending: !result.stopped, cleanupTerminal: true } };
+  const waiting = { ...closed, copyToReturn: { since: now(), heldBy: [], left, stopPending: !result.stopped, pendingTerminals: result.pending ?? ownedTerminals(task).map(t => t.address), cleanupTerminal: true } };
   saveTask(h, waiting);
   const cleanup = result.stopped ? removeStoppedTerminal(task) : { text: `its worker stop is not confirmed (${result.how})` };
   waiting.copyToReturn.cleanupTerminal = Boolean(cleanup);

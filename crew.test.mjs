@@ -695,6 +695,65 @@ gapTests['closed-safety'] = () => {
   }
 };
 
+gapTests['owned-terminals'] = () => {
+  const f = gapFixture('owned-terminals'), bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
+  const t = f.spawn('history', ['--kind', 'ship', '--agent', 'pi']), old = structuredClone(readWorld().terminals[t.terminal]);
+  assert.deepEqual(f.task(t.id).terminals.map(t => t.address), [t.terminal]);
+  let r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'replacement'], { CREW_AGENT_PATH: bin }); assert.equal(r.code, 0, r.out);
+  const current = f.task(t.id); assert.deepEqual(current.terminals.map(t => t.address), [t.terminal, current.terminal]);
+  // Reproduce a stranded predecessor without inventing ownership from Core labels.
+  let w = readWorld(); w.terminals[t.terminal] = old; fs.writeFileSync(world, JSON.stringify(w));
+  setTerminal(t.terminal, { status: { app: 'pi', state: 'working' } });
+  const before = readWorld().log.length; r = f.call(['finish', t.id]); assert.equal(r.code, 6, r.out);
+  assert.ok(!readWorld().log.slice(before).some(a => ['kill', 'rm'].includes(a[0])));
+  setTerminal(t.terminal, { status: { app: 'pi', state: 'idle' } });
+  w = readWorld(); w.terminals.person = { ...old, address: 'person' }; fs.writeFileSync(world, JSON.stringify(w));
+  r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out);
+  assert.ok(!readWorld().terminals[t.terminal] && !readWorld().terminals[current.terminal]);
+  assert.equal(readWorld().terminals.person.state, 'live', 'Copied labels never confer ownership');
+  assert.ok(f.task(t.id).copyToReturn && fs.existsSync(t.worktree));
+  r = f.call(['finish', t.id, '--force']); assert.equal(r.code, 6, r.out); assert.equal(readWorld().terminals.person.state, 'live');
+  w = readWorld(); delete w.terminals.person; fs.writeFileSync(world, JSON.stringify(w));
+  assert.equal(f.call(['finish', t.id]).code, 0); assert.ok(!fs.existsSync(t.worktree));
+
+  const pending = f.spawn('pending', ['--agent', 'pi']);
+  const second = 'owned-second'; w = readWorld(); w.terminals[second] = { ...structuredClone(w.terminals[pending.terminal]), address: second }; w.failRm = true; fs.writeFileSync(world, JSON.stringify(w));
+  f.save({ ...pending, terminals: [...pending.terminals, { address: second, agent: 'pi' }] });
+  r = f.call(['finish', pending.id]); assert.equal(r.code, 0, r.out); assert.ok(f.task(pending.id).copyToReturn);
+  w = readWorld(); w.failRm = false; fs.writeFileSync(world, JSON.stringify(w));
+  r = f.call(['finish', pending.id]); assert.equal(r.code, 0, r.out); assert.ok(!readWorld().terminals[second] && !readWorld().terminals[pending.terminal]);
+
+  const legacy = f.spawn('legacy', ['--agent', 'pi']); const { terminals, ...record } = legacy; f.save(record);
+  assert.equal(f.call(['finish', legacy.id]).code, 0); assert.ok(!readWorld().terminals[legacy.terminal]);
+};
+
+gapTests['owned-review'] = () => {
+  const f = leftoversFixture('review'), t = f.spawn('author'), bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
+  let r = f.call(['review', t.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+  const review = f.task('author-review'), old = structuredClone(readWorld().terminals[review.terminal]);
+  assert.deepEqual(review.terminals.map(t => t.address), [review.terminal]);
+  r = f.call(['relaunch', review.id, '--agent', 'pi', '--model', 'next-reviewer'], { CREW_AGENT_PATH: bin }); assert.equal(r.code, 0, r.out);
+  const next = f.task(review.id); assert.equal(next.terminals.length, 2);
+  let w = readWorld(); w.terminals[review.terminal] = old; w.terminals[next.terminal].cwd = t.worktree; fs.writeFileSync(world, JSON.stringify(w));
+  r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out); assert.ok(f.task(t.id).copyToReturn);
+  assert.equal(readWorld().terminals[next.terminal].state, 'live', 'Parent finish never adopts a separate review task');
+  r = f.call(['finish', review.id]); assert.equal(r.code, 0, r.out);
+  assert.ok(!readWorld().terminals[review.terminal] && !readWorld().terminals[next.terminal]);
+  assert.ok(!fs.existsSync(t.worktree), 'Successful finish sweeps the now-free parent copy');
+};
+gapTests['owned-a1-stop'] = () => {
+  const f = gapFixture('owned-a1-stop'), t = f.spawn('api', ['--agent', 'a1']), second = 'owned-pi';
+  const w = readWorld(); w.terminals[second] = { ...structuredClone(w.terminals[t.terminal]), address: second };
+  Object.assign(w.terminals[t.terminal], { status: { app: 'a1', state: 'idle' }, labels: { 'a1.session': 'fake-session', 'a1.runtime': 'fake-runtime' } });
+  fs.writeFileSync(world, JSON.stringify(w)); f.save({ ...t, terminals: [...t.terminals, { address: second, agent: 'pi' }] });
+  const preload = path.join(f.dir, 'api.cjs'), log = path.join(f.dir, 'api.log');
+  fs.writeFileSync(preload, `const fs=require('node:fs'),cp=require('node:child_process'),orig=cp.spawnSync;
+cp.spawnSync=(p,a,o)=>{if(a?.[0]==='-c'&&a[1].startsWith('a1 api ')){fs.appendFileSync(${JSON.stringify(log)},a[1]+'\\n');return {status:0,stdout:JSON.stringify(a[1].includes('session.lifecycle')?{error:{code:'session-unavailable'}}:{success:true}),stderr:''}}return orig(p,a,o)};require('node:module').syncBuiltinESMExports();`);
+  const r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` }); assert.equal(r.code, 0, r.out);
+  const calls = fs.readFileSync(log, 'utf8'); assert.match(calls, /session.exit/); assert.match(calls, /session.lifecycle/); assert.match(calls, /fake-session/);
+  assert.ok(!readWorld().terminals[t.terminal] && !readWorld().terminals[second]);
+};
+
 gapTests.ignored = () => {
   const f = gapFixture('ignored'), count = Math.max(12001, Number(process.env.CREW_TEST_IGNORED_FILES) || 12001);
   const fill = t => { fs.mkdirSync(path.join(t.worktree, 'scratch')); for (let i = 0; i < count; i++) fs.writeFileSync(path.join(t.worktree, 'scratch', `${i}.txt`), 'old'); fs.utimesSync(path.join(t.worktree, 'scratch'), 1700000000, 1700000000); };
@@ -819,6 +878,7 @@ console.log(JSON.stringify({providers: families.map(provider => q[provider] === 
   assert.equal(f.call(['relaunch', task.id]).code, 8, 'Unnamed relaunch never repeats an already tried candidate');
   setQuota({ codex: 70, claude: 70, copilot: 80 });
   assert.equal(f.call(['relaunch', task.id, '--agent', 'a1', '--model', 'openai-codex/gpt-x']).code, 0, 'A named relaunch may retry an earlier choice');
+  assert.ok(f.task(task.id).terminals.length >= 3, 'Automatic hand-over and explicit relaunch retain launch history');
   assert.equal(f.call(['finish', task.id, '--force']).code, 0);
 };
 
@@ -846,6 +906,7 @@ const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'cr
     fs.writeFileSync(release, 'go');
     await until(() => f.task(task.id).state === 'failed' || readWorld().log.some(a => a[0] === 'get' && a.at(-1) === moved.terminal));
     assert.equal(f.task(task.id).state, 'working', 'An old terminal probe must not overwrite the relaunched task');
+    assert.ok(f.task(task.id).terminals.some(t => t.address === task.terminal), 'Relaunch race retains predecessor ownership');
     for (const args of [['status', '--json'], ['status', '--json', '--view', 'fleet']]) {
       const shown = JSON.parse(f.call(args).out).tasks.find(t => t.id === task.id);
       assert.equal(shown.state, 'working'); assert.equal(shown.terminal, moved.terminal);

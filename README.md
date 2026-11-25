@@ -539,7 +539,15 @@ per machine.
 
 ## Finish and other terminals
 
-`crew finish` hands a working copy back only when the task's own terminal was the only one in it. Handing a pool
+`crew finish` stops and removes every terminal recorded as started by crew for that task,
+not just the current worker: spawn, relaunch and automatic hand-over retain terminal history.
+Reviewers retain their own task's history; finishing a ship does not adopt its reviewer.
+Each owned worker keeps the idle/busy and graceful-exit checks, and unconfirmed stops or
+removals keep the copy pending for retry. Legacy records still own their recorded current
+terminal, without bulk migration or guessing missing historical addresses from labels.
+Crew never closes an unrecorded terminal based on its cwd or matching labels.
+
+`crew finish` hands a working copy back only after all of its owned terminals are gone and no foreign terminal holds it. Handing a pool
 slot back ends every process whose working folder is in the slot (treehouse does that so the next task gets a
 quiet folder), and on Windows a shell keeps the folder it was opened in even after `cd`. A terminal a person
 opened from a worker's tab, with their own agent in it, would be ended with the worker. So finish asks Core for
