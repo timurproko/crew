@@ -16,8 +16,8 @@ Checked on this machine with Claude Code 2.1.332:
 
 Two cases, handled in two places:
 
-1. **The installed version does not know `auto`.** Before a Claude launch, crew runs `claude --permission-mode auto --allowedTools <list> --version` once per process (short timeout). If it fails, the worker starts with `acceptEdits`, and crew's start line ends with `(auto mode not available: <first line of the error>; started in acceptEdits)`.
-2. **The account or session refuses auto mode at start.** This cannot be probed without starting a session, so the worker's terminal command is wrapped: if the auto-mode `claude` exits non-zero within a few seconds of starting, the wrapper prints `crew: Claude Code did not start in auto mode; starting again in acceptEdits` and runs the same command with `acceptEdits`. A worker that ran normally and then ended is not restarted. Crew's existing "agent ended without a report" recovery stays the last resort.
+1. **The installed version does not know `auto`.** Before a Claude launch, crew runs `claude --permission-mode auto --allowedTools <list> --version` once per process (20-second timeout). If it exits non-zero with a line naming `permission-mode` or `auto`, the worker starts with `acceptEdits`, and crew's spawn, relaunch or hand-over line ends with `; auto mode not available (<that line>), started in acceptEdits`. A missing or silent `claude` keeps auto mode and leaves the case to the guard below.
+2. **The account or session refuses auto mode at start.** This cannot be probed without starting a session, so the worker's terminal command is wrapped: if the auto-mode `claude` exits non-zero (other than 130, an interrupt) within 20 seconds of starting, the wrapper prints `crew: Claude Code ended at once in auto mode (exit N); starting it again in acceptEdits` and runs the same command once with `acceptEdits`. A worker that ran for longer or ended normally is not restarted. Crew's existing "agent ended without a report" recovery stays the last resort.
 
 The fallback never uses `bypassPermissions` or `dontAsk`.
 
