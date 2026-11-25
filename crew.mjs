@@ -248,14 +248,31 @@ function loadTask(h, id) {
   if (!validId(id)) refuse(`Not a task id: ${id}`);
   const task = readJson(taskFile(h, id));
   if (!task) refuse(`No task ${id} in ${h.dir}.`);
-  return task;
+  return reviveRelaunchedTask(h, task);
 }
+const ENDED_WITHOUT_REPORT = 'The worker terminal ended without a report.';
+// Older waits could overwrite a relaunch with their old terminal snapshot. Recover
+// only this exact failure, and only one live, labelled worker in the same copy.
+// This is a read projection; status never rewrites authoritative task state.
+function reviveRelaunchedTask(h, task) {
+  if (task?.state !== 'failed' || task.error !== ENDED_WITHOUT_REPORT || !task.worktree) return task;
+  const recorded = probe(task.terminal);
+  if (recorded.state === 'unknown') return task;
+  const candidates = recorded.state === 'live' ? [recorded.t]
+    : (otherTerminalsIn(task.worktree, task.terminal) ?? []).map(t => probe(t.address).t);
+  const matches = candidates.filter(t => t?.state === 'live' && t.cwd && comparablePath(t.cwd) === comparablePath(task.worktree)
+    && t.labels?.['crew.task'] === task.id && t.labels?.['crew.home'] === String(h.config.tag));
+  if (matches.length !== 1) return task;
+  const { error, ...kept } = task;
+  return { ...kept, state: 'working', terminal: matches[0].address };
+}
+const sameWorker = (a, b) => a && b && a.state === b.state && a.terminal === b.terminal && a.relaunched === b.relaunched;
 // Lifecycle intent prevents successive polls from taking the task lock ahead of
 // done/finish/land/tell/spawn. An already-started atomic write cannot be preempted:
 // allow its supported one-second Windows replacement window plus scheduling margin.
-function taskTransaction(h, id, action, { observation = false } = {}) {
+function taskTransaction(h, id, action, { observation = false, waitMs = 2000 } = {}) {
   const lock = `${taskFile(h, id)}.lock`, priority = `${taskFile(h, id)}.lifecycle.lock`;
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + waitMs;
   const acquire = (file, wait) => {
     for (;;) {
       try { return fs.openSync(file, 'wx'); }
@@ -353,7 +370,7 @@ export function rememberTaskPr(h, task, facts) {
 }
 function allTasks(h) {
   if (!fs.existsSync(h.tasks)) return [];
-  return fs.readdirSync(h.tasks).filter(validId).map(id => readJson(taskFile(h, id))).filter(Boolean)
+  return fs.readdirSync(h.tasks).filter(validId).map(id => reviveRelaunchedTask(h, readJson(taskFile(h, id)))).filter(Boolean)
     .sort((a, b) => String(a.created).localeCompare(String(b.created)));
 }
 
@@ -1223,9 +1240,9 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   }
   // The worker is already running and may have reported before this line (a fast failure
   // report, or a slow answer from Core). Add the terminal to what is on disk now rather than
-  // writing the record this command started with over an accepted report.
+  // writing the record this command started with over a report or cancellation.
   const current = readJson(taskFile(h, id)) ?? record;
-  saveTask(h, { ...current, state: current.state === 'reported' ? 'reported' : 'working', terminal: address, spawned: now() });
+  saveTask(h, { ...current, state: current.state === 'preparing' ? 'working' : current.state, terminal: address, spawned: now() });
   const detail = pickLabel(pick) !== pick.harness || chosen.available ? `; ${pickLabel(pick)}${chosen.available ? `, ${chosen.available} more can take over` : ''}` : '';
   console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}`);
   backlogMove(h, id, 'start');
@@ -1236,6 +1253,31 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
 // the next candidate of its chain, which is told to go on from what is already there.
 // Returns the new pick, or null with `why` when nobody else can take the task.
 function relaunch(h, task, reason, flags = null) {
+  // Keep kill/start/publication in one task transaction. A wait yields to a manual
+  // relaunch and must never apply its old observation to the replacement worker.
+  let moved;
+  try {
+    moved = taskTransaction(h, task.id, current => {
+      current = reviveRelaunchedTask(h, current);
+      if (!sameWorker(current, task)) return;
+      return replaceWorker(h, current, reason, flags);
+    }, { observation: flags === null }) ?? { superseded: true };
+  } catch (error) {
+    if (loadTask(h, task.id).state === 'failed') reviewLabels(h, task.id, 'abandon');
+    throw error;
+  }
+  if (!moved.pick && !moved.superseded) reviewLabels(h, task.id, 'abandon');
+  if (moved.pick && task.reviews && task.reviewLabelEnded) {
+    taskTransaction(h, task.id, latest => {
+      const { reviewLabelEnded, ...kept } = latest;
+      writeJson(taskFile(h, task.id), { ...kept, updated: now() });
+    });
+    reviewLabels(h, task.id);
+  }
+  return moved;
+}
+function replaceWorker(h, task, reason, flags) {
+  const store = value => writeJson(taskFile(h, task.id), { ...value, updated: now() });
   const before = task.launch ?? { harness: task.agent }, tried = new Set([...(task.tried ?? []), pickKey(before)]);
   const role = roleOf(task), named = flags && [...PICK_FLAGS, 'no-fallback'].some(key => flags[key] !== undefined);
   const config = dispatchConfig(h);
@@ -1245,7 +1287,7 @@ function relaunch(h, task, reason, flags = null) {
   const candidates = original.filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true }), checks = candidateChecks(rows);
   if (!usable.length) {
-    saveTask(h, { ...task, candidateChecks: checks });
+    store({ ...task, candidateChecks: checks });
     return { pick: null, why: rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain' };
   }
   const [pick, ...rest] = usable;
@@ -1260,11 +1302,11 @@ function relaunch(h, task, reason, flags = null) {
   const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, instruction });
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
-    saveTask(h, { ...task, state: 'failed', terminal: null, error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
+    store({ ...task, state: 'failed', terminal: null, error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
     refuse(`Core did not start the next worker for ${task.id}: ${JSON.stringify(started.value)}. Its working copy is kept: ${task.worktree}`, 5);
   }
   const { error, ...kept } = task;
-  saveTask(h, { ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
+  store({ ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
     fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
   return { pick, rest, address };
 }
@@ -1314,10 +1356,11 @@ function recoverWorker(h, task, state, observed, timing) {
   if (!previous && !error && !idle) return {};
   let recovery = previous ? { ...previous } : { terminal: task.terminal, errors: 0 };
   if (recovery.state !== state) { recovery.state = state; recovery.since = now(); }
-  const persist = () => {
-    const latest = loadTask(h, task.id);
-    if (latest.state === 'working' && latest.terminal === task.terminal && JSON.stringify(latest.recovery) !== JSON.stringify(recovery)) saveTask(h, { ...latest, recovery });
-  };
+  const persist = () => taskTransaction(h, task.id, latest => {
+    if (sameWorker(latest, task) && JSON.stringify(latest.recovery) !== JSON.stringify(recovery)) {
+      writeJson(taskFile(h, task.id), { ...latest, recovery, updated: now() });
+    }
+  }, { observation: true });
   if (state === 'working' && Date.now() - observed.since >= timing.working) {
     recovery = { terminal: task.terminal, errors: 0, state, since: recovery.since };
   }
@@ -1340,10 +1383,11 @@ function recoverWorker(h, task, state, observed, timing) {
   const at = now(), attempt = error ? recovery.errors + 1 : 1;
   if (error) { recovery.errors = attempt; recovery.lastErrorNudge = at; }
   else recovery.idleNudged = at;
-  const latest = loadTask(h, task.id);
   // A fast worker may have reported during send: append history to its newest record.
-  saveTask(h, { ...latest, ...(latest.terminal === task.terminal ? { recovery } : {}),
-    nudges: [...(latest.nudges ?? []), { at, kind: error ? 'error' : 'idle', why: line ?? 'idle without a report', terminal: task.terminal, attempt }] });
+  taskTransaction(h, task.id, latest => {
+    writeJson(taskFile(h, task.id), { ...latest, ...(latest.terminal === task.terminal ? { recovery } : {}), updated: now(),
+      nudges: [...(latest.nudges ?? []), { at, kind: error ? 'error' : 'idle', why: line ?? 'idle without a report', terminal: task.terminal, attempt }] });
+  }, { observation: true });
   observed.checks = 0; // observe the effect before another message or hand-over
   console.log(error ? `== ${task.id}: ${from} stopped on an error (${line}); told to continue (${attempt} of 3)`
     : `== ${task.id}: ${from} is idle without a report; told to continue or report and run crew done (1 of 1)`);
@@ -1360,6 +1404,7 @@ function cmdRelaunch(args) {
   if (!['working', 'stopped', 'failed'].includes(task.state)) refuse(`Task ${id} is ${task.state}; only unfinished work is handed to another agent.`);
   if (!fs.existsSync(task.worktree)) refuse(`Task ${id} has no working copy any more (${task.worktree}); spawn a new task instead.`, 6);
   const moved = relaunch(h, task, words.join(' ').trim() || 'the coordinator handed the task over', flags);
+  if (moved.superseded) refuse(`Task ${id} changed during relaunch; inspect its current worker and retry if needed.`, 6);
   if (!moved.pick) refuse(`Task ${id} was not handed over: ${moved.why}`, 8);
   reviewLabels(h, id, 'rework');
   console.log(`relaunched ${id}: ${pickLabel(moved.pick)} in terminal ${moved.address}${moved.rest.length ? `, ${moved.rest.length} more can take over` : ''}; next: crew wait ${id}`);
@@ -1369,12 +1414,15 @@ function cmdDone(args) {
   const h = home();
   const id = args[0] ?? process.env.CREW_TASK;
   if (!id) refuse('Usage: crew done [<id>]');
-  const task = loadTask(h, id);
-  const mine = me();
-  if (task.terminal && mine && task.terminal !== mine) refuse(`Task ${id} belongs to terminal ${task.terminal}, not this one.`, 3);
-  if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
-  if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
-  saveTask(h, { ...task, state: 'reported', reported: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
+  loadTask(h, id);
+  const task = taskTransaction(h, id, current => {
+    const task = reviveRelaunchedTask(h, current), mine = me();
+    if (task.terminal && mine && task.terminal !== mine) refuse(`Task ${id} belongs to terminal ${task.terminal}, not this one.`, 3);
+    if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
+    if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
+    writeJson(taskFile(h, id), { ...task, state: 'reported', reported: now(), updated: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
+    return task;
+  }, { waitMs: 30000 }); // a new worker can finish before Core acknowledges its start
   if (task.reviews) {
     reviewLabels(h, id, 'verdict');
     if (loadTask(h, id).reviewVerdict?.stale) staleApproval(task.reviews);
@@ -1417,8 +1465,12 @@ function cmdWait(args) {
       // without a report has failed, whatever the reason.
       if (!check || !task.terminal) continue;
       const { state: seen, t } = probe(task.terminal);
+      // Core queries can span a handover or report. Discard their results when the
+      // worker changed, and let an in-flight relaunch publish before acting.
+      if (!sameWorker(loadTask(h, id), task) || fs.existsSync(`${taskFile(h, id)}.lock`)) { quiet.delete(id); observations.delete(id); continue; }
       const state = seen === 'live' ? (t.status?.state === 'done' ? 'idle' : t.status?.state) : seen;
       const previous = observations.get(id);
+      if (previous && previous.terminal !== task.terminal) quiet.delete(id);
       const observed = previous?.terminal === task.terminal && previous.state === state
         ? { ...previous, checks: previous.checks + 1 } : { terminal: task.terminal, state, since: Date.now(), checks: 1 };
       observations.set(id, observed);
@@ -1429,20 +1481,26 @@ function cmdWait(args) {
       }
       if (t?.status?.state) quiet.delete(id);
       if (seen !== 'live') {
-        saveTask(h, { ...task, state: 'failed', error: 'The worker terminal ended without a report.' });
-        settled.set(id, 'failed');
+        const failed = taskTransaction(h, id, current => {
+          if (!sameWorker(current, task)) return false;
+          writeJson(taskFile(h, id), { ...current, state: 'failed', error: ENDED_WITHOUT_REPORT, updated: now() });
+          return true;
+        }, { observation: true });
+        if (failed) { settled.set(id, 'failed'); reviewLabels(h, id, 'abandon'); }
       } else if (handover && AGENTS[task.agent]?.seen && !t.status?.state && startedLongAgo(task) && quiet.set(id, (quiet.get(id) ?? 0) + 1).get(id) >= 2) {
         // The agent is gone and left no report: the next candidate takes the task over.
         quiet.delete(id);
         const said = lastWords(task.terminal), reason = `its agent ended without a report${said ? ` (${said})` : ''}`, from = pickLabel(task.launch ?? { harness: task.agent });
-        const moved = relaunch(h, loadTask(h, id), reason);
+        const moved = relaunch(h, task, reason);
+        if (moved.superseded) continue;
         if (moved.pick) console.log(`== ${id}: ${from} is gone: ${reason}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
         else { blocked.set(id, `${from} is gone: ${reason}, and ${moved.why}`); settled.set(id, 'needs a person'); }
       } else if (handover && t.status?.state && !['working', 'blocked'].includes(t.status.state) && stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12)) {
         // The worker cannot go on for want of quota or a login: the next candidate of its
         // chain takes the task over in the same working copy, and the wait goes on.
         const reason = stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12), from = pickLabel(task.launch ?? { harness: task.agent });
-        const moved = relaunch(h, loadTask(h, id), reason);
+        const moved = relaunch(h, task, reason);
+        if (moved.superseded) continue;
         if (moved.pick) console.log(`== ${id}: ${from} stopped (${reason}); ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
         else { blocked.set(id, `${from} stopped (${reason}) and ${moved.why}`); settled.set(id, 'needs a person'); }
       } else if (t.status?.state === 'blocked') {
@@ -1457,6 +1515,7 @@ function cmdWait(args) {
           const latest = loadTask(h, id);
           if (latest.state !== 'working' || latest.terminal !== task.terminal) continue;
           const moved = relaunch(h, latest, recovery.handover);
+          if (moved.superseded) continue;
           if (moved.pick) console.log(`== ${id}: ${recovery.tried}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
           else { blocked.set(id, `${recovery.tried}, and ${moved.why}`); settled.set(id, 'needs a person'); }
         } else if (recovery.blocked) { blocked.set(id, recovery.blocked); settled.set(id, 'needs a person'); }
@@ -1537,6 +1596,7 @@ function cmdStop(args) {
   const task = loadTask(h, id);
   const result = stopWorker(task, { force });
   if (result.stopped && task.state !== 'closed') saveTask(h, { ...loadTask(h, id), state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now() });
+  if (result.stopped) reviewLabels(h, id, 'abandon');
   console.log(`${result.stopped ? 'stopped' : 'not stopped'} ${id}: ${result.how}`);
   if (!result.stopped) process.exitCode = 6;
 }
@@ -1861,6 +1921,7 @@ function cmdFinish(args) {
   if (!id) refuse('Usage: crew finish <id> [--force]');
   const task = loadTask(h, id);
   if (task.state === 'closed') {
+    reviewLabels(h, id, 'abandon');
     // A closed task whose copy still waits: --force is the person's word to discard what was
     // found in it and return it now. A terminal in it still keeps it, forced or not.
     if (task.copyToReturn && force) {
@@ -1921,6 +1982,7 @@ function cmdFinish(args) {
     saveTask(h, closed);
     console.log(`finished ${id} (${result.how})${back.said}${comparison?.unseen ? '; discarded unseen after explicit --force' : ''}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}`);
   }
+  reviewLabels(h, id, 'abandon');
   // A legacy treehouse task moves its scout's item even after a review, as it always did.
   if (task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews)) backlogMove(h, id, 'done');
   returnWaitingCopies(h, { skip: id });
@@ -2005,21 +2067,29 @@ function recordReviewVerdict(h, task, reviewer, verdict, currentHead, pr) {
 // Advisory hooks only: saved launch/report, successful follow-up/handover, or plain land.
 // Each PR state/head read is bounded and attempted once, with no label retries or leases.
 function reviewLabels(h, id, action = 'start') {
-  const errors = [], completed = action === 'verdict', rework = action === 'rework', check = action === 'check';
+  const errors = [], completed = action === 'verdict', rework = action === 'rework', check = action === 'check', abandon = action === 'abandon', starting = action === 'start';
   try {
     const reviewer = loadTask(h, id), verdict = completed ? fs.readFileSync(reviewer.report, 'utf8').split(/\r?\n/)[0].trim() : null;
+    if (!(rework || check) && !reviewer.reviews) return;
+    if (starting && reviewer.state !== 'working' || abandon && reviewer.reviewVerdict) return;
+    if (abandon) {
+      taskTransaction(h, id, latest => {
+        if (!latest.reviewLabelEnded) writeJson(taskFile(h, id), { ...latest, reviewLabelEnded: now(), updated: now() });
+      });
+      if (allTasks(h).some(t => t.id !== id && t.reviews === reviewer.reviews && ['preparing', 'working'].includes(t.state) && !t.reviewVerdict && !t.reviewLabelEnded)) return;
+    }
     if (completed && verdict !== 'APPROVE' && verdict !== 'CHANGES NEEDED') return;
     const task = rework || check ? reviewer : loadTask(h, reviewer.reviews);
     if (task.kind !== 'ship' || task.selfFix) return;
     const first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
     if (task.stage === 'plan' || /^Plan:/i.test(first)) return;
     if (completed) recordReviewVerdict(h, task, reviewer, verdict, reviewHeadOf(task));
-    if (check && task.reviewVerdict?.verdict !== 'APPROVE') return;
+    if (check && !task.reviewVerdict) return;
     if (rework && task.reviewVerdict) saveTask(h, { ...loadTask(h, id), reviewVerdict: { ...task.reviewVerdict, needsReview: true } });
-    let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr;
+    let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr ?? (abandon ? reviewer.reviewLabelBefore?.pr : null);
     if (!url && rework && run('git', ['-C', task.worktree, 'remote', 'get-url', 'origin'], { timeout: 2000 }).code !== 0) return;
     if (!url) {
-      const found = gh(['pr', 'view', branchOf(task), '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 10000 });
+      const found = gh(['pr', 'view', branchOf(task), '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 2000 });
       if (found.code !== 0 && /no pull requests? found|no pull request associated/i.test(found.stderr)) return;
       if (found.code !== 0) throw new Error(found.stderr || 'PR lookup failed');
       url = found.stdout.trim();
@@ -2042,13 +2112,13 @@ function reviewLabels(h, id, action = 'start') {
     let recorded;
     if (completed) recorded = recordReviewVerdict(h, task, reviewer, verdict, currentHead, url);
     if (check) {
-      const previous = task.reviewVerdict, stale = !previous.head || !currentHead || previous.head !== currentHead;
-      saveTask(h, { ...loadTask(h, id), reviewVerdict: { ...previous, currentHead, stale, needsReview: previous.needsReview || stale } });
+      const previous = task.reviewVerdict, stale = previous.verdict === 'APPROVE' && (!previous.head || !currentHead || previous.head !== currentHead);
+      recorded = { ...previous, currentHead, stale, needsReview: previous.needsReview || stale };
+      saveTask(h, { ...loadTask(h, id), reviewVerdict: recorded });
       if (open && stale) staleApproval(id);
-      return;
     }
-    if (!open && !completed) {
-      if (!rework) console.log(`crew: implementation PR ${url} is already ${pr.merged_at ? 'merged' : 'closed'}; review labels skipped`);
+    if (!open) {
+      if (starting) console.log(`crew: implementation PR ${url} is already ${pr.merged_at ? 'merged' : 'closed'}; review labels skipped`);
       return;
     }
     const pages = JSON.parse(api('GET', `${repo}/actions/variables`, ['--paginate', '--slurp']));
@@ -2070,23 +2140,43 @@ function reviewLabels(h, id, action = 'start') {
       if (manifest?.version !== 1 || keys.some(key => !validName(manifest.labels?.[key]?.name) || (manifest.labels[key].previousNames !== undefined && (!Array.isArray(manifest.labels[key].previousNames) || !manifest.labels[key].previousNames.every(validName))))) throw new Error('invalid review label manifest');
       palette = keys.map(key => ({ name: manifest.labels[key].name, previousNames: manifest.labels[key].previousNames ?? [] }));
     } catch (error) { errors.push(`review label manifest: ${error.message}; using built-in defaults`); }
-    const desired = open ? palette[rework || completed && (verdict !== 'APPROVE' || recorded.stale) ? 2 : completed ? 1 : 0].name : null;
     const current = JSON.parse(api('GET', issue, ['--paginate', '--slurp'])).flat();
     if (!Array.isArray(current) || current.some(l => typeof l?.name !== 'string')) throw new Error('PR labels unreadable');
-    if (rework && !current.some(l => [palette[1].name, ...palette[1].previousNames].includes(l.name))) return;
+    const assigned = index => current.some(l => [palette[index].name, ...palette[index].previousNames].includes(l.name));
+    if (rework && !palette.some((_, i) => assigned(i))) return;
+    const needsRework = rework || completed && (verdict !== 'APPROVE' || recorded.stale) || check && recorded.needsReview;
+    let desired = palette[needsRework ? 2 : completed || check ? 1 : 0].name;
+    if (starting) {
+      // Save stable roles before removing anything, including labels added by hand.
+      const prior = [1, 2].filter(assigned);
+      const inherited = assigned(0) ? allTasks(h).find(t => t.id !== id && t.reviews === task.id && ['preparing', 'working'].includes(t.state) && t.reviewLabelBefore?.pr === url && !t.reviewVerdict && !t.reviewLabelEnded)?.reviewLabelBefore : null;
+      const reviewLabelBefore = inherited ?? { pr: url, key: prior.length === 1 ? keys[prior[0]] : null, tells: task.tells ?? 0, relaunched: task.relaunched ?? null };
+      taskTransaction(h, id, latest => {
+        if (latest.state === 'working') writeJson(taskFile(h, id), { ...latest, reviewLabelBefore, updated: now() });
+      });
+    }
+    if (abandon) {
+      // Preserve newer verdicts/follow-ups; an interrupted start may have removed
+      // the old verdict without adding activity yet, so restore that empty state too.
+      if (!assigned(0) && (assigned(1) || assigned(2) || !reviewer.reviewLabelBefore)) return;
+      const before = reviewer.reviewLabelBefore, changed = before && (before.tells !== (task.tells ?? 0) || before.relaunched !== (task.relaunched ?? null));
+      const index = changed ? 2 : keys.indexOf(before?.key);
+      desired = index > 0 ? palette[index].name : null;
+    }
     const remove = new Set(palette.flatMap(label => [label.name, ...label.previousNames]).filter(name => name !== desired));
+    let removalFailed = false;
     for (const name of remove) {
       if (current.some(l => l.name === name)) {
         // Completion during a lookup cancels the rest of this start hook, not the verdict.
-        if (!completed && !rework && loadTask(h, id).state !== 'working') return;
+        if (starting && loadTask(h, id).state !== 'working') return;
         try { api('DELETE', `${issue}/${encodeURIComponent(name)}`); }
-        catch (error) { errors.push(error.message); }
+        catch (error) { removalFailed = true; errors.push(error.message); }
       }
     }
-    if (!desired) return; // A late verdict only clears managed labels on a closed PR.
+    if (!desired || removalFailed) return; // Never knowingly add a conflicting managed label.
     try {
       if (JSON.parse(api('GET', `${repo}/labels/${encodeURIComponent(desired)}`)).name !== desired) throw new Error(`shared label not defined: ${desired}`);
-      if (!completed && !rework && loadTask(h, id).state !== 'working') return;
+      if (starting && loadTask(h, id).state !== 'working') return;
       api('POST', issue, ['--input', '-'], { labels: [desired] });
     } catch (error) { errors.push(error.message); }
   } catch (error) { errors.push(error.message); }
@@ -2556,8 +2646,9 @@ function fleetTasks(h) {
 }
 function cmdFleetStatus(h, discover) {
   const { owner, live } = ownerState(h), currentTime = Date.now();
-  // One state-only pass; never enter the full status/report/Core/copy projection.
-  const records = fleetTasks(h).filter(t => fleetTaskVisible(t, currentTime)
+  // State-only apart from the narrowly proven legacy terminal-race recovery.
+  // Never enter the full report/copy projection.
+  const records = fleetTasks(h).map(t => t.state === 'failed' ? loadTask(h, t.id) : t).filter(t => fleetTaskVisible(t, currentTime)
     || (discover && t.state === 'closed' && t.kind === 'ship' && t.pr == null && !savedPrFacts(t)));
   const results = new Map(records.map(t => [t.id, localFleetPr(t)]));
   if (discover) {

@@ -231,6 +231,14 @@ Claude profile.
   the current session even if busy, without an idle test or `--force`; the copy stays. Without
   selection flags it uses the saved list and excludes every tried candidate. A selection flag
   rebuilds the list from current configuration and excludes only the current candidate.
+  Terminal replacement is serialized with task writes: a concurrent wait discards observations
+  of the previous worker, including its terminal ending, and follows the replacement instead.
+  A replacement that reports before Core acknowledges its start waits for publication of its
+  terminal; the old worker cannot report for it.
+  For the older wait/relaunch race, loading a task with the exact terminal-ended failure can
+  recover a working view when Core proves one live worker with this task's and home's labels
+  in the same copy. Ambiguous workers or unanswered Core queries leave the failure unchanged.
+  Status does not rewrite the record; the recovered worker's `crew done` saves its correct terminal.
   A provider or network error is different: after two consecutive Core `error` observations, crew sends a short message to continue from where the worker stopped.
   The first message waits 30 seconds from the first error observation; the second waits two minutes after the first message, and the third waits five minutes after the second.
   After three messages and two further error observations without recovery, the existing hand-over starts the next candidate with the last screen error as its reason.
@@ -309,8 +317,8 @@ matching current verdict label. Both hooks also remove assigned historical names
 `🤖 Under review` and `🤖 Changes needed`, preserving unrelated labels. Malformed or missing
 reports cause no label change. Before changing labels, each hook reads the PR state once
 with a two-second timeout and no retries; a failed or invalid read warns and skips all writes.
-Review start skips merged/closed PRs and prints that state. A verdict on a now-merged/closed
-PR removes assigned current and historical managed review labels without adding a verdict.
+Review start skips merged/closed PRs and prints that state. All hooks leave labels on
+merged/closed PRs untouched, including late verdicts and abandoned reviews.
 Workflow, gate and plain projects use the same hooks; Plan reports skip label operations.
 Plain branches without a PR at review time still record review evidence, but skip labels.
 Status remains read-only.
@@ -321,15 +329,24 @@ Reviewers are given a fixed branch-head SHA, recorded as `reviewHead`. A valid v
 For a PR, that same state read supplies its current head. An `APPROVE` for a different or
 unverifiable head sets Rework instead of Approved and says the task needs another review.
 Before a plain branch has a PR, the local branch head supplies the comparison. Plain
-`crew land`, including a repeated land, checks the PR head against the last approval and
-warns and updates recorded freshness without writing labels. Status JSON exposes the saved
+`crew land`, including a repeated land, checks the PR head against the last verdict,
+updates recorded freshness and normalizes open-PR labels to Approved or Rework. A stale
+approval warns and selects Rework. Status JSON exposes the saved
 verdict; plain status says `needs another review` when recorded, without new GitHub reads.
 
-After a successful `crew tell` or `crew relaunch` of a ship task, an existing current or
-historical Approved assignment is best-effort swapped to the current Rework name on an
-open PR. Recorded verdicts are marked as needing another review. No PR, no Approved
-assignment, or a merged/closed PR causes no label writes. A later review and verdict use
-the ordinary Review/Approved/Rework sequence.
+After a successful `crew tell` or `crew relaunch` of a ship task, existing managed
+assignments (including an active Review) are best-effort replaced by the current Rework
+name on an open PR. Recorded verdicts are marked as needing another review. No PR, no
+managed assignment, or a merged/closed PR causes no label writes. Every label-setting hook
+removes the other managed roles and historical aliases, even when added by hand; if a
+removal fails, it does not knowingly add a conflicting label. Unrelated labels stay.
+
+Before starting review, crew saves the prior unambiguous verdict's stable role on the
+reviewer task. Stopping, finishing, observing terminal failure or exhausting handover
+without a verdict removes Review and restores that role (using its current manifest name),
+or leaves none when no role was saved. Cleanup waits for the last active local reviewer;
+concurrent reviews inherit the original snapshot. A newer verdict or follow-up's Rework
+is not undone. Cancellation during start lookups cannot re-add Review afterwards.
 
 Names come from `labels/base.json` on the source repository's default branch. Set
 `CREW_REVIEW_LABELS_REPO=owner/repository` to choose the source (default
@@ -348,14 +365,16 @@ It uses signed-in `gh`, repository-variable read access and sufficient label-wri
 any manifest read or label write. Any failure prints one warning line without changing task
 state or exit status. A missing current definition skips that addition but still permits
 removals; crew never adds a historical name instead. Each write is attempted once; a start
-hook stops writing once the reviewer is no longer working. There are no retries, locks,
-pending label-state files, overlap tracking or background lifecycle cleanup.
+hook stops writing once the reviewer is no longer working. There are no label retries,
+network-spanning locks, pending label-state files or background sweeps. Prior-role and local abandonment evidence live on the task record.
 
-A crashed/stopped reviewer or failed removal leaves activity labels until the shared workflow
-clears them on merge/close or a person removes them. With two reviewers, the first verdict
-removes activity labels while the other may still be running. Swaps are best effort, not atomic;
-a PR can close or its head can move after the state read but before a write. Merged/closed PRs should carry no
-managed review labels. Labels never gate delivery or imply GitHub approval.
+An unobserved crash or failed cleanup can still leave activity labels for a person or the
+shared workflow to reconcile. With two reviewers, the first verdict removes activity while
+the other may still be running. Swaps are best effort, not atomic; a PR can close or its head
+can move after the state read but before a write. Crew never reconciles labels added by hand
+until a relevant command runs; GitHub-side exclusivity needs the shared workflow's label
+job to remove the other managed roles on an open PR's managed-label event, resolving current
+and historical names from the same manifest. Labels never gate delivery or imply GitHub approval.
 
 ## Companion tools
 
@@ -443,7 +462,9 @@ still produce many rows.
 
 The help output (`crew --help` or `node crew.mjs --help`) advertises the literal
 `--view fleet` as the capability signal. Check both version markers before consuming
-this contract. Unknown view names exit 2
+this contract. A narrow exception to state-only fleet reads is recovery of a recorded
+terminal-ended failure from the older wait/relaunch race, using the Core proof described above.
+Unknown view names exit 2
 with `unsupported-status-view: <name>`; missing values or fleet without JSON are usage
 errors. A client can probe and fall back to `status --all --json --discover-prs` on an
 unsupported capability, not on a transport/authentication failure or timeout. Older Crew
