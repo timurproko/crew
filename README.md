@@ -307,7 +307,13 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
 - `crew review` and `crew tell` work the same way for a workflow project's implementation.
 
 For every kind, first land requires a reported worker, an existing copy, and clean tracked
-and untracked files, even when it only records a link. An already-landed PR can return early.
+and untracked files, even when it only records a link. An already-landed open PR can return early.
+When land freshly verifies the task's exact PR merged, it uses finish's guarded cleanup,
+including on repeated land, without implicit force. Busy workers, protected work or unrelated
+terminals still prevent unsafe cleanup. Finish and merged-task land include one cleanup line
+saying which ignored roots or local changes/scratch were discarded, or `discarded none` when
+nothing was removed. A failed partial discard is identified as incomplete rather than reported
+as a successful return; reports and unmerged branches stay retained.
 
 ### Advisory review labels
 

@@ -23,7 +23,7 @@
 
 ## 4. Finish and merged land explain discarded contents once
 
-- [ ] 4.1 Reuse guarded cleanup from land for a verified merged PR, including repeated/already-landed tasks; cover open-PR behavior remaining unchanged and merged tasks with blocked cleanup preserving work and busy/foreign terminals.
-- [ ] 4.2 Produce one accurate bounded cleanup summary for ignored roots, owned terminals and copy disposition; assert successful, empty, postponed, failed and repeated cleanup never falsely claim disposal or duplicate the task's summary in a sweep.
-- [ ] 4.3 Update README's merged-land/output contract and run focused land/summary regressions for workflow, gate and plain delivery paths.
-- [ ] 4.4 Run `node crew.test.mjs` once on the completed implementation in disposable fixture homes and record the result and any remaining gaps; run strict OpenSpec validation and final PR-body validation before the final outcome is ticked.
+- [x] 4.1 Reuse guarded cleanup from land for a verified merged PR, including repeated/already-landed tasks; cover open-PR behavior remaining unchanged and merged tasks with blocked cleanup preserving work and busy/foreign terminals.
+- [x] 4.2 Produce one accurate bounded cleanup summary for ignored roots, owned terminals and copy disposition; assert successful, empty, postponed, failed and repeated cleanup never falsely claim disposal or duplicate the task's summary in a sweep.
+- [x] 4.3 Update README's merged-land/output contract and run focused land/summary regressions for workflow, gate and plain delivery paths.
+- [x] 4.4 Run `node crew.test.mjs` once on the completed implementation in disposable fixture homes and record the result and any remaining gaps; run strict OpenSpec validation and final PR-body validation before the final outcome is ticked.

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead } from './crew.mjs';
@@ -631,17 +632,22 @@ else console.log(JSON.stringify(pr.state === 'MERGED' ? [pr] : []));`);
   const pr = patch => fs.writeFileSync(control, JSON.stringify({ ...JSON.parse(fs.readFileSync(control)), ...patch }));
   return { ...f, origin, control, call, spawn, pr };
 }
-gapTests['closed-scratch'] = () => {
+gapTests['closed-scratch'] = async () => {
   const f = leftoversFixture('scratch');
   for (const state of ['MERGED', 'CLOSED']) {
     const t = f.spawn(state.toLowerCase()); f.pr({ state, ...(state === 'CLOSED' ? { mergedAt: null } : {}) });
     const probe = path.join(t.worktree, '.artifacts', 'gh-probe'); git('init', '-q', probe); commit(probe, { note: 'throwaway' }, 'probe');
     const outside = path.join(f.dir, `outside-${state}`); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'keep'), 'mine');
     fs.symlinkSync(outside, path.join(t.worktree, '.artifacts', 'link'), WINDOWS ? 'junction' : 'dir');
-    const socket = path.join(t.worktree, '.artifacts', 'herdr-app.sock'); fs.writeFileSync(socket, 'unreadable socket placeholder');
+    const socket = path.join(t.worktree, '.artifacts', 'herdr-app.sock');
+    const server = WINDOWS ? null : net.createServer();
+    if (server) await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socket, resolve); });
+    else fs.writeFileSync(socket, 'unreadable socket placeholder');
     const preload = path.join(f.dir, 'unreadable.cjs');
     fs.writeFileSync(preload, `const fs=require('node:fs'),orig=fs.lstatSync; fs.lstatSync=(p,...a)=>{if(String(p).endsWith('herdr-app.sock')) throw Error('socket cannot be statted');return orig(p,...a)};`);
-    const r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
+    let r;
+    try { r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` }); }
+    finally { if (server) await new Promise(resolve => server.close(resolve)); }
     assert.equal(r.code, 0, r.out); assert.ok(!fs.existsSync(path.join(t.worktree, '.git')), r.out);
     assert.equal(fs.readFileSync(path.join(outside, 'keep'), 'utf8'), 'mine');
     assert.equal(Boolean(git('-C', f.repo, 'branch', '--list', t.branch).trim()), state === 'CLOSED', 'Closed is not merged');
@@ -664,6 +670,10 @@ gapTests['closed-refusals'] = () => {
   for (const [mode, patch] of Object.entries({ open: { state: 'OPEN' }, stale: { headRefOid: 'a'.repeat(40) }, branch: { headRefName: 'feature/other' }, foreign: { headRepository: { nameWithOwner: 'other/repo' } }, down: { down: true }, absent: { state: 'NOT_FOUND' } })) {
     const t = f.spawn(mode); f.pr(patch); unchanged(t, /keep|head|unpublished/i);
   }
+  const openPrivate = f.spawn('open-private'); f.pr({ state: 'OPEN' });
+  fs.rmSync(path.join(openPrivate.worktree, '.artifacts'), { recursive: true });
+  commit(openPrivate.worktree, { 'private.txt': 'not pushed' }, 'private open PR work');
+  unchanged(openPrivate, /unpushed/);
   const wrong = f.spawn('wrong-url'); f.save({ ...f.task(wrong.id), pr: 'https://github.com/other/repo/pull/12' }); unchanged(wrong, /keep/);
   const forced = f.spawn('forced'); f.pr({ state: 'OPEN' }); assert.equal(f.call(['finish', forced.id, '--force']).code, 0);
 };
@@ -762,6 +772,69 @@ cp.spawnSync=(p,a,o)=>{if(a?.[0]==='-c'&&a[1].startsWith('a1 api ')){fs.appendFi
   const r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` }); assert.equal(r.code, 0, r.out);
   const calls = fs.readFileSync(log, 'utf8'); assert.match(calls, /session.exit/); assert.match(calls, /session.lifecycle/); assert.match(calls, /fake-session/);
   assert.ok(!readWorld().terminals[t.terminal] && !readWorld().terminals[second]);
+};
+
+gapTests['merged-land-summary'] = () => {
+  const f = leftoversFixture('land-summary');
+  for (const kind of ['plain', 'workflow', 'gate']) {
+    const t = f.spawn(kind); f.save({ ...f.task(t.id), ...(kind === 'workflow' ? { workflow: 'delivery', stage: 'implementation' } : { landed: '2026-01-01' }), ...(kind === 'gate' ? { gate: 'no-mistakes' } : {}) });
+    let r = f.call(['land', t.id]); assert.equal(r.code, 0, r.out);
+    assert.equal(f.task(t.id).state, 'closed'); assert.ok(!readWorld().terminals[t.terminal]);
+    assert.match(r.out, /discarded ignored scratch \(\.artifacts\/\)/);
+    assert.equal(r.out.trim().split('\n').filter(l => l.includes('discarded')).length, 1, r.out);
+    r = f.call(['finish', t.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /already closed; discarded none/);
+    r = f.call(['land', t.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /already closed; discarded none/);
+  }
+  const dirty = f.spawn('dirty'); fs.writeFileSync(path.join(dirty.worktree, 'change.txt'), 'mine');
+  let r = f.call(['land', dirty.id]); assert.equal(r.code, 6, r.out); assert.equal(readWorld().terminals[dirty.terminal].state, 'live');
+  const busy = f.spawn('busy'); setTerminal(busy.terminal, { status: { app: 'pi', state: 'working' } });
+  r = f.call(['land', busy.id]); assert.equal(r.code, 6, r.out); assert.equal(readWorld().terminals[busy.terminal].state, 'live');
+  const held = f.spawn('held'); f.guest(held); r = f.call(['land', held.id]); assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /kept for now.*discarded none/); assert.ok(fs.existsSync(path.join(held.worktree, '.artifacts', 'KEEP')));
+  f.leave(); r = f.call(['land', held.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /discarded ignored scratch/);
+  const open = f.spawn('open'); f.pr({ state: 'OPEN' });
+  r = f.call(['land', open.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /already has a pull request/);
+  assert.equal(readWorld().terminals[open.terminal].state, 'live'); assert.ok(fs.existsSync(path.join(open.worktree, '.artifacts', 'KEEP')));
+  const empty = f.spawn('empty'); fs.rmSync(path.join(empty.worktree, '.artifacts'), { recursive: true });
+  r = f.call(['finish', empty.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /discarded none/);
+};
+gapTests['closed-delivery'] = () => {
+  const f = leftoversFixture('delivery'), tool = path.join(f.dir, 'delivery.mjs'), control = path.join(f.dir, 'delivery-down');
+  fs.writeFileSync(tool, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process'; const copy=process.argv[3];
+if(fs.existsSync(copy+'/.artifacts')){console.error('nested repositories or KEEP still present');process.exit(1)}
+if(fs.existsSync(${JSON.stringify(control)})){console.error('injected return failure');process.exit(1)}
+const r=spawnSync('git',['worktree','remove','--force',copy],{encoding:'utf8'});if(r.status!==0){console.error(r.stderr);process.exit(1)}console.log('slot returned');`);
+  for (const fail of [false, true]) {
+    const t = f.spawn(fail ? 'failure' : 'success'); f.save({ ...f.task(t.id), via: 'delivery', pooled: true });
+    git('init', '-q', path.join(t.worktree, '.artifacts', 'probe'));
+    if (fail) fs.writeFileSync(control, 'down');
+    const r = f.call(['finish', t.id], { CREW_TOOL_DELIVERY: tool }); assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /discarded ignored scratch/); assert.ok(!fs.existsSync(path.join(t.worktree, '.artifacts')));
+    assert.equal(Boolean(f.task(t.id).copyToReturn), fail, r.out);
+    if (fail) { assert.match(r.out, /kept for now/); fs.rmSync(control); assert.equal(f.call(['finish', t.id], { CREW_TOOL_DELIVERY: tool }).code, 0); }
+    else assert.match(r.out, /returned to the pool/);
+  }
+};
+
+gapTests['closed-clean-race'] = () => {
+  const f = leftoversFixture('clean-race'), t = f.spawn('late'), preload = path.join(f.dir, 'clean.cjs'), late = path.join(t.worktree, 'mine.txt');
+  fs.writeFileSync(preload, `const fs=require('node:fs'),cp=require('node:child_process'),orig=cp.spawnSync;cp.spawnSync=(p,a,o)=>{const r=orig(p,a,o);if(p==='git'&&a.includes('clean'))fs.writeFileSync(${JSON.stringify(late)},'mine');return r};require('node:module').syncBuiltinESMExports();`);
+  const r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
+  assert.equal(r.code, 0, r.out); assert.match(r.out, /kept for now.*protected work changed.*discarded ignored scratch/);
+  assert.equal(fs.readFileSync(late, 'utf8'), 'mine'); assert.ok(f.task(t.id).copyToReturn);
+};
+
+gapTests['owned-late-publication'] = () => {
+  const f = gapFixture('owned-late'), t = f.spawn('late', ['--agent', 'pi']), bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
+  const preload = path.join(f.dir, 'late.cjs'), launch = path.join(f.dir, 'launch.log');
+  fs.writeFileSync(preload, `const fs=require('node:fs'),cp=require('node:child_process'),orig=cp.spawnSync;let launched=false;
+cp.spawnSync=(p,a,o)=>{const r=orig(p,a,o);if(!launched&&a?.includes(${JSON.stringify(fake)})&&a.includes('kill')){launched=true;
+const next=orig(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},'relaunch',${JSON.stringify(t.id)},'--agent','pi','--model','late-worker'],{cwd:${JSON.stringify(f.home)},encoding:'utf8',env:{...process.env,NODE_OPTIONS:'',CREW_AGENT_PATH:${JSON.stringify(bin)}}});fs.writeFileSync(${JSON.stringify(launch)},next.stdout+next.stderr);if(next.status!==0)throw Error('replacement failed '+next.stderr)}return r};require('node:module').syncBuiltinESMExports();`);
+  const r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
+  assert.equal(r.code, 0, r.out); assert.match(fs.readFileSync(launch, 'utf8'), /relaunched/);
+  const closed = f.task(t.id); assert.equal(closed.terminals.length, 2);
+  for (const worker of closed.terminals) assert.ok(!readWorld().terminals[worker.address], `Late owned terminal ${worker.address} must be removed`);
+  assert.ok(!closed.copyToReturn && !fs.existsSync(t.worktree), r.out);
 };
 
 gapTests.ignored = () => {

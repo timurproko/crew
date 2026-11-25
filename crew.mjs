@@ -1695,6 +1695,7 @@ function describeHolders(holders, folder) {
 // legacy treehouse pool, or git. Never refuses: { ok, said, leftover } or { ok: false, why },
 // so finish can refuse with `why` and the later sweep can report it and go on.
 function returnCopy(task, project, { force = false, scratch = null } = {}) {
+  const contents = fs.existsSync(task.worktree) ? gitStatus(task.worktree, '--ignored') : [];
   let discarded = [];
   if (scratch) {
     // Only the verified closed-PR path may bypass ignored KEEP/nested-repository
@@ -1708,9 +1709,19 @@ function returnCopy(task, project, { force = false, scratch = null } = {}) {
     // -X is ignored-only; the second -f permits ignored probe repositories.
     // Git does not follow directory symlinks or remove tracked files.
     const clean = run('git', ['-C', task.worktree, 'clean', '-ff', '-d', '-X'], { timeout: 60000 });
-    if (clean.code !== 0) return { ok: false, why: `ignored scratch cleanup failed (${lastLine(clean.stderr)}); some ignored scratch may have been discarded` };
+    if (clean.code !== 0) return { ok: false, partial: true, why: `ignored scratch cleanup failed (${lastLine(clean.stderr)})` };
+    const after = snapshotCopy(task.worktree, { scratch: true });
+    if (!after || after.incomplete || Object.keys(after.files).length || after.head !== scratch.head || after.operations.length)
+      return { ok: false, scratch: true, discarded, why: 'protected work changed during ignored scratch cleanup' };
   }
-  return { ...releaseCopy(task, project, { force: force || Boolean(scratch) }), discarded };
+  const back = releaseCopy(task, project, { force: force || Boolean(scratch) });
+  return { ...back, scratch: Boolean(scratch), discarded: scratch ? discarded : back.ok ? contents?.map(e => e.file) ?? [] : [],
+    unseen: back.ok && contents === null, partial: !back.ok && !scratch };
+}
+function discardSummary(back) {
+  if (back?.partial) return '; discard incomplete: some contents may have been removed';
+  if (back?.unseen) return '; discarded unseen after explicit --force';
+  return back?.discarded?.length ? `; discarded ${back.scratch ? 'ignored scratch' : 'local changes/scratch'} (${listFiles(back.discarded)})` : '; discarded none';
 }
 function releaseCopy(task, project, { force = false } = {}) {
   if (task.via === 'delivery') {
@@ -1793,14 +1804,19 @@ function closedPrScratch(h, task) {
     || !url.toLowerCase().startsWith(`https://github.com/${repository.toLowerCase()}/pull/`)) return null;
   const found = readPrAtUrl(url, 'headRefOid headRefName headRepository { nameWithOwner }', { cwd: project.path, timeout: 2000 });
   const pr = found?.pr;
-  if (!pr || !['MERGED', 'CLOSED'].includes(pr.state) || pr.headRefName !== branchOf(task)
+  if (!pr || !['OPEN', 'MERGED', 'CLOSED'].includes(pr.state) || pr.headRefName !== branchOf(task)
     || pr.headRepository?.nameWithOwner?.toLowerCase() !== repository.toLowerCase()) return null;
   rememberTaskPr(h, task, found.facts);
+  if (pr.state === 'OPEN') {
+    const ahead = unpushedCommits(git, branchOf(task));
+    if (ahead === undefined || ahead === null) return { state: pr.state, why: 'publication that could not be proved against origin' };
+    return ahead ? { state: pr.state, why: `${ahead} unpushed commits` } : null;
+  }
   const head = git('rev-parse', '--verify', 'HEAD');
-  if (head.code !== 0 || pr.headRefOid !== head.stdout.trim()) return { why: 'unpublished work or a local head not covered by the closed PR' };
+  if (head.code !== 0 || pr.headRefOid !== head.stdout.trim()) return { state: pr.state, why: 'unpublished work or a local head not covered by the closed PR' };
   const behind = unpushedCommits(git, branchOf(task));
-  if (behind === undefined) return { why: 'publication that could not be checked against origin' };
-  if (behind > 0) return { why: `${behind} unpushed commits` };
+  if (behind === undefined) return { state: pr.state, why: 'publication that could not be checked against origin' };
+  if (behind > 0) return { state: pr.state, why: `${behind} unpushed commits` };
   return { head: head.stdout.trim(), state: pr.state };
 }
 function workInCopy(task, snapshot) {
@@ -1967,19 +1983,25 @@ function removeOneStoppedTerminal(task) {
 // and not over work written or marked in it since finish, unless the person asks for that
 // now (`crew finish <id> --force` on the closed task). A --force given at finish covered only
 // what was there then. { state: returned | gone | held | silent | kept | failed, line }.
-function returnWaiting(h, task, { force = false } = {}) {
+function returnWaiting(h, task, options = {}) {
+  const back = tryReturnWaiting(h, task, options);
+  return { ...back, line: back.line + discardSummary(back.disposal) };
+}
+function tryReturnWaiting(h, task, { force = false } = {}) {
   const { copyToReturn, ...rest } = task, project = projectOf(h, task);
   // A new explicit force accepts what is here now, not work written during the stop/removal
   // it is about to retry. Keep the original durable baseline if more work appears meanwhile.
   const scratch = !force && fs.existsSync(task.worktree) ? closedPrScratch(h, task) : null;
   if (scratch?.why) return { state: 'kept', line: `the working copy of ${task.id} waits: ${scratch.why}` };
   const accepted = force ? snapshotCopy(task.worktree) : copyToReturn.left;
-  if (copyToReturn.stopPending) {
+  const stopped = copyToReturn.stoppedTerminals ?? (copyToReturn.stopPending ? [] : [task.terminal]);
+  if (copyToReturn.stopPending || ownedTerminals(task).some(t => !stopped.includes(t.address))) {
     // The stop was requested but not confirmed. Reapply idle/busy protection before any
     // further lifecycle action; uncertainty never grants permission to discard the copy.
     try {
       const result = stopTaskWorkers(task, { force });
       copyToReturn.pendingTerminals = result.pending;
+      copyToReturn.stoppedTerminals = ownedTerminals(task).filter(t => !result.pending.includes(t.address)).map(t => t.address);
       saveTask(h, task);
       if (!result.stopped) return { state: 'held', line: `The working copy of ${task.id} is kept: its worker stop is not confirmed (${result.how}). The next crew finish or crew start retries it.` };
       copyToReturn.stopPending = false;
@@ -2007,12 +2029,12 @@ function returnWaiting(h, task, { force = false } = {}) {
   if (check.kept) return { state: 'kept', line: `the working copy of finished task ${task.id} waits: ${check.kept.text}. ${force ? 'The copy changed during this forced attempt; stop writes to it before retrying force.' : `\`crew finish ${task.id} --force\` discards its present contents and returns the copy.`}` };
   // What is left was accepted at finish (or now): discarding it is what was asked.
   const back = returnCopy(task, project, { force: check.leftovers, scratch });
-  if (!back.ok) return { state: 'failed', line: `the working copy of ${task.id} was not returned yet: ${back.why}` };
+  if (!back.ok) return { state: 'failed', disposal: back, line: `the working copy of ${task.id} was not returned yet: ${back.why}` };
   saveTask(h, { ...rest, copyReturned: now() });
-  return { state: 'returned', line: `returned the working copy of finished task ${task.id}${back.said}${check.unseen ? '; discarded unseen after explicit --force' : ''}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}` };
+  return { state: 'returned', disposal: { ...back, unseen: Boolean(check.unseen) || back.unseen }, line: `returned the working copy of finished task ${task.id}${back.said}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}` };
 }
 
-function cmdFinish(args) {
+function cmdFinish(args, { scratchProof } = {}) {
   const h = home();
   requireOwner(h, 'finish work');
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
@@ -2030,7 +2052,7 @@ function cmdFinish(args) {
       // Asked again, perhaps after the tab was closed: try this copy now and say how it stands.
       const back = returnWaiting(h, task);
       console.log(back.state === 'returned' || back.state === 'gone' ? `${id} is already closed; ${back.line}` : `${id} is already closed; its working copy still waits to be returned: ${back.line}`);
-    } else console.log(`${id} is already closed`);
+    } else console.log(`${id} is already closed; discarded none`);
     returnWaitingCopies(h, { skip: id });
     return;
   }
@@ -2040,7 +2062,7 @@ function cmdFinish(args) {
   if (fs.existsSync(task.worktree) && otherTerminalsIn(task.worktree, task.terminal) === null) refuse(`${CORE_SILENT} the terminals in ${task.worktree}; nothing was removed. Try again.`, 4);
   // Establish the accepted baseline first, and derive the protective refusal from it.
   // A separate earlier clean result must never authorize dirty work found by this snapshot.
-  const scratch = !force ? closedPrScratch(h, task) : null;
+  const scratch = !force ? scratchProof ?? closedPrScratch(h, task) : null;
   const left = snapshotCopy(task.worktree, { scratch: Boolean(scratch && !scratch.why) });
   const work = force ? { dirty: [], keep: false } : workInCopy(task, left);
   if (work.dirty === null) refuse(`Could not check ${task.worktree} for uncommitted work; nothing was removed. Pass --force to discard it unseen.`, 6);
@@ -2060,9 +2082,23 @@ function cmdFinish(args) {
   const forget = () => (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) && forgetClaudeFolder(task.worktree);
   const closed = { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state };
   // Record the remaining work before asking Core again, so an interrupted removal is retried.
-  const waiting = { ...closed, copyToReturn: { since: now(), heldBy: [], left, stopPending: !result.stopped, pendingTerminals: result.pending ?? ownedTerminals(task).map(t => t.address), cleanupTerminal: true } };
+  const waiting = { ...closed, copyToReturn: { since: now(), heldBy: [], left, stopPending: !result.stopped, pendingTerminals: result.pending ?? ownedTerminals(task).map(t => t.address), stoppedTerminals: ownedTerminals(task).filter(t => result.stopped || result.pending && !result.pending.includes(t.address)).map(t => t.address), cleanupTerminal: true } };
   saveTask(h, waiting);
-  const cleanup = result.stopped ? removeStoppedTerminal(task) : { text: `its worker stop is not confirmed (${result.how})` };
+  // A replacement already in flight can publish while the old worker leaves.
+  // saveTask retains that ownership: close it too, never misclassify it as foreign.
+  const published = loadTask(h, id);
+  if (ownedTerminals(published).some(t => !ownedTerminals(task).some(old => old.address === t.address))) {
+    waiting.terminals = published.terminals;
+    try { result = stopTaskWorkers(published, { force }); }
+    catch (error) {
+      if (!(error instanceof Refusal)) throw error;
+      result = { stopped: false, how: error.message, pending: ownedTerminals(published).map(t => t.address) };
+    }
+    waiting.copyToReturn.stopPending = !result.stopped;
+    waiting.copyToReturn.pendingTerminals = result.pending;
+    waiting.copyToReturn.stoppedTerminals = ownedTerminals(published).filter(t => !result.pending.includes(t.address)).map(t => t.address);
+  }
+  const cleanup = result.stopped ? removeStoppedTerminal(published) : { text: `its worker stop is not confirmed (${result.how})` };
   waiting.copyToReturn.cleanupTerminal = Boolean(cleanup);
   const holders = cleanup ? null : fs.existsSync(task.worktree) ? otherTerminalsIn(task.worktree, task.terminal) : [];
   let reason = cleanup?.text ?? (holders === null ? 'Core did not say which terminals are in it' : holders.length ? `${holders.length === 1 ? 'terminal' : 'terminals'} ${describeHolders(holders, task.worktree)} ${holders.length === 1 ? 'holds' : 'hold'} it` : null);
@@ -2078,10 +2114,10 @@ function cmdFinish(args) {
   if (reason) {
     waiting.copyToReturn.heldBy = holders?.map(t => t.address) ?? [];
     saveTask(h, waiting);
-    console.log(`finished ${id} (${result.how}); its working copy is kept for now (${reason})${holders?.length ? ' and crew returns it by itself once nothing holds it' : '; the next crew finish or crew start retries its return'}; report kept at ${task.report}`);
+    console.log(`finished ${id} (${result.how}); its working copy is kept for now (${reason})${holders?.length ? ' and crew returns it by itself once nothing holds it' : '; the next crew finish or crew start retries its return'}; report kept at ${task.report}${discardSummary(back)}`);
   } else {
     saveTask(h, closed);
-    console.log(`finished ${id} (${result.how})${back.said}${comparison?.unseen ? '; discarded unseen after explicit --force' : ''}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}`);
+    console.log(`finished ${id} (${result.how})${back.said}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}${discardSummary({ ...back, unseen: Boolean(comparison?.unseen) || back.unseen })}`);
   }
   reviewLabels(h, id, 'abandon');
   // A legacy treehouse task moves its scout's item even after a review, as it always did.
@@ -2314,6 +2350,17 @@ function pullRequestState(h, task, url) {
   const ticked = (outcomes.match(/^\s*- \[[xX]\]/gm) ?? []).length, all = ticked + (outcomes.match(/^\s*- \[ \]/gm) ?? []).length;
   return `${pr.isDraft ? 'draft' : 'ready'}${all ? `, ${ticked} of ${all} outcomes ticked` : ''}`;
 }
+function finishMergedTask(h, task) {
+  if (task.state === 'closed' && !task.copyToReturn && task.prFacts?.state === 'MERGED') {
+    console.log(`${task.id} is already closed; discarded none`);
+    return true;
+  }
+  const scratchProof = closedPrScratch(h, task);
+  if (scratchProof?.state !== 'MERGED') return false;
+  // Same refusal/ownership path as finish, never an implicit force.
+  cmdFinish([task.id], { scratchProof });
+  return true;
+}
 function cmdLand(args) {
   const h = home();
   requireOwner(h);
@@ -2326,9 +2373,11 @@ function cmdLand(args) {
   if (task.kind !== 'ship') refuse(`Task ${id} is a scout; it has a report, not a branch.`);
   // A workflow task's link is recorded already when its worker reports; it lands only once.
   if (task.pr && (task.landed || !task.workflow)) {
+    if (finishMergedTask(h, task)) return;
     if (!task.workflow && !task.gate) reviewLabels(h, id, 'check');
     console.log(`${id} already has a pull request: ${task.pr}`); return;
   }
+  if (task.state === 'closed' && finishMergedTask(h, task)) return;
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; it is delivered only after its worker reported.`);
   const project = registeredProject(h, task.project) ?? refuse(`Unknown project: ${task.project}.`);
   const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
@@ -2336,6 +2385,9 @@ function cmdLand(args) {
   if (!fs.existsSync(path.join(wt, '.git'))) no(`its working copy ${wt} is gone. Its commits are still on branch ${branchOf(task)} in ${project.path}.`);
   const dirty = git('status', '--porcelain');
   if (dirty.code !== 0 || dirty.stdout.trim()) no(`its working copy has uncommitted files (${dirty.stdout.trim().split(/\r?\n/).slice(0, 5).map(l => l.slice(3)).join(', ')}). Tell the worker to commit them: crew tell ${id} "..."`);
+  // Keep first-land local refusals ahead of GitHub reads and cleanup.
+  if (task.workflow && task.stage === 'plan') no(`its last report is a plan awaiting approval, not an implementation. Read the plan, then: crew tell ${id} "approved, implement", or send it back with what to change.`);
+  if (finishMergedTask(h, task)) return;
   const remote = git('remote', 'get-url', 'origin');
   if (task.gate === 'no-mistakes') {
     // The gate reviewed, pushed and opened the pull request while the worker drove it; what
@@ -2350,7 +2402,6 @@ function cmdLand(args) {
   if (task.workflow) {
     // The repository's own workflow: the worker opened the draft pull request and ticks it,
     // the repository's bot marks it ready. Crew only records it; it never pushes or opens one.
-    if (task.stage === 'plan') no(`its last report is a plan awaiting approval, not an implementation. Read the plan, then: crew tell ${id} "approved, implement", or send it back with what to change.`);
     // Delivered means the pull request holds every commit of the copy; the worker pushes them.
     if (remote.code !== 0) no('the project has no `origin`, so it has no pull request to record.');
     const behind = unpushedCommits(git, branchOf(task));
