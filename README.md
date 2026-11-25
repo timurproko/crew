@@ -154,6 +154,12 @@ Adding one is a line in `AGENTS` in `crew.mjs`.
 
 ## Who does the work
 
+Every Claude worker (scout, ship, review, fix, and after a hand-over or relaunch) runs in
+Claude Code's `auto` permission mode with the usual `--allowedTools`, so a tool outside that
+list, such as an MCP connector's, no longer stops it for a person. Where the installed Claude
+Code or the account cannot start in auto mode, the worker runs in `acceptEdits` and the start
+line (or the worker's screen) says so. There is no setting for it.
+
 Worker selection is configured in `<home>/config/crew-dispatch.json`.
 A *profile* names the agent program and optionally its model and effort; `default` is an
 ordered list of them, `rules` pair a description of a kind of work with the profiles to use
