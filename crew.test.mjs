@@ -72,7 +72,8 @@ fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
 fs.writeFileSync(fake, `
 import fs from 'node:fs';
 const file = ${JSON.stringify(world)}, w = JSON.parse(fs.readFileSync(file, 'utf8')), a = process.argv.slice(2);
-w.log.push(a); const save = () => fs.writeFileSync(file, JSON.stringify(w));
+// Polling tests read concurrently: publish complete fake-Core worlds atomically.
+w.log.push(a); const save = () => { const temp = file + '.' + process.pid; fs.writeFileSync(temp, JSON.stringify(w)); fs.renameSync(temp, file); };
 if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forEach((v, i) => { if (v === '--label') { const [k, ...r] = a[i + 1].split('='); labels[k] = r.join('='); } });
   w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; save(); console.log(JSON.stringify({ address })); }
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
@@ -2020,7 +2021,10 @@ console.log(JSON.stringify({providers:providers.map(provider=>({provider,quotaSe
   fs.mkdirSync(path.join(f.home, 'config'));
   fs.writeFileSync(path.join(f.home, 'config', 'crew-dispatch.json'), JSON.stringify({ default: [{ harness: 'pi' }] }));
   const quotaReads = () => fs.readFileSync(quotaLog, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
-  fs.writeFileSync(fakeGh, `import fs from 'node:fs'; import {spawnSync} from 'node:child_process';
+  const finishResult = id => path.join(dir, `${id}.finish.json`), finishScript = path.join(dir, 'finish.mjs');
+  fs.writeFileSync(finishScript, `import fs from 'node:fs'; import path from 'node:path'; import {main} from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+main(['finish',process.argv[2]]); const file=path.join(${JSON.stringify(dir)},process.argv[2]+'.finish.json');fs.writeFileSync(file+'.tmp',JSON.stringify({code:process.exitCode??0}));fs.renameSync(file+'.tmp',file);`);
+  fs.writeFileSync(fakeGh, `import fs from 'node:fs'; import {spawn,spawnSync} from 'node:child_process';
 const a=process.argv.slice(2), file=${JSON.stringify(state)}, s=JSON.parse(fs.readFileSync(file,'utf8')), log=${JSON.stringify(log)};
 let task; try { task=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json','utf8')); } catch {}
 const method=a[a.indexOf('--method')+1], endpoint=a.find(x=>x.startsWith('repos/')), input=a.includes('--input') ? JSON.parse(fs.readFileSync(0,'utf8')) : null;
@@ -2033,8 +2037,17 @@ const duringEndpoint={variables:'/actions/variables',manifest:'/contents/labels/
 if((s.duringVerdict || s.duringFinish) && task?.state==='working' && endpoint.endsWith(duringEndpoint)) {
   const verdict=s.duringVerdict, finish=s.duringFinish; s.duringVerdict=null; s.duringFinish=false; fs.writeFileSync(file,JSON.stringify(s));
   if(verdict) fs.writeFileSync(task.report,verdict);
-  const done=spawnSync(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},finish?'finish':'done',task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TERMINAL:finish?process.env.CREW_TERMINAL:task.terminal},encoding:'utf8'});
-  if(done.status!==0) fail(done.stdout+done.stderr);
+  if(finish) {
+    // Wait only for the real lifecycle publication, not full copy/label cleanup
+    // inside this API's two-second budget. The test awaits completion separately.
+    const child=spawn(process.execPath,[${JSON.stringify(finishScript)},task.id],{cwd:${JSON.stringify(f.home)},env:process.env,stdio:'ignore',detached:true});child.unref();
+    const record=${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+task.id+'/task.json', deadline=Date.now()+1500;
+    while(true){let closed=false;try{closed=JSON.parse(fs.readFileSync(record)).state==='closed'}catch{}
+      if(closed)break;if(Date.now()>deadline)fail('finish did not publish closure');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);}
+  } else {
+    const done=spawnSync(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},'done',task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TERMINAL:task.terminal},encoding:'utf8'});
+    if(done.status!==0) fail(done.stdout+done.stderr);
+  }
 }
 if(endpoint.endsWith('/actions/variables')) { if(s.variablesDenied) fail('variables unreadable'); console.log(JSON.stringify([{variables:s.enabled===undefined ? [] : [{name:'DELIVERY_LABELS_ENABLED',value:s.enabled}]}])); }
 else if(endpoint.endsWith('/contents/labels/base.json')) {
@@ -2060,7 +2073,7 @@ else fail('unexpected fake request');`);
   const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
   const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
   const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
-  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, parent, start, done, writes, warnings, quotaReads };
+  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, parent, start, done, writes, warnings, quotaReads, finishResult };
 }
 gapTests['review-label-abandon'] = () => {
   const f = reviewLabelsFixture('abandon');
@@ -2091,11 +2104,14 @@ gapTests['review-label-abandon'] = () => {
   assert.equal(f.call(['finish', verdict.id]).code, 0); assert.equal(f.writes().length, before, 'A completed verdict is never restored to its previous state');
 };
 
-gapTests['review-label-cancel-start'] = () => {
+gapTests['review-label-cancel-start'] = async () => {
   const f = reviewLabelsFixture('cancel-start');
   for (const duringAt of ['variables', 'manifest', 'labels', 'definition']) {
     f.parent(duringAt); f.control({ labels: ['unrelated', f.changes], duringFinish: true, duringAt });
-    const { task, result } = f.start(duringAt); assert.equal(f.warnings(result).length, 0, result.out);
+    const { task, result } = f.start(duringAt);
+    await until(() => fs.existsSync(f.finishResult(task.id)));
+    assert.equal(JSON.parse(fs.readFileSync(f.finishResult(task.id))).code, 0, 'Real finish must complete successfully');
+    assert.equal(f.warnings(result).length, 0, result.out);
     assert.equal(task.state, 'closed');
     assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Cancelling during a start lookup cannot leave or re-add activity');
   }

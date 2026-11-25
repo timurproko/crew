@@ -1572,7 +1572,8 @@ function workerToStop(task, force) {
 function stopTaskWorkers(task, { force = false, onStop = null } = {}) {
   const workers = ownedTerminals(task).map(t => ({ ...task, terminal: t.address, agent: t.agent }));
   // Refuse a busy or unobservable owned worker before stopping any of the set.
-  for (const worker of workers) workerToStop(worker, force);
+  // A singleton's stopWorker already does this check before any mutation.
+  if (workers.length > 1) for (const worker of workers) workerToStop(worker, force);
   const pending = [], results = [];
   let attempted = false;
   for (const worker of workers) {
