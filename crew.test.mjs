@@ -122,6 +122,15 @@ console.log = () => { throw new TypeError('injected project list failure'); }; m
 
 // Run a focused regression with --gaps=ignored (or all new regressions with --gaps).
 const gapTests = {};
+// New dispatch fixtures own their fake Core history as well as their home. In particular,
+// their polling logs must not enlarge the shared world used by later concurrency tests.
+const isolatedCore = test => () => {
+  const before = fs.readFileSync(world, 'utf8'), trustBefore = fs.readFileSync(claudeConfig, 'utf8');
+  try {
+    test();
+    assert.equal(fs.readFileSync(claudeConfig, 'utf8'), trustBefore, 'Dispatch fixture must not alter another fixture\'s Claude trust');
+  } finally { fs.writeFileSync(world, before); }
+};
 function identityFixture(name) {
   const dir = path.join(root, `identity-${name}`), home = path.join(dir, 'home'), session = path.join(dir, 'session'), inspector = path.join(dir, 'inspector'), owner = `identity-${name}`;
   fs.mkdirSync(session, { recursive: true }); fs.mkdirSync(inspector);
@@ -135,7 +144,7 @@ function identityFixture(name) {
   const ownerFile = path.join(home, 'owner.json');
   return { dir, home, session, inspector, owner, ownerFile, env, call, write, status, labels, record: () => JSON.parse(fs.readFileSync(ownerFile, 'utf8')) };
 }
-gapTests['coordinator-identity'] = () => {
+gapTests['coordinator-identity'] = isolatedCore(() => {
   const f = identityFixture('authority');
   f.status('ONE@EXAMPLE.TEST');
   f.write('account-switcher-session.json', { email: 'one@example.test', at: Date.now() - 1000 });
@@ -181,8 +190,8 @@ gapTests['coordinator-identity'] = () => {
   assert.equal(coordinatorIdentity(oldOwner, { time, env: { CREW_CLAUDE_ACCOUNT: 'hint@example.test' }, core }).status, 'unknown', 'Hints alone are not identity');
   const log = readWorld().log;
   assert.ok(!log.some(a => ['send', 'kill'].includes(a[0]) && a.includes(f.owner)), 'No coordinator input or process mutation');
-};
-gapTests['coordinator-dispatch'] = () => {
+});
+gapTests['coordinator-dispatch'] = isolatedCore(() => {
   const f = identityFixture('dispatch'), dispatch = path.join(f.home, 'config', 'crew-dispatch.json');
   fs.mkdirSync(path.dirname(dispatch), { recursive: true });
   const example = JSON.parse(/### Coordinator-specific worker lists[\s\S]*?```json\r?\n([\s\S]*?)```/.exec(fs.readFileSync(path.join(here, 'README.md'), 'utf8'))[1]);
@@ -261,7 +270,7 @@ gapTests['coordinator-dispatch'] = () => {
     config({ default: ['a1'], coordinators: value }); r = f.call(['agents', '--json']);
     assert.equal(r.code, 2, JSON.stringify(value) + r.out); assert.ok(r.out.includes('crew-dispatch.json'), r.out); assert.ok(r.out.includes(field), r.out);
   }
-};
+});
 gapTests['repair-scope'] = () => {
   for (const file of ['crew.mjs', 'crew.test.mjs', 'README.md', 'bin/crew', 'bin/crew.cmd', 'docs/guide.md']) assert.ok(repairFile(file), file);
   for (const file of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', 'package.json', 'scripts/build.mjs', 'LICENSE', '.gitignore', '.gitattributes', 'openspec/specs/tool-maintenance/spec.md', 'crew/crew.mjs', 'other.mjs', 'bin-other/file']) assert.ok(!repairFile(file), file);
@@ -863,14 +872,14 @@ console.log(JSON.stringify({providers: families.map(provider => q[provider] === 
   assert.equal(f.call(['finish', task.id, '--force']).code, 0);
 };
 
-gapTests['coordinator-recovery'] = () => {
+gapTests['coordinator-recovery'] = isolatedCore(() => {
   const f = gapFixture('coordinator-recovery'), owner = 'owner-coordinator-recovery';
   const bin = path.join(f.dir, 'agents'), launcher = path.join(f.dir, 'claude-as.sh'), quota = path.join(f.dir, 'quota.mjs'), quotaLog = path.join(f.dir, 'quota.log');
   fs.mkdirSync(bin); for (const name of ['a1', 'pi', 'claude']) fs.writeFileSync(path.join(bin, name), '');
   fs.writeFileSync(launcher, '#!/bin/sh\n'); fs.writeFileSync(quotaLog, '');
   fs.writeFileSync(quota, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(quotaLog)}, 'read\\n'); console.log('{"providers":[]}');`);
   const env = { CREW_AGENT_PATH: bin, CREW_CLAUDE_LAUNCHER: launcher, CREW_CLAUDE_ACCOUNTS: 'saved-one@example.test,saved-two@example.test', CREW_TOOL_QUOTA_AXI: quota,
-    CREW_WORKTREES: path.join(f.dir, 'copies'), CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', DELIVERY_LABELS_ENABLED: 'false' };
+    CREW_WORKTREES: path.join(f.dir, 'copies'), CREW_CLAUDE_CONFIG: path.join(f.dir, 'claude.json'), CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', DELIVERY_LABELS_ENABLED: 'false' };
   const call = args => f.call(args, env);
   const business = 'tymur.prokopiev@ameria.com', personal = 'masha.shmakova@gmail.com';
   const login = email => setTerminal(owner, { status: { app: 'claude-code', state: 'working' }, labels: { 'custom.claude.email': email, 'custom.claude.state': 'ok', 'custom.claude.at': String(Date.now()), 'custom.claude.session': 'coordinator-process' } });
@@ -922,7 +931,7 @@ gapTests['coordinator-recovery'] = () => {
   // Non-Claude/unlisted owners emit their reason once on a command that launches work.
   login('aicoder-de13@ameria.com'); r = call(['spawn', 'global-policy', '--project', 'demo', 'Count.']); assert.equal(r.code, 0, r.out);
   assert.equal((r.out.match(/^coordinator /gm) ?? []).length, 1); assert.match(r.out, /no coordinator section.*using global dispatch/); assert.equal(f.task('global-policy').launch.model, 'wrong/global');
-};
+});
 
 gapTests['wait-relaunch'] = async () => {
   const f = gapFixture('wait-relaunch'), task = f.spawn('racing', ['--agent', 'pi']);
