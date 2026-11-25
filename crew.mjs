@@ -47,7 +47,7 @@ export const validId = id => typeof id === 'string' && /^[a-z0-9][a-z0-9-]{0,39}
 export function projectNameError(name) {
   if (typeof name !== 'string' || !name.length) return 'a project name is required (1 to 40 characters)';
   if (name.length > 40) return 'use at most 40 characters';
-  if (!/^[a-z0-9]/.test(name)) return 'start with a lowercase ASCII letter or digit';
+  if (!/^\.?[a-z0-9]/.test(name)) return 'start with a lowercase ASCII letter or digit, or one dot followed by one';
   if (/[^a-z0-9.-]/.test(name)) return 'use only lowercase ASCII letters, digits, dashes and dots';
   if (name.includes('..')) return 'consecutive dots are not allowed';
   if (name.endsWith('.')) return 'a trailing dot is not allowed';
