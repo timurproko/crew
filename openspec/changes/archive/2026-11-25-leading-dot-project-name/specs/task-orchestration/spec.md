@@ -14,7 +14,7 @@ Crew SHALL accept project names of 1 to 40 lowercase ASCII letters, digits, dash
 #### Scenario: A leading-dot project keeps its name
 
 - **WHEN** a project named `.xrbuild` is registered next to a project named `xrbuild` and an owner spawns ship work with `--project .xrbuild`
-- **THEN** registry listing, the task record and removal use the exact name `.xrbuild`, the two projects stay distinct, and the task's branch and working-copy names are built from the task ID without the project name
+- **THEN** registry listing, the task record and removal use the exact name `.xrbuild`, the two projects stay distinct, and the task's branch is built from the task ID without the project name
 
 #### Scenario: A dotted repository uses a pool slot
 
@@ -35,9 +35,9 @@ Crew SHALL accept project names of 1 to 40 lowercase ASCII letters, digits, dash
 
 ### Requirement: Project names stay out of git refs and working-copy paths
 
-Crew SHALL NOT use a project name as any part of a git ref or a working-copy path. Branch and working-copy names SHALL be built from the task ID or the repository folder, so a leading-dot project name never reaches a git ref.
+Crew SHALL NOT use a project name as any part of a git ref or of a working-copy name crew makes itself. A task branch SHALL be built from the task ID, and a plain working copy SHALL be named from the task ID. A delivery-managed copy is named by delivery from the repository folder, not by crew, so it MAY contain the folder's dot name. A leading-dot project name therefore never reaches a git ref.
 
 #### Scenario: Ship work in a leading-dot project
 
-- **WHEN** an owner spawns ship work in a project named `.xrbuild`
+- **WHEN** an owner spawns ship work in a plain-workflow project named `.xrbuild`
 - **THEN** the task's branch and working-copy folder are named from the task ID and contain no part of the project name
