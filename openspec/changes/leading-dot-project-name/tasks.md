@@ -8,4 +8,4 @@
 
 ## 2. README states the leading-dot project name rule with an example
 
-- [ ] 2.1 Update the README name rule and add the example `crew project add .xrbuild D:/Git/xrbuild/.xrbuild`.
+- [x] 2.1 Update the README name rule and add the example `crew project add .xrbuild D:/Git/xrbuild/.xrbuild`.
