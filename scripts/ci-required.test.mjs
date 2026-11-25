@@ -46,7 +46,7 @@ test('workflow ignores label events and preserves code-change supersession', () 
 });
 
 test('review labels use a separate advisory-only caller and policy declaration', () => {
-  const workflow = readFileSync(new URL('../.github/workflows/review-labels.yml', import.meta.url), 'utf8');
+  const workflow = readFileSync(new URL('../.github/workflows/review-labels.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   assert.match(workflow, /on:\s*\n  pull_request_target:\s*\n    types: \[labeled\]\s*\n\npermissions:/);
   assert.match(workflow, /uses: timurproko\/MyWorkflows\/\.github\/workflows\/review-labels\.yml@main/);
   assert.equal((workflow.match(/    uses:/g) || []).length, 1);
