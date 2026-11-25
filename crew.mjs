@@ -26,9 +26,10 @@ export const DEFAULT_HOME = CREW_DIR;
 // The only per-agent knowledge: how to start it with one instruction, and how it can be
 // asked to leave. `close` means the terminal is closed once the agent is no longer working.
 // `args` follow the instruction: Claude Code reads a prompt placed after --allowedTools as
-// one more tool name. A Claude worker keeps its permission system; it is only told up front
-// that editing files and using its ordinary tools inside its own working copy is expected,
-// so it does not stop to ask for each one. Folder trust: see trustClaudeFolder below.
+// one more tool name. A Claude worker keeps its permission system: it runs in Claude Code's
+// auto mode, which decides tool prompts (an MCP connector's tools among them) instead of
+// stopping for a person, and its ordinary tools are pre-approved. Where auto mode cannot
+// start it falls back to acceptEdits (see workerLaunch). Folder trust: see trustClaudeFolder.
 // `seen` marks an agent Core recognises in a terminal (it reports the agent and whether it is
 // working); only for those can crew tell that the agent is gone while the terminal lives on.
 // PowerShell is in the list beside Bash: on Windows Claude Code runs its commands through
@@ -36,7 +37,7 @@ export const DEFAULT_HOME = CREW_DIR;
 export const AGENTS = {
   a1: { command: 'a1', exit: 'a1-api', seen: true },
   pi: { command: 'pi', exit: 'close' },
-  claude: { command: 'claude', exit: 'close', seen: true, trust: 'claude', args: ['--permission-mode', 'acceptEdits', '--allowedTools', 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'] },
+  claude: { command: 'claude', exit: 'close', seen: true, trust: 'claude', args: ['--permission-mode', 'auto', '--allowedTools', 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'] },
 };
 
 // --- small helpers -----------------------------------------------------------
@@ -571,6 +572,8 @@ behind it. Crew reads the quota itself (quota-axi, each saved Claude account sep
   It reports each action in a line; pass it on to the person afterwards rather than asking them to resume the worker.
 - "Nobody can take this work now" lists why for each candidate. Tell the person exactly that;
   do not retry in a loop.
+- Claude workers run in Claude Code's auto permission mode, so they do not stop for a person at
+  every tool prompt. Where auto mode cannot start they run in acceptEdits; the start line says so.
 
 ## Rules
 - Never work in a worker's copy yourself and never edit a project directly.
@@ -792,7 +795,8 @@ export function agentCommand(name, agent, instruction, env = process.env, pick =
   if (pick.effort) tune.push(EFFORT_FLAG[name], pick.effort);
   // Claude Code reads a prompt placed after --allowedTools as one more tool name, so its
   // options follow the instruction; A1 and Pi take theirs before it.
-  const words = name === 'claude' ? [instruction, ...tune, ...(agent.args ?? [])] : [...tune, instruction, ...(agent.args ?? [])];
+  const args = name === 'claude' && pick.permissionMode ? withPermissionMode(agent.args ?? [], pick.permissionMode) : agent.args ?? [];
+  const words = name === 'claude' ? [instruction, ...tune, ...args] : [...tune, instruction, ...args];
   const plain = [agent.command, ...words].map(shq).join(' ');
   const account = name === 'claude' ? String(pick.account ?? env.CREW_CLAUDE_ACCOUNT ?? '').trim() : '';
   if (!account) return plain;
@@ -804,6 +808,41 @@ export function agentCommand(name, agent, instruction, env = process.env, pick =
     return plain;
   }
   return `bash --noprofile --norc ${shq(bashPath(launcher))} --as ${shq(account)} --command "$(type -P claude || type -P claude.exe)" -- ${words.map(shq).join(' ')}`;
+}
+
+// Claude workers run in auto mode, with acceptEdits as the fallback. Never bypassPermissions
+// or dontAsk. Two ways auto mode can fail to start:
+// - the installed Claude Code does not know it: its option parser refuses the mode before
+//   anything starts. Asked once per crew process with --version; the worker then starts in
+//   acceptEdits and crew's start line says so.
+// - the account or session refuses it at start, which only a real start shows: the terminal
+//   command runs Claude Code once more in acceptEdits when the auto-mode run ends with an
+//   error within AUTO_GRACE seconds, and says so on the worker's screen. A worker that ran
+//   for longer, ended normally or was interrupted (130) is not started again.
+const PERMISSION_FALLBACK = 'acceptEdits', AUTO_GRACE = 20;
+const withPermissionMode = (args, mode) => args.map((a, i) => args[i - 1] === '--permission-mode' ? mode : a);
+const permissionModeOf = args => args[args.indexOf('--permission-mode') + 1];
+let autoModeAnswer;
+function autoModeRefused() {
+  if (autoModeAnswer !== undefined) return autoModeAnswer;
+  const args = withPermissionMode(AGENTS.claude.args, 'auto');
+  const r = runTool('claude', [...args, '--version'], { timeout: 20000 });
+  // Only a clear refusal counts; a missing or silent claude leaves auto mode to the terminal guard.
+  const said = r ? `${r.stderr}\n${r.stdout}`.split(/\r?\n/).map(l => l.trim()).find(l => /permission-mode|\bauto\b/i.test(l)) : null;
+  autoModeAnswer = r && !r.error && typeof r.code === 'number' && r.code !== 0 && said ? said.slice(0, 160) : null;
+  return autoModeAnswer;
+}
+export function autoModeGuard(auto, fallback, grace = AUTO_GRACE) {
+  return `crew_started=$SECONDS; ${auto}; crew_exit=$?; if [ $crew_exit -ne 0 ] && [ $crew_exit -ne 130 ] && [ $((SECONDS - crew_started)) -lt ${grace} ]; then `
+    + `echo "crew: Claude Code ended at once in auto mode (exit $crew_exit); starting it again in ${PERMISSION_FALLBACK}"; ${fallback}; fi`;
+}
+// The shell words that start `pick`, and a note for crew's start line when auto mode was not used.
+function workerLaunch(agent, instruction, pick, env = process.env) {
+  const command = mode => agentCommand(pick.harness, agent, instruction, env, mode ? { ...pick, permissionMode: mode } : pick);
+  if (pick.harness !== 'claude' || permissionModeOf(agent.args ?? []) !== 'auto') return { command: command(), note: '' };
+  const refused = autoModeRefused();
+  if (refused) return { command: command(PERMISSION_FALLBACK), note: `; auto mode not available (${refused}), started in ${PERMISSION_FALLBACK}` };
+  return { command: autoModeGuard(command(), command(PERMISSION_FALLBACK)), note: '' };
 }
 
 // --- who does the work ----------------------------------------------------------------
@@ -1312,17 +1351,18 @@ const PICK_USAGE = `[--agent ${Object.keys(AGENTS).join('|')}] [--model <id>] [-
 function startTerminal(h, { id, worktree, label, pick, instruction }) {
   const agent = AGENTS[pick.harness];
   if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
+  const { command, note } = workerLaunch(agent, instruction, pick);
   const line = [
     `export CREW_HOME=${shq(bashPath(h.dir))} CREW_TASK=${shq(id)} PATH=${shq(`${bashPath(path.join(HERE, 'bin'))}`)}:"$PATH"`,
-    agentCommand(pick.harness, agent, instruction, process.env, pick),
+    command,
     'exec bash --login -i',
   ].join('; ');
   const tag = h.config.tag;
-  return hcJson(['run', '--json', '--bg', '--keep', '--no-parent', '--no-notify', '--cwd', worktree,
+  return { note, ...hcJson(['run', '--json', '--bg', '--keep', '--no-parent', '--no-notify', '--cwd', worktree,
     // crew.kind is what the worker is, for anything that shows terminals (Herdr's pane header).
     '--label', `crew.task=${id}`, '--label', `crew.home=${tag}`, '--label', `crew.kind=${label}`,
     '--label', `herdr.space=fm-crew-${tag}`, '--label', `herdr.tab=${tag}-${id}`, '--label', 'herdr.right-click=menu',
-    '--', bashProgram(), '--login', '-i', '-c', line]);
+    '--', bashProgram(), '--login', '-i', '-c', line]) };
 }
 const kindLabel = task => (task.selfFix ? 'fix' : task.reviews ? 'review' : task.kind);
 const roleOf = kindLabel;
@@ -1396,7 +1436,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   const current = readJson(taskFile(h, id)) ?? record;
   saveTask(h, { ...current, state: current.state === 'preparing' ? 'working' : current.state, terminal: address, terminals: launchedTerminals(current, address, pick.harness), spawned: now() });
   const detail = pickLabel(pick) !== pick.harness || chosen.available ? `; ${pickLabel(pick)}${chosen.available ? `, ${chosen.available} more can take over` : ''}` : '';
-  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}`);
+  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}${started.note}`);
   backlogMove(h, id, 'start');
 }
 
@@ -1465,7 +1505,7 @@ function replaceWorker(h, task, reason, flags) {
   const { error, ...kept } = task;
   store({ ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, terminals: launchedTerminals(task, address, pick.harness), relaunched: now(),
     ...(dispatch ? { dispatch } : {}), fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
-  return { pick, rest, address };
+  return { pick, rest, address, note: started.note };
 }
 
 // What on a stopped worker's screen says it cannot go on for want of quota or a login. Only
@@ -1564,7 +1604,7 @@ function cmdRelaunch(args) {
   if (moved.superseded) refuse(`Task ${id} changed during relaunch; inspect its current worker and retry if needed.`, 6);
   if (!moved.pick) refuse(`Task ${id} was not handed over: ${moved.why}`, 8);
   reviewLabels(h, id, 'rework');
-  console.log(`relaunched ${id}: ${pickLabel(moved.pick)} in terminal ${moved.address}${moved.rest.length ? `, ${moved.rest.length} more can take over` : ''}; next: crew wait ${id}`);
+  console.log(`relaunched ${id}: ${pickLabel(moved.pick)} in terminal ${moved.address}${moved.rest.length ? `, ${moved.rest.length} more can take over` : ''}${moved.note ?? ''}; next: crew wait ${id}`);
 }
 
 function cmdDone(args) {
@@ -1650,7 +1690,7 @@ function cmdWait(args) {
         const said = lastWords(task.terminal), reason = `its agent ended without a report${said ? ` (${said})` : ''}`, from = pickLabel(task.launch ?? { harness: task.agent });
         const moved = relaunch(h, task, reason);
         if (moved.superseded) continue;
-        if (moved.pick) console.log(`== ${id}: ${from} is gone: ${reason}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
+        if (moved.pick) console.log(`== ${id}: ${from} is gone: ${reason}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}${moved.note ?? ''}`);
         else { blocked.set(id, `${from} is gone: ${reason}, and ${moved.why}`); settled.set(id, 'needs a person'); }
       } else if (handover && t.status?.state && !['working', 'blocked'].includes(t.status.state) && stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12)) {
         // The worker cannot go on for want of quota or a login: the next candidate of its
@@ -1658,7 +1698,7 @@ function cmdWait(args) {
         const reason = stoppedOn(task.terminal, t.status.state === 'error' ? 40 : 12), from = pickLabel(task.launch ?? { harness: task.agent });
         const moved = relaunch(h, task, reason);
         if (moved.superseded) continue;
-        if (moved.pick) console.log(`== ${id}: ${from} stopped (${reason}); ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
+        if (moved.pick) console.log(`== ${id}: ${from} stopped (${reason}); ${pickLabel(moved.pick)} continues it in terminal ${moved.address}${moved.note ?? ''}`);
         else { blocked.set(id, `${from} stopped (${reason}) and ${moved.why}`); settled.set(id, 'needs a person'); }
       } else if (t.status?.state === 'blocked') {
         // The agent itself says it is waiting for a person (a permission or a question).
@@ -1673,7 +1713,7 @@ function cmdWait(args) {
           if (latest.state !== 'working' || latest.terminal !== task.terminal) continue;
           const moved = relaunch(h, latest, recovery.handover);
           if (moved.superseded) continue;
-          if (moved.pick) console.log(`== ${id}: ${recovery.tried}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}`);
+          if (moved.pick) console.log(`== ${id}: ${recovery.tried}; ${pickLabel(moved.pick)} continues it in terminal ${moved.address}${moved.note ?? ''}`);
           else { blocked.set(id, `${recovery.tried}, and ${moved.why}`); settled.set(id, 'needs a person'); }
         } else if (recovery.blocked) { blocked.set(id, recovery.blocked); settled.set(id, 'needs a person'); }
       }

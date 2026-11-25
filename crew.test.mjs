@@ -7,7 +7,7 @@ import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, autoModeGuard, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -59,11 +59,26 @@ for (const options of [{ kind: 'scout' }, { kind: 'ship' }, { kind: 'ship', work
   const launcher = path.join(root, 'claude-as.sh'); fs.writeFileSync(launcher, '#!/bin/sh');
   const env = { CREW_CLAUDE_ACCOUNT: 'me@example.com', CREW_CLAUDE_LAUNCHER: launcher };
   assert.equal(agentCommand('a1', AGENTS.a1, 'do it', env), "'a1' 'do it'", 'The account applies to Claude Code only');
-  assert.equal(agentCommand('claude', AGENTS.claude, 'do it', {}), "'claude' 'do it' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'");
+  assert.equal(agentCommand('claude', AGENTS.claude, 'do it', {}), "'claude' 'do it' '--permission-mode' 'auto' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'", 'Claude workers run in auto mode');
+  assert.equal(agentCommand('claude', AGENTS.claude, 'do it', {}, { permissionMode: 'acceptEdits' }), "'claude' 'do it' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'", 'The fallback changes only the mode');
+  assert.equal(agentCommand('a1', AGENTS.a1, 'do it', {}, { permissionMode: 'acceptEdits' }), "'a1' 'do it'", 'A1 and Pi have no permission mode');
   const line = agentCommand('claude', AGENTS.claude, "it's", env);
-  assert.ok(line.startsWith("bash --noprofile --norc '") && line.includes("claude-as.sh' --as 'me@example.com' --command \"$(type -P claude || type -P claude.exe)\" -- 'it'\\''s' '--permission-mode' 'acceptEdits'"), line);
+  assert.ok(line.startsWith("bash --noprofile --norc '") && line.includes("claude-as.sh' --as 'me@example.com' --command \"$(type -P claude || type -P claude.exe)\" -- 'it'\\''s' '--permission-mode' 'auto'"), line);
   assert.throws(() => agentCommand('claude', AGENTS.claude, 'x', { ...env, CREW_CLAUDE_ACCOUNT: "a'; rm -rf ~" }), /Not an account name/);
   assert.equal(agentCommand('claude', AGENTS.claude, 'x', { CREW_CLAUDE_ACCOUNT: 'me@example.com', CREW_CLAUDE_LAUNCHER: path.join(root, 'missing.sh') }).startsWith("'claude' 'x'"), true, 'No launcher: the default account, with a warning');
+}
+
+// Auto mode refused at start: the worker's shell runs it once more in acceptEdits, and only then.
+{
+  const bash = WINDOWS ? [process.env.CREW_BASH, 'C:/Program Files/Git/bin/bash.exe'].find(p => p && fs.existsSync(p)) : 'bash';
+  if (bash) {
+    const guard = (auto, grace) => spawnSync(bash, ['--noprofile', '--norc', '-c', autoModeGuard(auto, 'echo fallback ran', grace)], { encoding: 'utf8' }).stdout;
+    let out = guard('echo auto refused; false');
+    assert.ok(out.includes('auto refused\ncrew: Claude Code ended at once in auto mode (exit 1); starting it again in acceptEdits\nfallback ran'), out);
+    for (const [auto, grace, why] of [['echo worked', undefined, 'a normal end'], ['(exit 130)', undefined, 'an interrupt'], ['false', 0, 'an error after the grace time']]) {
+      out = guard(auto, grace); assert.ok(!out.includes('fallback ran') && !out.includes('crew: Claude Code ended'), `${why} is not restarted: ${out}`);
+    }
+  }
 }
 
 // A fake Core: terminals live in a JSON file; `run` creates one, `get` reads, `kill`/`rm` remove.
@@ -3099,7 +3114,8 @@ try {
   // Claude Code: the instruction comes before its options, and it keeps its permission system.
   assert.equal(crew(['spawn', 'tc', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2' }).code, 0);
   const claudeLine = readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
-  assert.ok(claudeLine.includes("'claude' 'Read the brief at ") && claudeLine.includes(" and carry it out exactly.' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; exec bash"), claudeLine);
+  assert.ok(claudeLine.includes("'claude' 'Read the brief at ") && claudeLine.includes(" and carry it out exactly.' '--permission-mode' 'auto' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; crew_exit=$?"), claudeLine);
+  assert.ok(claudeLine.includes(" and carry it out exactly.' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; fi; exec bash"), 'An early refusal of auto mode starts it again in acceptEdits');
   assert.ok(!claudeLine.includes('skip-permissions'), 'A worker is never started with its permission checks switched off');
   // Its copy is recorded as trusted in Claude's config, beside what was there; a1/pi copies are not.
   const copyKey = slash(path.join(copies, 'tc'));
@@ -3110,6 +3126,19 @@ try {
   assert.equal(crew(['finish', 'tc', '--force'], { terminal: 'c2' }).code, 0);
   cc = JSON.parse(fs.readFileSync(claudeConfig, 'utf8'));
   assert.deepEqual(Object.keys(cc.projects), ['C:/mine'], 'Finish removes the entry crew made and no other');
+  // An installed Claude Code that does not know auto mode: the worker starts in acceptEdits, and the start line says why.
+  {
+    const oldClaude = path.join(root, 'fake-claude-old.mjs');
+    fs.writeFileSync(oldClaude, `const a = process.argv.slice(2);
+if (a.includes('--version') && a[a.indexOf('--permission-mode') + 1] === 'auto') { console.error("error: option '--permission-mode <mode>' argument 'auto' is invalid. Allowed choices are acceptEdits, bypassPermissions, default, plan."); process.exit(1); }
+console.log('1.0.0 (Claude Code)');`);
+    const r = crew(['spawn', 'tv', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2', env: { CREW_TOOL_CLAUDE: oldClaude } });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /spawned tv: claude scout in terminal \S+, .*; auto mode not available \(error: option '--permission-mode <mode>' argument 'auto' is invalid\. .*\), started in acceptEdits/);
+    const oldLine = readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
+    assert.ok(oldLine.includes("'--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; exec bash") && !oldLine.includes("'auto'") && !oldLine.includes('crew_exit'), oldLine);
+    assert.equal(crew(['finish', 'tv', '--force'], { terminal: 'c2' }).code, 0);
+  }
   // A config crew cannot parse is never overwritten; the worker still starts.
   fs.writeFileSync(claudeConfig, '{ not json');
   const r2 = crew(['spawn', 'td', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2' });
@@ -3787,6 +3816,7 @@ if (a[0] === '--version') process.exit(0);`);
     assert.equal(moved.agent, 'claude'); assert.equal(moved.state, 'working'); assert.notEqual(moved.terminal, first); assert.equal(readWorld().terminals[first], undefined, 'The stopped worker\'s terminal is gone');
     assert.deepEqual(moved.chain.map(c => c.account), [undefined, undefined, 'two@example.com', 'gone@example.com']); assert.equal(moved.fallbacks.length, 1);
     assert.ok(lastRun().includes("--as 'one@example.com'") && lastRun().includes('Another worker (a1 github-copilot/gpt-x) began this task and had to stop') && lastRun().includes('continue from there'), lastRun());
+    assert.ok(lastRun().includes("'--permission-mode' 'auto'"), 'A Claude worker that takes over also runs in auto mode');
     assert.equal(readWorld().terminals[moved.terminal].cwd, moved.worktree, 'Same working copy');
     assert.match(crew2(['status']).out, /scout\/claude opus as one@example\.com \(after a1 github-copilot\/gpt-x\)/);
     // A worker that is merely idle, or working with old text on screen, is left alone.
