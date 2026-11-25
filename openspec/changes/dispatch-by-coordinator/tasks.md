@@ -16,10 +16,10 @@
 
 ## 3. Recovery and relaunch preserve the selected task chain without implicit fallback workers
 
-- [ ] 3.1 Save selection provenance and effective quota policy beside task candidates; targeted task-record tests prove existing task compatibility and selected-section measurement behavior without changing finish/land/brief functions.
-- [ ] 3.2 Keep quota/login handover, crashed-worker recovery and unflagged relaunch confined to saved candidates; fake-Core tests prove singleton exhaustion reports the stop reason/no other candidate and never launches a saved-account or global fallback.
-- [ ] 3.3 Keep an account change from widening old task chains while flagged relaunch uses the current selected policy; targeted fixtures prove exact launch attempts, tried filtering, preserved copies and legacy saved-chain behavior.
-- [ ] 3.4 Document frozen recovery chains, singleton exhaustion and rollback-to-global behavior in README; compare documented behavior with the disposable recovery fixtures and check the diff avoids PR #14's functions.
+- [x] 3.1 Save selection provenance and effective quota policy beside task candidates; targeted task-record tests prove existing task compatibility and selected-section measurement behavior without changing finish/land/brief functions.
+- [x] 3.2 Keep quota/login handover, crashed-worker recovery and unflagged relaunch confined to saved candidates; fake-Core tests prove singleton exhaustion reports the stop reason/no other candidate and never launches a saved-account or global fallback.
+- [x] 3.3 Keep an account change from widening old task chains while flagged relaunch uses the current selected policy; targeted fixtures prove exact launch attempts, tried filtering, preserved copies and legacy saved-chain behavior.
+- [x] 3.4 Document frozen recovery chains, singleton exhaustion and rollback-to-global behavior in README; compare documented behavior with the disposable recovery fixtures and check the diff avoids PR #14's functions.
 
 ## Workflow follow-up
 

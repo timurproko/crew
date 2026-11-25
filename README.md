@@ -321,6 +321,16 @@ the first profile before override expansion, so add `--account` for one explicit
 keeping stdout valid JSON. Its existing `source` identifies the final list, including the
 coordinator path on a match. JSON represents an unknown account with null and its reason.
 
+Scoped tasks save their complete selected candidates and quota-measurement policy. Quota/login
+loss, a crashed worker and relaunch without selection flags use only that saved chain,
+even after the coordinator changes account or the config changes. A singleton has nobody
+to hand over to: crew says `Nobody can take this work now`, with the stop/no-other-candidate
+reason, and keeps the working copy for a person. Relaunch with selection flags deliberately
+rebuilds from the coordinator's current policy, excluding the current worker as before.
+Removing `coordinators` restores global selection for new tasks; existing task chains stay
+saved. Rolling back to an older crew also restores global selection for new tasks because
+older versions do not understand this key.
+
 ### Coordinator identity
 
 `crew start` records the owner terminal and non-secret identity/source metadata in

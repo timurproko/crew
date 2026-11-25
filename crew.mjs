@@ -1080,7 +1080,8 @@ function chooseWorker(h, role, flags, legacy, project = null) {
   const taken = rows.find(r => pickKey(r) === pickKey(usable[0]));
   for (const r of rows) { if (r === taken) break; console.log(`passed over ${pickLabel(r)}: ${r.fact.note}`); }
   if (taken.fact.status === 'low') console.log(`${pickLabel(taken)} is under its floor (${taken.fact.note}), but nobody above their floor can take the work`);
-  return { pick: usable[0], rest: candidates.filter(c => pickKey(c) !== pickKey(usable[0])), candidates, checks: candidateChecks(rows), available: usable.length - 1, source };
+  return { pick: usable[0], rest: candidates.filter(c => pickKey(c) !== pickKey(usable[0])), candidates, checks: candidateChecks(rows), available: usable.length - 1, source,
+    dispatch: { coordinator, source, sharedQuota: config.shared } };
 }
 
 const coordinatorLine = (c, source) => `coordinator ${c.account ?? (c.status === 'non-claude' ? c.harness : 'account unknown')} (${c.reason ?? c.source}); using ${c.section === 'global' ? 'global dispatch' : c.section} (${source})`;
@@ -1304,7 +1305,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
     // Keep the original order, even for candidates that cannot work now: hand-over rereads
     // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
-    launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks,
+    launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks, dispatch: chosen.dispatch,
     ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
   withRegistry(h, () => {
     // The project may have been removed/replaced while selection was running.
@@ -1394,14 +1395,19 @@ function replaceWorker(h, task, reason, flags) {
   const before = task.launch ?? { harness: task.agent }, tried = new Set([...(task.tried ?? []), pickKey(before)]);
   const role = roleOf(task), named = flags && [...PICK_FLAGS, 'no-fallback'].some(key => flags[key] !== undefined);
   const config = dispatchConfig(h);
-  // The task's own chain as it stood at launch; a task from before there were chains, or an
-  // explicit choice on the command line, takes the configured one as it stands now.
-  const original = named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project).candidates : task.candidates ?? task.chain;
+  // Saved chains and their measurement policy stay frozen. Only a deliberate selection
+  // (or a legacy task without a chain) asks the *current* coordinator policy again.
+  const rebuilt = named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project) : null;
+  const dispatch = rebuilt ? { coordinator: rebuilt.coordinator, source: rebuilt.source, sharedQuota: rebuilt.config.shared } : task.dispatch;
+  if (config.hasCoordinators && dispatch) console.log(coordinatorLine(dispatch.coordinator, dispatch.source));
+  const original = rebuilt ? rebuilt.candidates : task.candidates ?? task.chain;
   const candidates = original.filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
-  const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true }), checks = candidateChecks(rows);
+  const scoped = dispatch && dispatch.coordinator.section !== 'global';
+  const { rows, usable } = usableCandidates(candidates, { shared: scoped ? dispatch.sharedQuota : config.shared, always: true }), checks = candidateChecks(rows);
   if (!usable.length) {
     store({ ...task, candidateChecks: checks });
-    return { pick: null, why: rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain' };
+    const why = rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain';
+    return { pick: null, why: scoped ? `${why}; Nobody can take this work now` : why };
   }
   const [pick, ...rest] = usable;
   const chain = original.filter(c => pickKey(c) !== pickKey(pick) && !tried.has(pickKey(c)));
@@ -1420,7 +1426,7 @@ function replaceWorker(h, task, reason, flags) {
   }
   const { error, ...kept } = task;
   store({ ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, relaunched: now(),
-    fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
+    ...(dispatch ? { dispatch } : {}), fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
   return { pick, rest, address };
 }
 

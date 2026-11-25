@@ -471,7 +471,7 @@ function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), termina
   const child = spawn(process.execPath, [script, ...args], { cwd: f.home, env: {
     ...process.env, HOME: path.join(f.dir, 'user'), USERPROFILE: path.join(f.dir, 'user'),
     CREW_CLAUDE_CONFIG: path.join(f.dir, 'claude.json'),
-    CREW_HOME: f.home, CREW_HC: fake, CREW_TERMINAL: terminal, HC_TERMINAL_ID: '',
+    CREW_HOME: f.home, CREW_HC: fake, CREW_TERMINAL: terminal, HC_TERMINAL_ID: '', CLAUDE_CONFIG_DIR: '', CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '',
     CREW_TOOL_PATH: path.join(root, 'no-tools'), CREW_WORKTREES: path.join(f.dir, 'copies'),
     ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...env,
   }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -861,6 +861,67 @@ console.log(JSON.stringify({providers: families.map(provider => q[provider] === 
   setQuota({ codex: 70, claude: 70, copilot: 80 });
   assert.equal(f.call(['relaunch', task.id, '--agent', 'a1', '--model', 'openai-codex/gpt-x']).code, 0, 'A named relaunch may retry an earlier choice');
   assert.equal(f.call(['finish', task.id, '--force']).code, 0);
+};
+
+gapTests['coordinator-recovery'] = () => {
+  const f = gapFixture('coordinator-recovery'), owner = 'owner-coordinator-recovery';
+  const bin = path.join(f.dir, 'agents'), launcher = path.join(f.dir, 'claude-as.sh'), quota = path.join(f.dir, 'quota.mjs'), quotaLog = path.join(f.dir, 'quota.log');
+  fs.mkdirSync(bin); for (const name of ['a1', 'pi', 'claude']) fs.writeFileSync(path.join(bin, name), '');
+  fs.writeFileSync(launcher, '#!/bin/sh\n'); fs.writeFileSync(quotaLog, '');
+  fs.writeFileSync(quota, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(quotaLog)}, 'read\\n'); console.log('{"providers":[]}');`);
+  const env = { CREW_AGENT_PATH: bin, CREW_CLAUDE_LAUNCHER: launcher, CREW_CLAUDE_ACCOUNTS: 'saved-one@example.test,saved-two@example.test', CREW_TOOL_QUOTA_AXI: quota,
+    CREW_WORKTREES: path.join(f.dir, 'copies'), CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', DELIVERY_LABELS_ENABLED: 'false' };
+  const call = args => f.call(args, env);
+  const business = 'tymur.prokopiev@ameria.com', personal = 'masha.shmakova@gmail.com';
+  const login = email => setTerminal(owner, { status: { app: 'claude-code', state: 'working' }, labels: { 'custom.claude.email': email, 'custom.claude.state': 'ok', 'custom.claude.at': String(Date.now()), 'custom.claude.session': 'coordinator-process' } });
+  const config = { default: [{ harness: 'pi', model: 'wrong/global' }], roles: { review: [{ harness: 'pi', model: 'wrong/review' }], fix: [{ harness: 'pi', model: 'wrong/fix' }] },
+    coordinators: { [business]: { shared_quota: true, default: [{ harness: 'claude', model: 'claude-opus-5-5', account: 'aicoder-de13@ameria.com' }] },
+      [personal]: { default: [{ harness: 'a1', model: 'openai-codex/gpt-6.1-sol' }] } } };
+  const writeConfig = () => { fs.mkdirSync(path.join(f.home, 'config'), { recursive: true }); fs.writeFileSync(path.join(f.home, 'config', 'crew-dispatch.json'), JSON.stringify(config)); };
+  const spawnTask = (id, flags = []) => { const r = call(['spawn', id, '--project', 'demo', ...flags, 'Count lines.']); assert.equal(r.code, 0, r.out); assert.equal((r.out.match(/^coordinator /gm) ?? []).length, 1); return f.task(id); };
+  const launches = () => readWorld().log.filter(a => a[0] === 'run').length;
+  login(business); writeConfig(); let task = spawnTask('solo-quota');
+  assert.equal(task.candidates.length, 1); assert.deepEqual(task.chain, []); assert.equal(task.dispatch.coordinator.account, business); assert.equal(task.dispatch.sharedQuota, true);
+  const count = launches();
+  setTerminal(task.terminal, { status: { state: 'error', app: 'claude-code' }, screen: 'usage limit reached' });
+  let r = call(['wait', task.id, '--timeout', '3']); assert.equal(r.code, 7, r.out);
+  assert.match(r.out, /usage limit reached/); assert.match(r.out, /no other candidate/); assert.match(r.out, /Nobody can take this work now/); assert.equal(launches(), count);
+  r = call(['relaunch', task.id]); assert.equal(r.code, 8, r.out); assert.match(r.out, /Nobody can take this work now/); assert.ok(fs.existsSync(task.worktree)); assert.equal(f.task(task.id).terminal, task.terminal);
+  login(personal); task = spawnTask('solo-crash'); const count2 = launches();
+  setTerminal(task.terminal, { status: null, screen: 'worker crashed' });
+  r = call(['wait', task.id, '--timeout', '3']); assert.equal(r.code, 7, r.out);
+  assert.match(r.out, /agent ended without a report/); assert.match(r.out, /Nobody can take this work now/); assert.equal(launches(), count2);
+  // A multi-profile section's saved chain and measurement flag survive a new login/config.
+  const chain = [{ harness: 'a1', model: 'openai-codex/first' }, { harness: 'pi', model: 'openai-codex/second' }];
+  config.coordinators[business].default = chain; writeConfig(); login(business); task = spawnTask('saved-policy');
+  assert.equal(fs.readFileSync(quotaLog, 'utf8'), '', 'Section shared_quota suppresses all measurement');
+  config.coordinators[business].default = [{ harness: 'pi', model: 'wrong/new-config' }]; config.coordinators[business].shared_quota = false; writeConfig(); login(personal);
+  r = call(['relaunch', task.id]); assert.equal(r.code, 0, r.out);
+  let moved = f.task(task.id); assert.equal(moved.agent, 'pi'); assert.equal(moved.launch.model, 'openai-codex/second'); assert.deepEqual(moved.candidates, chain);
+  assert.equal(moved.dispatch.coordinator.account, business); assert.equal(moved.dispatch.sharedQuota, true); assert.equal(fs.readFileSync(quotaLog, 'utf8'), '');
+  assert.equal(call(['relaunch', task.id]).code, 8, 'The saved policy cannot widen after all candidates were tried');
+  r = call(['relaunch', task.id, '--model', 'openai-codex/explicit']); assert.equal(r.code, 0, r.out);
+  moved = f.task(task.id); assert.equal(moved.launch.model, 'openai-codex/explicit'); assert.equal(moved.dispatch.coordinator.account, personal); assert.equal(moved.dispatch.sharedQuota, false);
+  assert.deepEqual(moved.candidates.map(c => c.model), ['openai-codex/explicit', 'openai-codex/gpt-6.1-sol']); assert.ok(fs.readFileSync(quotaLog, 'utf8').includes('read'));
+  // Automatic handover follows the same saved policy after a coordinator switch.
+  config.coordinators[business].default = chain; config.coordinators[business].shared_quota = true; writeConfig(); login(business);
+  const automatic = spawnTask('saved-auto'); login(personal);
+  setTerminal(automatic.terminal, { status: { state: 'error', app: 'a1' }, screen: 'Please run /login' });
+  fs.writeFileSync(quotaLog, '');
+  r = call(['wait', automatic.id, '--timeout', '2']); assert.equal(r.code, 124, r.out);
+  assert.equal(f.task(automatic.id).launch.model, 'openai-codex/second'); assert.deepEqual(f.task(automatic.id).candidates, chain);
+  assert.equal(f.task(automatic.id).dispatch.coordinator.account, business); assert.equal(fs.readFileSync(quotaLog, 'utf8'), '');
+  // Older saved tasks are still saved tasks: provenance absence never authorizes rebuilding.
+  const legacy = spawnTask('legacy-policy'); const { dispatch, ...old } = legacy;
+  f.save({ ...old, candidates: [old.launch, { harness: 'pi', model: 'legacy/saved' }], chain: [{ harness: 'pi', model: 'legacy/saved' }] });
+  r = call(['relaunch', legacy.id]); assert.equal(r.code, 0, r.out); assert.equal(f.task(legacy.id).launch.model, 'legacy/saved');
+  // The real review/fix entry points, not just agents --role, stay in section defaults.
+  const ship = spawnTask('section-ship', ['--kind', 'ship']); fs.writeFileSync(ship.report, 'Implementation complete.'); f.save({ ...ship, state: 'reported' });
+  r = call(['review', ship.id]); assert.equal(r.code, 0, r.out); assert.equal(f.task('section-ship-review').launch.model, 'openai-codex/gpt-6.1-sol');
+  r = f.call(['fix', 'Check coordinator policy.'], { ...env, CREW_TOOL_ROOT: f.repo }); assert.equal(r.code, 0, r.out); assert.equal(f.task('fix-1').launch.model, 'openai-codex/gpt-6.1-sol');
+  // Non-Claude/unlisted owners emit their reason once on a command that launches work.
+  login('aicoder-de13@ameria.com'); r = call(['spawn', 'global-policy', '--project', 'demo', 'Count.']); assert.equal(r.code, 0, r.out);
+  assert.equal((r.out.match(/^coordinator /gm) ?? []).length, 1); assert.match(r.out, /no coordinator section.*using global dispatch/); assert.equal(f.task('global-policy').launch.model, 'wrong/global');
 };
 
 gapTests['wait-relaunch'] = async () => {
@@ -3193,7 +3254,7 @@ console.log(JSON.stringify({ schemaVersion: 5, providers: who ? [row('claude', q
 if (a[0] === '--version') process.exit(0);`);
     const setQuota = q => fs.writeFileSync(quotaFile, JSON.stringify(q));
     const E = { CREW_AGENT_PATH: bin, CREW_CLAUDE_LAUNCHER: path.join(switcher, 'claude-as.sh'), CREW_TOOL_QUOTA_AXI: fakeQuota, CREW_HOME: home2 };
-    const crew2 = (args, terminal = 'k1', more = {}) => { const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: root, env: { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_WORKTREES: path.join(root, 'copies2'), HC_TERMINAL_ID: '', CREW_TERMINAL: terminal, CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...E, ...more } }); return { code: r.status, out: r.stdout + r.stderr }; };
+    const crew2 = (args, terminal = 'k1', more = {}) => { const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: root, env: { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_WORKTREES: path.join(root, 'copies2'), HC_TERMINAL_ID: '', CREW_TERMINAL: terminal, CLAUDE_CONFIG_DIR: '', CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '', CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...E, ...more } }); return { code: r.status, out: r.stdout + r.stderr }; };
     const task2 = id => JSON.parse(fs.readFileSync(path.join(home2, 'tasks', id, 'task.json'), 'utf8'));
     const lastRun = () => readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
     assert.equal(crew2(['init', home2]).code, 0); assert.equal(crew2(['project', 'add', 'demo', project]).code, 0); assert.equal(crew2(['start']).code, 0);
