@@ -45,6 +45,25 @@ test('workflow ignores label events and preserves code-change supersession', () 
   assert.match(workflow, /cancel-in-progress: true/);
 });
 
+test('review labels use a separate advisory-only caller and policy declaration', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/review-labels.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /on:\s*\n  pull_request_target:\s*\n    types: \[labeled\]\s*\n\npermissions:/);
+  assert.match(workflow, /uses: timurproko\/MyWorkflows\/\.github\/workflows\/review-labels\.yml@main/);
+  assert.equal((workflow.match(/    uses:/g) || []).length, 1);
+  assert.doesNotMatch(workflow, /delivery\.yml|tests\.yml|CI required|Delivery check/);
+  const delivery = readFileSync(new URL('../.github/workflows/delivery.yml', import.meta.url), 'utf8');
+  assert.doesNotMatch(delivery, /\b(?:labeled|unlabeled)\b/);
+  const declarations = JSON.parse(readFileSync(new URL('../.github/protection.json', import.meta.url), 'utf8'));
+  assert.deepEqual(declarations, [
+    { kind: 'default-branch', checks: ['CI required'], mergeMethods: ['squash'], linearHistory: true },
+    {
+      kind: 'workflow-events',
+      workflows: ['.github/workflows/delivery.yml', '.github/workflows/review-labels.yml'],
+      events: ['pull_request_target', 'workflow_dispatch'],
+    },
+  ]);
+});
+
 test('workflow keeps draft suites and aggregate disabled and checks both platforms', () => {
   const workflow = readFileSync(new URL('../.github/workflows/tests.yml', import.meta.url), 'utf8');
   assert.match(workflow, /if: needs\.readiness\.outputs\.ready == 'true'/);
