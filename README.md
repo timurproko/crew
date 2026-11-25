@@ -179,7 +179,8 @@ Claude profile.
   `session-dir.js list`; `CREW_CLAUDE_ACCOUNTS` names them on a machine without it). A profile
   with `account` is started through the plugin's launcher as that account. A Claude profile
   without one stands for every saved account, each a candidate of its own, with
-  `CREW_CLAUDE_ACCOUNT` (what Herdr's account choice sets) first.
+  `CREW_CLAUDE_ACCOUNT` (what Herdr's account choice sets) first. This expansion applies to
+  global lists and explicit account-less CLI overrides, not coordinator-scoped profiles below.
 - **A floor** (`"floor": 50` on a profile) is the share of its quota, in percent, a profile
   keeps in reserve: once it is known to have less left, it yields to the next. It is not dropped but moved
   behind the others, so when everybody else is out it is still used and work goes on. The figure is the
@@ -262,6 +263,93 @@ Claude profile.
   `crew status` shows who works on each task, its current Core error state, and how many continuation messages that worker received.
   `crew status --json` also includes `nudges` history, the worker's `continuations` count, and its active `recovery` record.
   Both status forms only read; they never send recovery messages.
+
+### Coordinator-specific worker lists
+
+Add `coordinators` to choose a worker policy by the **owner coordinator's** Claude account,
+not the worker's login. Keys are complete, case-insensitive email addresses. For example:
+
+```json
+{
+  "default": [
+    { "harness": "a1", "model": "openai-codex/gpt-x", "effort": "high" },
+    { "harness": "a1", "model": "github-copilot/gpt-x" },
+    { "harness": "claude", "model": "opus" }
+  ],
+  "coordinators": {
+    "tymur.prokopiev@ameria.com": {
+      "default": [
+        { "harness": "claude", "model": "claude-opus-5-5", "account": "aicoder-de13@ameria.com" }
+      ]
+    },
+    "masha.shmakova@gmail.com": {
+      "default": [
+        { "harness": "a1", "model": "openai-codex/gpt-6.1-sol" }
+      ]
+    }
+  }
+}
+```
+
+Here tymur's coordinator launches only the named Opus worker as aicoder; masha's launches
+only the named A1 Codex worker. There is **nothing behind either one**: a scoped profile is
+one candidate, even a Claude profile without `account`. Crew neither expands it into saved
+Claude logins nor appends global defaults. An account-less scoped Claude profile uses the
+normal launch-default login; name `account` for a specific login.
+
+Every other coordinator uses the existing global policy (`default`, with the existing
+project/role overrides): non-Claude coordinators such as Codex/a1 and pi, cloud or
+unverifiable sessions, unknown accounts, and Claude accounts without a section. In particular,
+`aicoder-de13@ameria.com` as **coordinator** uses global dispatch unless you add its own section.
+Each selection explains that choice in one line; it never borrows another account's section.
+Configs without `coordinators` keep their existing worker-selection behavior.
+
+Each section requires a nonempty `default`. Optional `roles`, `projects` and `rules` have the
+same profile shapes as above. Precedence is project role, project default, section role,
+section default: review and fix never fall through to the global roles/default. Rules are
+numbered within the selected section; a missing rule is an error, not a global rule lookup.
+Optional `shared_quota` is a boolean, inheriting the root measurement flag when omitted.
+Empty optional role/project lists mean no override. Invalid containers, fields, profiles,
+roles, rules, empty defaults, nested coordinators or case-colliding email keys are refused
+with the config field path, even in an unselected section.
+
+Explicit flags still work on top of that list: `--agent` starts clean; model/effort/account
+adjust the first profile; the selected list follows; `--rule` replaces the base. Only a
+**deliberate account-less CLI override** (for example `--agent claude`) keeps today's saved-login
+expansion; scoped config profiles behind it do not expand. `--no-fallback` still slices to
+the first profile before override expansion, so add `--account` for one explicit Claude login.
+`crew agents` prints the detected coordinator and selected section/list; `--json` adds
+`coordinator` with terminal, harness, account, status, source, reason and section while
+keeping stdout valid JSON. Its existing `source` identifies the final list, including the
+coordinator path on a match. JSON represents an unknown account with null and its reason.
+
+Scoped tasks save their complete selected candidates and quota-measurement policy. Quota/login
+loss, a crashed worker and relaunch without selection flags use only that saved chain,
+even after the coordinator changes account or the config changes; its diagnostic says
+`saved task policy` rather than claiming the old account is the current coordinator. A singleton has nobody
+to hand over to: crew says `Nobody can take this work now`, with the stop/no-other-candidate
+reason, and keeps the working copy for a person. Relaunch with selection flags deliberately
+rebuilds from the coordinator's current policy, excluding the current worker as before.
+Removing `coordinators` restores global selection for new tasks; existing task chains stay
+saved. Rolling back to an older crew also restores global selection for new tasks because
+older versions do not understand this key.
+
+### Coordinator identity
+
+`crew start` records the owner terminal and non-secret identity/source metadata in
+`owner.json`. New worker selection re-reads that owner's account-switcher metadata, so
+changing the coordinator's account in the session picker takes effect without restarting
+crew. An inspector's own account never substitutes for the owner's.
+
+The authority is the switcher's API-verified identity: fresh `custom.claude.*` labels
+on the owner terminal or `account-switcher-status.json` in its private `CLAUDE_CONFIG_DIR`.
+Reports must be at most 60 seconds old (up to five seconds of future clock skew); switching,
+conflicting, logged-out or unverified reports are unknown. The launch environment's
+`CREW_CLAUDE_ACCOUNT`, the selected-account marker and `.claude.json` alone are not proof:
+they can describe the launch login, an unconfirmed choice or stale engine memory. Crew
+never reads credentials or switches the coordinator's login to discover its identity.
+Non-Claude coordinators (a1/Codex and pi), cloud/unverifiable sessions and unknown accounts
+use the global dispatch policy rather than guessing another account.
 
 ## Delivering a code change
 

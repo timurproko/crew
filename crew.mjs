@@ -97,21 +97,21 @@ function run(command, args, options = {}) {
 // --- Core --------------------------------------------------------------------
 // CREW_HC names another hc binary; a .mjs path is run with node (the tests' fake Core).
 const HC = process.env.CREW_HC || 'hc';
-function hc(args) {
-  const r = HC.endsWith('.mjs') ? run(process.execPath, [HC, ...args]) : run(HC, args);
+function hc(args, options = {}) {
+  const r = HC.endsWith('.mjs') ? run(process.execPath, [HC, ...args], options) : run(HC, args, options);
   if (r.error) refuse(`herdr-core (hc) could not be run: ${r.error.message}`, 4);
   return r;
 }
-function hcJson(args) {
-  const r = hc(args);
+function hcJson(args, options) {
+  const r = hc(args, options);
   try { return { code: r.code, value: JSON.parse(r.stdout || r.stderr) }; } catch { return { code: r.code, value: null }; }
 }
 // What Core says about a terminal, in three distinct answers. `absent` only when Core
 // itself says it has no such terminal; any other failed query is `unknown`, and an unknown
 // answer never justifies taking a home over, failing a task or deleting a worker's files.
-function probe(address) {
+function probe(address, options) {
   if (!address) return { state: 'absent', t: null };
-  const { code, value } = hcJson(['get', '--json', address]);
+  const { code, value } = hcJson(['get', '--json', address], options);
   if (code === 0 && value && !value.error && typeof value.state === 'string') return { state: value.state === 'live' ? 'live' : 'finished', t: value };
   if (value?.error?.kind === 'not_found') return { state: 'absent', t: null };
   return { state: 'unknown', t: null };
@@ -403,6 +403,67 @@ function requireOwner(h, operation = 'control work in this home') {
   refuse(`This session does not hold crew home ${slash(h.dir)}. Run \`crew start\` first to ${operation}.`, 3);
 }
 
+// Account identity is the owner's verified *current session*, never the launch hint or
+// ~/.claude.json (the engine can rewrite that from stale memory after a switch).
+const EMAIL = /^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+const accountEmail = value => typeof value === 'string' && value.trim().length <= 100 && EMAIL.test(value.trim()) ? value.trim().toLowerCase() : null;
+export function coordinatorIdentity(owner, options = {}) {
+  let terminal = null;
+  try {
+    terminal = typeof owner?.terminal === 'string' ? owner.terminal : null;
+    const identity = detectCoordinatorIdentity(owner, options), h = options.home, caller = options.env ?? process.env;
+    // Identity and its optional cache are advisory: inspectors never write, and replaced
+    // owners cannot inherit this observation. Any failure stays inside this one boundary.
+    if (h && terminal && terminal === (caller.CREW_TERMINAL || caller.HC_TERMINAL_ID) && JSON.stringify(readJson(h.owner)) === JSON.stringify(owner)) {
+      writeJson(h.owner, { ...owner, coordinator: identity });
+    }
+    return identity;
+  } catch {
+    return { terminal, harness: null, account: null, status: 'unknown', source: null,
+      reason: 'owner-session identity probe is unavailable', configDir: null, observedAt: null };
+  }
+}
+function detectCoordinatorIdentity(owner, { env = process.env, core, time = Date.now() } = {}) {
+  const mine = owner?.terminal && owner.terminal === (env.CREW_TERMINAL || env.HC_TERMINAL_ID);
+  const configDir = mine && env.CLAUDE_CONFIG_DIR ? path.resolve(env.CLAUDE_CONFIG_DIR) : owner?.coordinator?.configDir ?? null;
+  const result = { terminal: owner?.terminal ?? null, harness: null, account: null, status: 'unknown', source: null, reason: 'no home owner', configDir, observedAt: null };
+  const unknown = reason => ({ ...result, reason });
+  if (!owner?.terminal) return unknown('no home owner');
+  const seen = core ?? probe(owner.terminal, { timeout: 2000 });
+  if (['absent', 'finished'].includes(seen.state)) return unknown('owner terminal is not live');
+  if (seen.state !== 'live') return unknown('Core owner-session metadata is unavailable');
+  const app = String(seen.t?.status?.app ?? seen.t?.agent ?? '').split(/[\\/]/).pop().replace(/\.exe$/i, '').toLowerCase();
+  if (['a1', 'pi', 'codex'].includes(app)) return { ...result, harness: app, status: 'non-claude', source: 'core', reason: `${app} is not a Claude coordinator`, configDir: null };
+  if (['claude', 'claude-code'].includes(app)) result.harness = 'claude';
+  const fresh = at => Number.isFinite(at) && time - at <= 60000 && at <= time + 5000;
+  const reports = [], labels = seen.t?.labels ?? {}, labelAt = Number(labels['custom.claude.at']);
+  if (seen.state === 'live' && labels['custom.claude.session'] && fresh(labelAt)) {
+    const state = labels['custom.claude.state'], account = accountEmail(labels['custom.claude.email']);
+    reports.push({ at: labelAt, account: ['ok', 'mismatch'].includes(state) ? account : null,
+      source: 'owner-terminal', reason: state === 'switching' ? 'account switch is in progress' : 'owner terminal has no verified Claude account' });
+  }
+  let marker = null;
+  if (configDir) {
+    marker = readJson(path.join(configDir, 'account-switcher-session.json'));
+    const status = readJson(path.join(configDir, 'account-switcher-status.json'));
+    if (status?.isolated === true && fresh(status.at)) {
+      reports.push({ at: status.at, account: ['ok', 'mismatch'].includes(status.state) && status.expiresAt > time ? accountEmail(status.apiEmail) : null,
+        source: 'session-status', reason: 'session has no verified current Claude account' });
+    }
+  }
+  if (!reports.length) return unknown('no fresh verified owner-session metadata');
+  const verified = reports.filter(r => r.account), latest = reports.reduce((a, b) => a.at > b.at ? a : b);
+  if (!verified.length) return unknown(latest.reason);
+  const best = verified.reduce((a, b) => a.at > b.at ? a : b);
+  if (reports.some(r => !r.account && r.at >= best.at)) return unknown(latest.reason);
+  if (Number.isFinite(marker?.at) && marker.at > best.at) return unknown('account selection is newer than verification');
+  if (new Set(verified.map(r => r.account)).size > 1) return unknown('owner-session identity reports disagree');
+  return { ...result, harness: 'claude', account: best.account, status: 'known', source: best.source, reason: null, observedAt: best.at };
+}
+function currentCoordinator(h) {
+  return coordinatorIdentity(readJson(h.owner), { home: h });
+}
+
 // --- Claude Code folder trust ---------------------------------------------------
 // Claude Code asks "do you trust this folder?" for every new path whose project carries
 // Claude settings, and a worker's copy is always a new path, so every Claude worker would
@@ -683,7 +744,8 @@ function cmdStart() {
   const { owner, live, unknown } = ownerState(h);
   if (owner && unknown && owner.terminal !== mine) refuse(`${CORE_SILENT} the owner terminal ${owner.terminal}, so crew home ${slash(h.dir)} was not taken over. Try again.`, 4);
   if (owner && live && owner.terminal !== mine) refuse(ownershipRefusal(h, owner, 'take ownership of this home'), 3);
-  writeJson(h.owner, { terminal: mine, since: now(), previous: owner && owner.terminal !== mine ? owner.terminal : undefined });
+  const nextOwner = { terminal: mine, since: now(), previous: owner && owner.terminal !== mine ? owner.terminal : undefined };
+  writeJson(h.owner, { ...nextOwner, coordinator: coordinatorIdentity(nextOwner) });
   // The rules file belongs to the tool: a newer crew may have changed what a coordinator does.
   const rules = path.join(h.coordinator, 'AGENTS.md');
   if (fs.existsSync(rules) && fs.readFileSync(rules, 'utf8') !== COORDINATOR_RULES) {
@@ -785,7 +847,8 @@ export function cleanProfile(raw, where = '') {
   const at = where ? `${where}: ` : '', p = typeof raw === 'string' ? { harness: raw } : raw;
   if (!p || typeof p !== 'object' || Array.isArray(p)) refuse(`${at}not a profile ({ "harness": "a1", "model": ..., "effort": ..., "account": ... }).`);
   const harness = p.harness ?? p.agent;
-  if (!AGENTS[harness]) refuse(`${at}Unknown agent: ${harness}. Known: ${Object.keys(AGENTS).join(', ')}`);
+  if (typeof harness !== 'string') refuse(`${at}Agent harness must be a string. Known: ${Object.keys(AGENTS).join(', ')}`);
+  if (!Object.hasOwn(AGENTS, harness)) refuse(`${at}Unknown agent: ${harness}. Known: ${Object.keys(AGENTS).join(', ')}`);
   const out = { harness };
   for (const key of ['model', 'effort', 'account']) {
     if (p[key] === undefined || p[key] === null || p[key] === '') continue;
@@ -806,8 +869,70 @@ export function cleanProfile(raw, where = '') {
 }
 
 const dispatchFile = h => path.join(h.dir, 'config', 'crew-dispatch.json');
+function coordinatorSections(raw, file, shared) {
+  if (raw === undefined) return {};
+  const fail = (where, why) => refuse(`${slash(file)}: ${where} ${why}.`);
+  const guard = (where, validate) => {
+    try { return validate(); }
+    catch (error) { if (error instanceof Refusal) throw error; fail(where, 'could not be validated'); }
+  };
+  const object = (value, where, allowed) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) fail(where, 'must be an object');
+    const bad = allowed && Object.keys(value).find(key => !allowed.includes(key));
+    if (bad) fail(`${where}.${bad}`, 'is not a supported field');
+    return value;
+  };
+  const list = (value, where, required = false) => {
+    if (value === null) fail(where, 'must be a profile or list of profiles');
+    const entries = value === undefined ? [] : Array.isArray(value) ? value : [value];
+    if (required && !entries.length) fail(where, 'must contain at least one profile');
+    return entries.map((p, i) => {
+      const at = `${where}[${i}]`;
+      return guard(at, () => {
+        const profile = typeof p === 'string' ? { harness: p } : object(p, at, ['harness', 'agent', 'model', 'effort', 'account', 'floor', 'provider', 'family']);
+        for (const key of ['harness', 'agent']) if (Object.hasOwn(profile, key)) {
+          if (typeof profile[key] !== 'string') fail(`${at}.${key}`, 'harness must be a string');
+          if (!Object.hasOwn(AGENTS, profile[key])) fail(`${at}.${key}`, `Unknown agent: ${profile[key]}`);
+        }
+        const harness = profile.harness ?? profile.agent;
+        if (harness === undefined) fail(`${at}.harness`, 'must name an agent');
+        for (const key of ['model', 'effort', 'account', 'provider', 'family']) if (Object.hasOwn(profile, key)) {
+          if (typeof profile[key] !== 'string' || !profile[key].length) fail(`${at}.${key}`, 'must be a non-empty string');
+          if (!(key === 'account' ? ACCOUNT : WORD).test(profile[key])) fail(`${at}.${key}`, 'is not a usable value');
+        }
+        if (Object.hasOwn(profile, 'floor') && (typeof profile.floor !== 'number' || !Number.isFinite(profile.floor) || profile.floor < 0 || profile.floor > 100)) fail(`${at}.floor`, 'must be a finite number from 0 to 100');
+        if (Object.hasOwn(profile, 'account') && harness !== 'claude') fail(`${at}.account`, 'is only supported for Claude Code');
+        return cleanProfile(profile, `${at} in ${slash(file)}`);
+      });
+    });
+  };
+  const roles = (value, where) => Object.fromEntries(Object.entries(value === undefined ? {} : object(value, where, ROLES)).map(([role, profiles]) => [role, list(profiles, `${where}.${role}`)]));
+  const sections = new Map();
+  for (const [key, value] of Object.entries(object(raw, 'coordinators'))) guard(`coordinators.${key}`, () => {
+    const where = `coordinators.${key}`, email = accountEmail(key);
+    if (!email) fail(where, 'must be keyed by a complete account email');
+    if (sections.has(email)) fail(where, `duplicates coordinator ${email} after case normalization`);
+    const section = object(value, where, ['default', 'roles', 'projects', 'rules', 'shared_quota']);
+    if (section.shared_quota !== undefined && typeof section.shared_quota !== 'boolean') fail(`${where}.shared_quota`, 'must be a boolean');
+    const projects = Object.fromEntries(Object.entries(section.projects === undefined ? {} : object(section.projects, `${where}.projects`)).map(([name, project]) => {
+      const at = `${where}.projects.${name}`;
+      if (name !== SELF_PROJECT && projectNameError(name)) fail(at, `has an invalid project name (${projectNameError(name)})`);
+      if (Array.isArray(project) || typeof project === 'string' || project?.harness || project?.agent) return [name, { default: list(project, at), roles: {} }];
+      object(project, at, ['default', 'roles']);
+      return [name, { default: list(project.default, `${at}.default`), roles: roles(project.roles, `${at}.roles`) }];
+    }));
+    if (section.rules !== undefined && !Array.isArray(section.rules)) fail(`${where}.rules`, 'must be an array');
+    const rules = (section.rules ?? []).map((rule, i) => {
+      const at = `${where}.rules[${i}]`; object(rule, at, ['when', 'why', 'use']);
+      for (const key of ['when', 'why']) if (rule[key] !== undefined && typeof rule[key] !== 'string') fail(`${at}.${key}`, 'must be text');
+      return { when: rule.when ?? '', why: rule.why ?? '', use: list(rule.use, `${at}.use`, true) };
+    });
+    sections.set(email, { default: list(section.default, `${where}.default`, true), roles: roles(section.roles, `${where}.roles`), projects, rules, shared: section.shared_quota ?? shared });
+  });
+  return Object.fromEntries(sections);
+}
 function dispatchConfig(h) {
-  const file = dispatchFile(h), none = { file, present: false, shared: false, default: [], roles: {}, rules: [], projects: {} };
+  const file = dispatchFile(h), none = { file, present: false, shared: false, default: [], roles: {}, rules: [], projects: {}, coordinators: {}, hasCoordinators: false };
   if (!fs.existsSync(file)) return none;
   let raw;
   try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { refuse(`${slash(file)} is not valid JSON (${error.message}). Correct it, or remove it to use the built-in default.`); }
@@ -822,7 +947,7 @@ function dispatchConfig(h) {
   const projects = Object.fromEntries(Object.entries(raw.projects ?? {}).map(([name, value]) => [name, Array.isArray(value) || typeof value !== 'object' || value === null || value.harness || value.agent
     ? { default: list(value, `projects.${name}`), roles: {} } : { default: list(value.default, `projects.${name}.default`), roles: roles(value.roles, `projects.${name}.roles`) }]));
   return { file, present: true, shared: raw.shared_quota === true, default: list(raw.default, 'default'),
-    roles: roles(raw.roles, 'roles'), projects,
+    roles: roles(raw.roles, 'roles'), projects, coordinators: coordinatorSections(raw.coordinators, file, raw.shared_quota === true), hasCoordinators: Object.hasOwn(raw, 'coordinators'),
     rules: (Array.isArray(raw.rules) ? raw.rules : []).map((r, i) => ({ when: String(r?.when ?? ''), why: String(r?.why ?? ''), use: list(r?.use, `rules[${i}].use`) })) };
 }
 
@@ -841,7 +966,14 @@ function claudeAccounts(env = process.env) {
 // the configured chain follows it as its fallback; `--no-fallback` keeps only the first.
 // `legacy` is the agent crew used before there was any configuration.
 function workChain(h, role, flags, legacy, project = null, env = process.env) {
-  const config = dispatchConfig(h), own = ownEntry(config.projects, project) ?? null;
+  const root = dispatchConfig(h), identity = currentCoordinator(h);
+  const section = identity.account ? ownEntry(root.coordinators, identity.account) : null;
+  const sectionPath = section ? `coordinators.${identity.account}` : 'global';
+  const config = section ? { ...root, ...section } : root;
+  const { terminal, harness, account, status, source: identitySource, reason } = identity;
+  const coordinator = { terminal, harness, account, status, source: identitySource,
+    reason: reason ?? (!section ? account ? `no coordinator section for ${account}` : 'no matching coordinator section' : null), section: sectionPath };
+  const own = ownEntry(config.projects, project) ?? null;
   // The project's own list comes before the general one, a role's list before a default.
   const [configured, from] = own?.roles[role]?.length ? [own.roles[role], `projects.${project}.roles.${role}`] : own?.default.length ? [own.default, `projects.${project}`]
     : config.roles[role]?.length ? [config.roles[role], `roles.${role}`] : [config.default, config.default.length ? 'default' : 'built-in'];
@@ -856,16 +988,22 @@ function workChain(h, role, flags, legacy, project = null, env = process.env) {
   // over; --model, --effort or --account alone adjust the first configured profile.
   const start = flags.agent !== undefined ? {} : base[0] ?? { harness: legacy };
   const first = named ? cleanProfile({ ...start, ...Object.fromEntries(['model', 'effort', 'account'].filter(k => flags[k] !== undefined).map(k => [k, flags[k]])), ...(flags.agent !== undefined ? { harness: flags.agent } : {}) }) : null;
-  let chain = first ? [first, ...base] : base.length ? base : [cleanProfile({ harness: legacy })];
+  // Scoped config profiles are literal candidates. Only legacy profiles and deliberate
+  // named overrides retain the existing account expansion, never the scoped base behind them.
+  let chain = base.map(profile => ({ profile, expand: !section }));
+  if (first) chain.unshift({ profile: first, expand: true });
+  if (!chain.length) chain = [{ profile: cleanProfile({ harness: legacy }), expand: true }];
   if (flags['no-fallback']) chain = chain.slice(0, 1);
-  const saved = claudeAccounts(env), preferred = String(env.CREW_CLAUDE_ACCOUNT ?? '').trim();
+  const saved = chain.some(({ profile, expand }) => expand && profile.harness === 'claude' && !profile.account) ? claudeAccounts(env) : [];
+  const preferred = String(env.CREW_CLAUDE_ACCOUNT ?? '').trim();
   const accounts = saved.includes(preferred) ? [preferred, ...saved.filter(a => a !== preferred)] : saved;
   const candidates = [], seen = new Set();
-  for (const profile of chain) {
-    const each = profile.harness === 'claude' && !profile.account && accounts.length ? accounts.map(account => ({ ...profile, account })) : [profile];
+  for (const { profile, expand } of chain) {
+    const each = expand && profile.harness === 'claude' && !profile.account && accounts.length ? accounts.map(account => ({ ...profile, account })) : [profile];
     for (const c of each) { if (!seen.has(pickKey(c))) { seen.add(pickKey(c)); candidates.push(c); } }
   }
-  return { candidates, config, source: flags.rule !== undefined ? `rule ${flags.rule}` : named ? 'named' : from };
+  const source = flags.rule !== undefined ? `rule ${flags.rule}` : named ? 'named' : from;
+  return { candidates, config, coordinator, source: section ? `${sectionPath}.${source}` : source };
 }
 
 // The provider an A1 or Pi profile without a model spends from: the agent's own saved default.
@@ -971,29 +1109,33 @@ const candidateChecks = rows => ({ checkedAt: now(), facts: Object.fromEntries(r
 
 // Who takes a new piece of work, and who stands behind them.
 function chooseWorker(h, role, flags, legacy, project = null) {
-  const { candidates, config, source } = workChain(h, role, flags, legacy, project);
+  const { candidates, config, coordinator, source } = workChain(h, role, flags, legacy, project);
+  if (config.hasCoordinators) console.log(coordinatorLine(coordinator, source));
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared });
   if (!usable.length) refuse(`Nobody can take this work now:\n${candidateLines(rows)}\nAdd another profile to ${slash(config.file)}, or name one: --agent <agent> [--model <id>] [--account <account>].`, 8);
   const taken = rows.find(r => pickKey(r) === pickKey(usable[0]));
   for (const r of rows) { if (r === taken) break; console.log(`passed over ${pickLabel(r)}: ${r.fact.note}`); }
   if (taken.fact.status === 'low') console.log(`${pickLabel(taken)} is under its floor (${taken.fact.note}), but nobody above their floor can take the work`);
-  return { pick: usable[0], rest: candidates.filter(c => pickKey(c) !== pickKey(usable[0])), candidates, checks: candidateChecks(rows), available: usable.length - 1, source };
+  return { pick: usable[0], rest: candidates.filter(c => pickKey(c) !== pickKey(usable[0])), candidates, checks: candidateChecks(rows), available: usable.length - 1, source,
+    dispatch: { coordinator, source, sharedQuota: config.shared } };
 }
 
+const coordinatorLine = (c, source) => `coordinator ${c.account ?? (c.status === 'non-claude' ? c.harness : 'account unknown')} (${c.reason ?? c.source}); using ${c.section === 'global' ? 'global dispatch' : c.section} (${source})`;
 function cmdAgents(args) {
   const h = home();
   const { flags } = takeFlags(args, ['role', 'project', ...PICK_FLAGS], ['json', 'no-fallback']);
   if (flags.role !== undefined && !ROLES.includes(flags.role)) refuse(`Unknown role: ${flags.role}. Roles: ${ROLES.join(', ')}`);
   if (flags.project !== undefined && flags.project !== SELF_PROJECT) requireProjectName(flags.project);
-  const role = flags.role ?? 'scout', { candidates, config, source } = workChain(h, role, flags, 'a1', flags.project ?? null);
+  const role = flags.role ?? 'scout', { candidates, config, coordinator, source } = workChain(h, role, flags, 'a1', flags.project ?? null);
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true });
   const first = usable[0] ? pickKey(usable[0]) : null;
   if (flags.json) {
-    console.log(JSON.stringify({ config: config.present ? slash(config.file) : null, role, source, sharedQuota: config.shared,
+    console.log(JSON.stringify({ config: config.present ? slash(config.file) : null, role, source, coordinator, sharedQuota: config.shared,
       candidates: rows.map(({ fact, family, ...c }) => ({ ...c, label: pickLabel(c), status: fact.status, remaining: fact.remaining ?? null, note: fact.note, next: pickKey(c) === first })),
       rules: config.rules.map((r, i) => ({ rule: i + 1, when: r.when, why: r.why, use: r.use.map(pickLabel) })) }));
     return;
   }
+  console.log(coordinatorLine(coordinator, source));
   console.log(config.present ? `profiles from ${slash(config.file)} (${source}), for ${role} work${flags.project ? ` in ${flags.project}` : ''}:` : `no ${slash(config.file)}: the built-in default, for ${role} work:`);
   for (const r of rows) console.log(`${pickKey(r) === first ? '->' : '  '} ${pickLabel(r).padEnd(52)} ${r.fact.status.padEnd(11)}${r.fact.note}`);
   if (!first) console.log('Nobody can take work now.');
@@ -1201,7 +1343,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
     // Keep the original order, even for candidates that cannot work now: hand-over rereads
     // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
-    launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks,
+    launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks, dispatch: chosen.dispatch,
     ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
   withRegistry(h, () => {
     // The project may have been removed/replaced while selection was running.
@@ -1291,14 +1433,19 @@ function replaceWorker(h, task, reason, flags) {
   const before = task.launch ?? { harness: task.agent }, tried = new Set([...(task.tried ?? []), pickKey(before)]);
   const role = roleOf(task), named = flags && [...PICK_FLAGS, 'no-fallback'].some(key => flags[key] !== undefined);
   const config = dispatchConfig(h);
-  // The task's own chain as it stood at launch; a task from before there were chains, or an
-  // explicit choice on the command line, takes the configured one as it stands now.
-  const original = named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project).candidates : task.candidates ?? task.chain;
+  // Saved chains and their measurement policy stay frozen. Only a deliberate selection
+  // (or a legacy task without a chain) asks the *current* coordinator policy again.
+  const rebuilt = named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project) : null;
+  const dispatch = rebuilt ? { coordinator: rebuilt.coordinator, source: rebuilt.source, sharedQuota: rebuilt.config.shared } : task.dispatch;
+  if (config.hasCoordinators && dispatch) console.log(`${rebuilt ? '' : 'saved task policy: '}${coordinatorLine(dispatch.coordinator, dispatch.source)}`);
+  const original = rebuilt ? rebuilt.candidates : task.candidates ?? task.chain;
   const candidates = original.filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
-  const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true }), checks = candidateChecks(rows);
+  const scoped = dispatch && dispatch.coordinator.section !== 'global';
+  const { rows, usable } = usableCandidates(candidates, { shared: scoped ? dispatch.sharedQuota : config.shared, always: true }), checks = candidateChecks(rows);
   if (!usable.length) {
     store({ ...task, candidateChecks: checks });
-    return { pick: null, why: rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain' };
+    const why = rows.length ? `nobody else can take it:\n${candidateLines(rows)}` : 'there is no other candidate in its chain';
+    return { pick: null, why: scoped ? `${why}; Nobody can take this work now` : why };
   }
   const [pick, ...rest] = usable;
   const chain = original.filter(c => pickKey(c) !== pickKey(pick) && !tried.has(pickKey(c)));
@@ -1317,7 +1464,7 @@ function replaceWorker(h, task, reason, flags) {
   }
   const { error, ...kept } = task;
   store({ ...kept, agent: pick.harness, launch: { ...pick, source: 'fallback' }, candidates: original, chain, candidateChecks: checks, tried: [...tried], state: 'working', terminal: address, terminals: launchedTerminals(task, address, pick.harness), relaunched: now(),
-    fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
+    ...(dispatch ? { dispatch } : {}), fallbacks: [...(task.fallbacks ?? []), { at: now(), from: pickLabel(before), to: pickLabel(pick), why: reason }] });
   return { pick, rest, address };
 }
 
