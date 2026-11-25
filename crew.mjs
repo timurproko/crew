@@ -1695,14 +1695,14 @@ function describeHolders(holders, folder) {
 // Hands a closed worker's copy back the way it was made: through the delivery workflow, the
 // legacy treehouse pool, or git. Never refuses: { ok, said, leftover } or { ok: false, why },
 // so finish can refuse with `why` and the later sweep can report it and go on.
-function returnCopy(task, project, { force = false, scratch = null } = {}) {
+function returnCopy(task, project, { force = false, scratch = null, accepted = null } = {}) {
   const contents = fs.existsSync(task.worktree) ? gitStatus(task.worktree, '--ignored') : [];
   let discarded = [];
   if (scratch) {
     // Only the verified closed-PR path may bypass ignored KEEP/nested-repository
-    // protection. Recheck protected files and HEAD after terminal removal.
+    // protection. Later observations never replace the accepted history baseline.
     const seen = snapshotCopy(task.worktree, { scratch: true });
-    if (!seen || seen.incomplete || Object.keys(seen.files).length || seen.head !== scratch.head || seen.operations.length)
+    if (!accepted || !seen || seen.incomplete || Object.keys(seen.files).length || seen.head !== scratch.head || seen.operations.length)
       return { ok: false, why: 'protected work changed before ignored scratch cleanup' };
     const roots = gitStatus(task.worktree, '--ignored');
     if (!roots) return { ok: false, why: 'ignored scratch could not be listed' };
@@ -1712,7 +1712,7 @@ function returnCopy(task, project, { force = false, scratch = null } = {}) {
     const clean = run('git', ['-C', task.worktree, 'clean', '-ff', '-d', '-X'], { timeout: 60000 });
     if (clean.code !== 0) return { ok: false, partial: true, why: `ignored scratch cleanup failed (${lastLine(clean.stderr)})` };
     const after = snapshotCopy(task.worktree, { scratch: true });
-    if (!after || after.incomplete || Object.keys(after.files).length || after.head !== scratch.head || after.operations.length || commitsOnlyInCopy(task.worktree, seen).length)
+    if (!after || after.incomplete || Object.keys(after.files).length || after.head !== scratch.head || after.operations.length || commitsOnlyInCopy(task.worktree, accepted).length)
       return { ok: false, scratch: true, discarded, why: 'protected work changed during ignored scratch cleanup' };
   }
   const back = releaseCopy(task, project, { force: force || Boolean(scratch) });
@@ -1817,9 +1817,9 @@ function closedPrScratch(h, task) {
   const behind = unpushedCommits(git, branchOf(task));
   if (behind === undefined) return { state: pr.state, why: 'publication that could not be checked against origin' };
   if (behind > 0) return { state: pr.state, why: `${behind} unpushed commits` };
-  // Auto-deletion of a merged source branch is not unpublished work. Its exact
-  // PR head or merge commit can also prove that an older local HEAD was published.
-  const contained = head.code === 0 && pr.headRefOid !== head.stdout.trim() && pr.state === 'MERGED' && behind === null && [pr.headRefOid, pr.mergeCommit?.oid].some(sha =>
+  // With zero unpushed commits (or an auto-deleted branch), the merged PR head
+  // or merge commit can also prove that an older local HEAD was published.
+  const contained = head.code === 0 && pr.headRefOid !== head.stdout.trim() && pr.state === 'MERGED' && [pr.headRefOid, pr.mergeCommit?.oid].some(sha =>
     /^[a-f0-9]{40,64}$/i.test(sha ?? '') && git('merge-base', '--is-ancestor', head.stdout.trim(), sha).code === 0);
   if (head.code !== 0 || (pr.headRefOid !== head.stdout.trim() && !contained)) return { state: pr.state, why: 'unpublished work or a local head not covered by the closed PR' };
   return { head: head.stdout.trim(), state: pr.state };
@@ -2034,7 +2034,7 @@ function tryReturnWaiting(h, task, { force = false } = {}) {
   const check = checkWaitingCopy(task, accepted, { discardUnseen: force, scratch: Boolean(scratch) });
   if (check.kept) return { state: 'kept', line: `the working copy of finished task ${task.id} waits: ${check.kept.text}. ${force ? 'The copy changed during this forced attempt; stop writes to it before retrying force.' : `\`crew finish ${task.id} --force\` discards its present contents and returns the copy.`}` };
   // What is left was accepted at finish (or now): discarding it is what was asked.
-  const back = returnCopy(task, project, { force: check.leftovers, scratch });
+  const back = returnCopy(task, project, { force: check.leftovers, scratch, accepted });
   if (!back.ok) return { state: 'failed', disposal: back, line: `the working copy of ${task.id} was not returned yet: ${back.why}` };
   saveTask(h, { ...rest, copyReturned: now() });
   return { state: 'returned', disposal: { ...back, unseen: Boolean(check.unseen) || back.unseen }, line: `returned the working copy of finished task ${task.id}${back.said}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}` };
@@ -2114,7 +2114,7 @@ function cmdFinish(args, { scratchProof } = {}) {
   // copy needs explicit discard-unseen authority; never infer that authority for a retry.
   const comparison = reason ? null : checkWaitingCopy(waiting, left, { discardUnseen: force, scratch: Boolean(scratch) });
   reason ??= comparison?.kept?.text ?? null;
-  const back = reason ? null : returnCopy(task, project, { force, scratch });
+  const back = reason ? null : returnCopy(task, project, { force, scratch, accepted: left });
   reason ??= back && !back.ok ? back.why : null;
   forget();
   if (reason) {

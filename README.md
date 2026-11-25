@@ -583,11 +583,14 @@ untracked contents as disposable scratch only after checking repository, branch 
 identity and publication. Tracked changes, non-ignored untracked files, unpushed commits,
 Git operations/locks and foreign terminals still protect the copy. A deleted remote branch
 is not proof by itself: its verified closed PR must hold the exact local head, or a merged
-PR's head or merge commit must contain it. Closed but unmerged branches stay. This exception discards ignored KEEP markers, screenshots, sockets
+PR's head or merge commit must contain it. This containment proof also permits a retained
+published source branch when there are zero unpushed commits. Closed but unmerged branches
+stay. This exception discards ignored KEEP markers, screenshots, sockets
 and nested probe repositories without reading their contents or following symlinks. It
 also applies on deferred return after rechecking safety; ignored-only changes do not hold
-an eligible copy indefinitely. After ignored cleanup, reflog history is checked again so a
-new orphan commit remains protected even if HEAD was reset to its original value. Unknown or open PRs retain the existing KEEP/force rules.
+an eligible copy indefinitely. After ignored cleanup, reflog history is checked again against
+the original accepted finish/retry snapshot, never a newer pre-clean observation. A new
+orphan commit remains protected even if HEAD was reset to its original value. Unknown or open PRs retain the existing KEEP/force rules.
 
 Outside that narrow exception, finish records changed and untracked file times and the keep marker before stopping. The
 non-forced ship refusal uses that same inspection, not an earlier clean result. Ignored
