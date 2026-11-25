@@ -20,7 +20,7 @@ None.
 
 ### Modified Capabilities
 
-- `task-orchestration`: the requirement "Dotted project names preserve their identity" allows one leading dot and records that a project name never forms part of a git ref or working-copy path.
+- `task-orchestration`: the requirement "Dotted project names preserve their identity" allows one leading dot; a new requirement records that a project name never forms part of a git ref or working-copy path.
 
 ## Impact
 

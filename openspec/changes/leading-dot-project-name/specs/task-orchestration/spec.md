@@ -4,7 +4,7 @@
 
 ### Requirement: Dotted project names preserve their identity
 
-Crew SHALL accept project names of 1 to 40 lowercase ASCII letters, digits, dashes and dots, starting with a letter or digit or with one dot followed by a letter or digit, excluding consecutive dots and a trailing dot. The 40-character limit SHALL count a leading dot. Project names SHALL remain distinct from task IDs. Registry operations, project selection, dispatch, backlog forwarding and status SHALL preserve the exact project name; working-copy allocation and task-based branch names SHALL remain valid for dotted projects. A project name SHALL NOT form part of a git ref or a working-copy path.
+Crew SHALL accept project names of 1 to 40 lowercase ASCII letters, digits, dashes and dots, starting with a letter, a digit or one dot followed by one, excluding consecutive dots and a trailing dot. Project names SHALL remain distinct from task IDs. Registry operations, project selection, dispatch, backlog forwarding and status SHALL preserve the exact project name; working-copy allocation and task-based branch names SHALL remain valid for dotted projects.
 
 #### Scenario: A dotted project completes the normal workflow
 
@@ -23,10 +23,21 @@ Crew SHALL accept project names of 1 to 40 lowercase ASCII letters, digits, dash
 
 #### Scenario: An invalid project name is supplied
 
-- **WHEN** an explicit project name is empty, too long, starts incorrectly (including a dot followed by anything other than a lowercase letter or digit), contains unsupported characters, has consecutive dots or ends in a dot
+- **WHEN** an explicit project name is empty, too long (a leading dot counts toward the 40 characters), starts incorrectly (including a dot followed by anything other than a lowercase letter or digit), contains unsupported characters, has consecutive dots or ends in a dot
 - **THEN** crew refuses with the supplied name and a specific explanation of the violated naming rule rather than bare usage text
 
 #### Scenario: Dotted project selection does not relax task IDs
 
 - **WHEN** a caller supplies a dotted project name with a valid task ID
 - **THEN** crew accepts project selection without changing the existing task-ID constraints or task-based branch naming
+
+## ADDED Requirements
+
+### Requirement: Project names stay out of git refs and working-copy paths
+
+Crew SHALL NOT use a project name as any part of a git ref or a working-copy path. Branch and working-copy names SHALL be built from the task ID or the repository folder, so a leading-dot project name never reaches a git ref.
+
+#### Scenario: Ship work in a leading-dot project
+
+- **WHEN** an owner spawns ship work in a project named `.xrbuild`
+- **THEN** the task's branch and working-copy folder are named from the task ID and contain no part of the project name
