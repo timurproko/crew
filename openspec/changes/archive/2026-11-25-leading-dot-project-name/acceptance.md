@@ -6,7 +6,7 @@ The maintainer integration decision accepts these scenarios:
 - Crew accepts project names such as `.xrbuild`, `.a` and `.bad` that start with one dot followed by a lowercase letter or digit.
 - Crew still refuses `.`, `..a`, `.-a`, `.A` and names over 40 characters counting the dot, with a specific reason.
 - A project `.xrbuild` registers, lists, spawns and removes next to a project `xrbuild` under its exact name.
-- Branch and working-copy names of a leading-dot project's tasks come from the task id, never the project name.
+- A leading-dot project's task branch, and its plain working copy, are named from the task id, never the project name.
 
 ```openspec-delivery
 {
@@ -22,10 +22,10 @@ The maintainer integration decision accepts these scenarios:
     "Crew accepts project names such as `.xrbuild`, `.a` and `.bad` that start with one dot followed by a lowercase letter or digit.",
     "Crew still refuses `.`, `..a`, `.-a`, `.A` and names over 40 characters counting the dot, with a specific reason.",
     "A project `.xrbuild` registers, lists, spawns and removes next to a project `xrbuild` under its exact name.",
-    "Branch and working-copy names of a leading-dot project's tasks come from the task id, never the project name."
+    "A leading-dot project's task branch, and its plain working copy, are named from the task id, never the project name."
   ],
-  "archiveDigest": "a0fa7efe221d24c7dee01ab7e9ab57ef48b7f2ef755e531938e43ba3e4137e39",
-  "specDigest": "b36e37dda65f11df5a351aa48131b010dc0fcb51a4352519f412029fcd5dc431",
+  "archiveDigest": "a91a3a1d6c27737ee038dd6e0d0c0957cbb7cdf8a5f68f13e00789debe23c961",
+  "specDigest": "2b8e439ab4874e57aeb999ec81c4b60a02fe9d8fd86471ce800eea02bd88a0da",
   "tasksDigest": "f3854d91f2e4a011ed2179bb2ddb8784aacc634d40082242c95f6de8552f152f",
   "evidenceDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "knownGaps": []
