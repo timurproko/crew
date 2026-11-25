@@ -282,6 +282,33 @@ gapTests['coordinator-dispatch'] = isolatedCore(() => {
     assert.equal(r.code, 2, JSON.stringify(value) + r.out); assert.ok(r.out.includes('crew-dispatch.json'), r.out); assert.ok(r.out.includes(field), r.out);
   }
 });
+gapTests['coordinator-harness'] = isolatedCore(() => {
+  const f = identityFixture('harness'), malformed = 'bad@example.test', other = 'other@example.test';
+  const dispatch = path.join(f.home, 'config', 'crew-dispatch.json');
+  fs.mkdirSync(path.dirname(dispatch), { recursive: true });
+  f.status(malformed); assert.equal(f.call(['start']).code, 0);
+  const profiles = [
+    { harness: 'constructor' }, { harness: '__proto__' }, { harness: 'toString' }, { harness: ['a1'] },
+    { agent: 'constructor' }, { agent: ['a1'] }, 'constructor', { harness: null },
+  ];
+  for (const selected of [true, false]) {
+    f.status(selected ? malformed : other);
+    for (const profile of profiles) {
+      fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: {
+        [malformed]: { default: [profile] }, [other]: { default: ['pi'] },
+      } }));
+      const r = f.call(['agents', '--json']);
+      assert.equal(r.code, 2, `${selected ? 'Selected' : 'Unselected'} malformed harness: ${JSON.stringify(profile)}\n${r.out}`);
+      assert.ok(r.out.includes('crew-dispatch.json'), r.out);
+      assert.ok(r.out.includes(`coordinators.${malformed}.default[0]`), r.out);
+      assert.match(r.out, /Unknown agent|harness must be a string/);
+    }
+  }
+  for (const harness of ['constructor', '__proto__', 'toString', ['a1'], {}, 1, true]) {
+    assert.throws(() => cleanProfile({ harness }), /Unknown agent|harness must be a string/);
+  }
+  for (const harness of Object.keys(AGENTS)) assert.equal(cleanProfile({ harness }).harness, harness);
+});
 gapTests['repair-scope'] = () => {
   for (const file of ['crew.mjs', 'crew.test.mjs', 'README.md', 'bin/crew', 'bin/crew.cmd', 'docs/guide.md']) assert.ok(repairFile(file), file);
   for (const file of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', 'package.json', 'scripts/build.mjs', 'LICENSE', '.gitignore', '.gitattributes', 'openspec/specs/tool-maintenance/spec.md', 'crew/crew.mjs', 'other.mjs', 'bin-other/file']) assert.ok(!repairFile(file), file);

@@ -827,7 +827,8 @@ export function cleanProfile(raw, where = '') {
   const at = where ? `${where}: ` : '', p = typeof raw === 'string' ? { harness: raw } : raw;
   if (!p || typeof p !== 'object' || Array.isArray(p)) refuse(`${at}not a profile ({ "harness": "a1", "model": ..., "effort": ..., "account": ... }).`);
   const harness = p.harness ?? p.agent;
-  if (!AGENTS[harness]) refuse(`${at}Unknown agent: ${harness}. Known: ${Object.keys(AGENTS).join(', ')}`);
+  if (typeof harness !== 'string') refuse(`${at}Agent harness must be a string. Known: ${Object.keys(AGENTS).join(', ')}`);
+  if (!Object.hasOwn(AGENTS, harness)) refuse(`${at}Unknown agent: ${harness}. Known: ${Object.keys(AGENTS).join(', ')}`);
   const out = { harness };
   for (const key of ['model', 'effort', 'account']) {
     if (p[key] === undefined || p[key] === null || p[key] === '') continue;
