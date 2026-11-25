@@ -2,31 +2,26 @@
 
 ## ADDED Requirements
 
-### Requirement: Claude worker permission mode is configurable
+### Requirement: Claude workers run in auto permission mode
 
-Crew SHALL start Claude workers with `--permission-mode acceptEdits` unless the dispatch config names another mode. A home-level or coordinator-section `permission_mode` SHALL set the mode for Claude candidates, and a Claude profile's `permissionMode` SHALL override it for that profile. Accepted values SHALL be `acceptEdits`, `auto`, `plan`, `default` and `manual`; any other value, including `bypassPermissions`, SHALL be refused with the field path. A1 and Pi profiles SHALL ignore the field. The resolved mode SHALL be saved with the task's candidates and used for every role and for hand-over and relaunch. `crew agents` SHALL show the mode when it is not `acceptEdits`.
+Crew SHALL start every Claude worker, for scout, ship, review and fix and on hand-over and relaunch, with `--permission-mode auto` and the same `--allowedTools` list as before. When the installed Claude Code or the account cannot start in auto mode, crew SHALL start the worker in `acceptEdits` instead and SHALL say so in the worker's start line. Crew SHALL never fall back to `bypassPermissions` or `dontAsk`. A1 and Pi launches SHALL be unchanged.
 
-#### Scenario: No mode configured
+#### Scenario: Claude worker starts
 
-- **WHEN** the dispatch config names no permission mode
-- **THEN** Claude workers start with `--permission-mode acceptEdits` and the same `--allowedTools` list as before
+- **WHEN** crew starts a Claude worker for any role
+- **THEN** its command carries `--permission-mode auto` followed by the unchanged `--allowedTools` list
 
-#### Scenario: Home sets auto mode
+#### Scenario: Hand-over to another Claude candidate
 
-- **WHEN** `permission_mode` is `auto` at the top of the dispatch config
-- **THEN** every Claude worker for scout, ship, review and fix starts with `--permission-mode auto`, and `crew agents` shows the mode
+- **WHEN** a Claude worker stops on a limit and the task is handed to the next Claude candidate, or is relaunched
+- **THEN** the new worker also starts in auto mode
 
-#### Scenario: Profile overrides the home mode
+#### Scenario: Installed Claude Code has no auto mode
 
-- **WHEN** the home mode is `auto` and one Claude profile sets `permissionMode` to `acceptEdits`
-- **THEN** that profile's worker starts with `acceptEdits` and the others with `auto`
+- **WHEN** Claude Code refuses `--permission-mode auto`
+- **THEN** the worker starts in `acceptEdits` and the start line names the fallback and its reason
 
-#### Scenario: Unsafe or unknown value
+#### Scenario: Account refuses auto mode at start
 
-- **WHEN** a permission mode is `bypassPermissions` or a value Claude Code does not name
-- **THEN** crew refuses the config and names the field and the accepted values
-
-#### Scenario: Hand-over keeps each candidate's mode
-
-- **WHEN** a Claude worker stops on a limit and the task is handed to the next saved Claude candidate
-- **THEN** the new worker starts with the mode saved for that candidate
+- **WHEN** the worker's Claude Code exits with an error right after starting in auto mode
+- **THEN** it is started once more in `acceptEdits` with a notice, rather than left dead

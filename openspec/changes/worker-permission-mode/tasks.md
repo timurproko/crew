@@ -1,19 +1,16 @@
 # Tasks
 
-## 1. Crew-dispatch config accepts a home permission_mode and a per-profile permissionMode for Claude rows
+## 1. Every Claude worker starts in auto permission mode with the same allowed tools
 
-- [ ] 1.1 Validate top-level and coordinator-section `permission_mode` and profile `permissionMode` against acceptEdits, auto, plan, default, manual; refuse unknown values, bypassPermissions and dontAsk with the field path and the accepted list.
-- [ ] 1.2 Ignore `permissionMode` on a1 and pi rows after validating it.
-- [ ] 1.3 Tests: invalid value, bypassPermissions refused, a1/pi row ignores the field.
+- [ ] 1.1 Change `AGENTS.claude.args` to `--permission-mode auto`, keeping the `--allowedTools` list; A1 and Pi arguments unchanged.
+- [ ] 1.2 Update the launch-line tests in `crew.test.mjs` (plain, account launcher, spawn) and add a hand-over/relaunch test asserting the next Claude worker also starts in auto mode.
 
-## 2. Every Claude worker launch uses the resolved mode, including hand-over and relaunch
+## 2. A Claude worker that cannot use auto mode falls back to acceptEdits and says so in its start line
 
-- [ ] 2.1 Resolve the mode per Claude candidate in the work chain (profile over section over home over acceptEdits) and save it in the task's launch and chain.
-- [ ] 2.2 Pass the candidate's mode to `--permission-mode` in `agentCommand` for scout, ship, review and fix, keeping `--allowedTools` unchanged.
-- [ ] 2.3 Tests: default launch line unchanged, home setting, per-profile override, hand-over to the next candidate keeps its own mode.
+- [ ] 2.1 Probe `--permission-mode auto` with `--version` before a Claude launch; on failure launch with acceptEdits and add the reason to crew's start line.
+- [ ] 2.2 Wrap the worker command so an early non-zero exit in auto mode prints a notice and restarts once in acceptEdits.
+- [ ] 2.3 Tests with a fake `claude`: version without auto falls back with the start-line note; early refusal restarts in acceptEdits; a normal run is not restarted.
 
-## 3. crew agents, README and the coordinator AGENTS template show the permission mode
+## 3. README and the coordinator AGENTS template say Claude workers run in auto mode
 
-- [ ] 3.1 Show a non-default mode in `crew agents` human output (via the candidate label) and as `permissionMode` in its JSON.
-- [ ] 3.2 Add a line or two under "Who does the work" in README and in the coordinator AGENTS template.
-- [ ] 3.3 Test: `crew agents` shows `mode auto` only when the mode is not acceptEdits.
+- [ ] 3.1 Add a line under "Who does the work" in README and in the coordinator AGENTS template, including the acceptEdits fallback.

@@ -4,21 +4,23 @@
 
 Checked on this machine with Claude Code 2.1.332:
 
-- `claude --help` lists `--permission-mode` choices `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. Auto mode is named `auto`.
-- `claude --permission-mode default --allowedTools Bash,Read --version` parses (a hidden alias of `manual`); `bogus` is refused by the parser with the list of choices.
-- `claude --permission-mode auto --allowedTools Bash,Read --version` parses, so `auto` combines with `--allowedTools`; the allowed tools stay pre-approved and auto mode decides the rest.
+- `claude --help` lists `--permission-mode` choices `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. Auto mode is named `auto`; `claude auto-mode` inspects its rules.
+- `claude --permission-mode auto --allowedTools Bash,Read --version` parses, so `auto` combines with `--allowedTools`: the listed tools stay pre-approved and auto mode decides the rest.
+- An unknown mode is refused by the parser before anything starts (`error: option '--permission-mode <mode>' argument 'bogus' is invalid. Allowed choices are ...`), with a non-zero exit. An older Claude Code without `auto` fails the same way.
 
-## Accepted values
+## Default
 
-`acceptEdits`, `auto`, `plan`, `default`, `manual`. `bypassPermissions` is refused from config on purpose (it skips every check). `dontAsk` is also refused: it denies anything not pre-allowed, which would turn every MCP prompt into a silent failure rather than the stop the person is trying to avoid; it can be added later if asked for.
+`AGENTS.claude.args` becomes `--permission-mode auto --allowedTools Bash,PowerShell,Read,Edit,Write,Glob,Grep`. Every role and every relaunch path builds its command through `agentCommand`, so one change covers scout, ship, review, fix, hand-over and relaunch. No config field and no `crew agents` change.
 
-## Where it is set
+## Fallback to acceptEdits
 
-- Top level of `config/crew-dispatch.json`: `"permission_mode": "auto"` (snake case, like `shared_quota`). A coordinator section may also set its own `permission_mode`, which replaces the top-level one for that section, consistent with how a section owns `shared_quota`.
-- On a Claude profile row: `"permissionMode": "auto"`. It overrides the home or section setting for that row only. On an `a1` or `pi` row it is ignored (accepted and dropped, so one list can be shared); an invalid value is still refused so a typo is not silent.
+Two cases, handled in two places:
 
-## How it flows
+1. **The installed version does not know `auto`.** Before a Claude launch, crew runs `claude --permission-mode auto --allowedTools <list> --version` once per process (short timeout). If it fails, the worker starts with `acceptEdits`, and crew's start line ends with `(auto mode not available: <first line of the error>; started in acceptEdits)`.
+2. **The account or session refuses auto mode at start.** This cannot be probed without starting a session, so the worker's terminal command is wrapped: if the auto-mode `claude` exits non-zero within a few seconds of starting, the wrapper prints `crew: Claude Code did not start in auto mode; starting again in acceptEdits` and runs the same command with `acceptEdits`. A worker that ran normally and then ended is not restarted. Crew's existing "agent ended without a report" recovery stays the last resort.
 
-`workChain` resolves each Claude candidate's mode once (`profile.permissionMode ?? section/home permission_mode ?? acceptEdits`) and stores it on the candidate only when it differs from `acceptEdits`, so existing task records and candidate keys stay unchanged. The task's saved `launch` and `chain` carry it, so hand-over on quota or login loss, crashed-worker recovery and `crew relaunch` reuse the mode chosen at dispatch. Command-line picks (`--agent claude --account …`) get the home/section mode.
+The fallback never uses `bypassPermissions` or `dontAsk`.
 
-`agentCommand` replaces the value after `--permission-mode` in the Claude arguments with the candidate's mode; `AGENTS.claude.args` keeps `acceptEdits` as the default. `pickLabel` appends `mode auto` (etc.) for a non-default mode, which `crew agents`, hand-over messages and status use; JSON candidates gain a `permissionMode` field.
+## Known gap
+
+How Claude Code behaves on an account where auto mode is switched off (refuses to start, or starts in another mode with a notice) could not be observed on this machine, whose account has auto mode. The wrapper covers the refuse-to-start case; if Claude Code instead downgrades by itself, the worker keeps running in whatever mode Claude Code chose.
