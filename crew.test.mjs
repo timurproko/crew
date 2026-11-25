@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -89,7 +89,18 @@ else if (a[0] === 'send') {
 }
 else save();
 `);
-const readWorld = () => JSON.parse(fs.readFileSync(world, 'utf8'));
+const readWorld = () => {
+  // The fake child publishes via truncate/write. A barrier reader can land between those
+  // operations; wait for a complete fixture snapshot, but still fail persistent corruption.
+  const deadline = Date.now() + 1000;
+  for (;;) {
+    try { return JSON.parse(fs.readFileSync(world, 'utf8')); }
+    catch (error) {
+      if (!(error instanceof SyntaxError) || Date.now() >= deadline) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+  }
+};
 const setTerminal = (address, patch) => { const w = readWorld(); Object.assign(w.terminals[address], patch); fs.writeFileSync(world, JSON.stringify(w)); };
 
 const homeDir = path.join(root, 'home'), project = path.join(root, 'project'), fakeUser = path.join(root, 'user');
@@ -97,7 +108,7 @@ fs.mkdirSync(fakeUser);
 const claudeConfig = path.join(root, 'claude.json');
 fs.writeFileSync(claudeConfig, JSON.stringify({ theme: 'dark', projects: { 'C:/mine': { hasTrustDialogAccepted: true, history: [1] } } }));
 function crew(args, { terminal, cwd = homeDir, env: extra = {}, script = path.join(here, 'crew.mjs') } = {}) {
-  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '',
+  const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '', CLAUDE_CONFIG_DIR: '', CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '',
     // No tool of the machine the suite runs on is seen, unless a test names a fake one.
     CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...extra };
   delete env.CREW_HOME;
@@ -122,6 +133,256 @@ console.log = () => { throw new TypeError('injected project list failure'); }; m
 
 // Run a focused regression with --gaps=ignored (or all new regressions with --gaps).
 const gapTests = {};
+// New dispatch fixtures own their fake Core history as well as their home. In particular,
+// their polling logs must not enlarge the shared world used by later concurrency tests.
+const isolatedCore = test => () => {
+  const before = fs.readFileSync(world, 'utf8'), trustBefore = fs.readFileSync(claudeConfig, 'utf8');
+  try {
+    test();
+    assert.equal(fs.readFileSync(claudeConfig, 'utf8'), trustBefore, 'Dispatch fixture must not alter another fixture\'s Claude trust');
+  } finally { fs.writeFileSync(world, before); }
+};
+function identityFixture(name) {
+  const dir = path.join(root, `identity-${name}`), home = path.join(dir, 'home'), session = path.join(dir, 'session'), inspector = path.join(dir, 'inspector'), owner = `identity-${name}`;
+  fs.mkdirSync(session, { recursive: true }); fs.mkdirSync(inspector);
+  const write = (file, value, folder = session) => fs.writeFileSync(path.join(folder, file), JSON.stringify(value));
+  const status = (email, patch = {}, folder = session) => write('account-switcher-status.json', { email: 'stale@example.test', isolated: true, state: 'ok', apiEmail: email, at: Date.now(), expiresAt: Date.now() + 3600000, ...patch }, folder);
+  const labels = (email, patch = {}) => ({ 'custom.claude.email': email, 'custom.claude.state': 'ok', 'custom.claude.at': String(Date.now()), 'custom.claude.session': 'fake-process-instance', ...patch });
+  const w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', status: { app: 'claude-code', state: 'working' }, labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+  const env = { CLAUDE_CONFIG_DIR: session, CREW_CLAUDE_ACCOUNT: 'launch@example.test', CREW_WORKTREES: path.join(dir, 'copies') };
+  const call = (args, extra = {}, terminal = owner) => crew(args, { cwd: home, terminal, env: { ...env, ...extra } });
+  let r = call(['init', home]); assert.equal(r.code, 0, r.out);
+  const ownerFile = path.join(home, 'owner.json');
+  return { dir, home, session, inspector, owner, ownerFile, env, call, write, status, labels, record: () => JSON.parse(fs.readFileSync(ownerFile, 'utf8')) };
+}
+gapTests['coordinator-identity'] = isolatedCore(() => {
+  const f = identityFixture('authority');
+  f.status('ONE@EXAMPLE.TEST');
+  f.write('account-switcher-session.json', { email: 'one@example.test', at: Date.now() - 1000 });
+  // These are deliberately unusable. Detection must not parse or change credentials/config.
+  fs.writeFileSync(path.join(f.session, '.credentials.json'), 'not credentials');
+  fs.writeFileSync(path.join(f.session, '.claude.json'), '{"oauthAccount":{"emailAddress":"stale@example.test"}}');
+  let r = f.call(['start']); assert.equal(r.code, 0, r.out);
+  let saved = f.record(); assert.equal(saved.terminal, f.owner); assert.ok(saved.since);
+  assert.equal(saved.coordinator.account, 'one@example.test'); assert.equal(saved.coordinator.source, 'session-status');
+  assert.equal(saved.coordinator.configDir, f.session);
+  f.status('two@example.test', { state: 'mismatch' });
+  r = f.call(['agents', '--json']); assert.equal(r.code, 0, r.out); JSON.parse(r.out);
+  assert.equal(f.record().coordinator.account, 'two@example.test', 'A new selection rereads session metadata');
+  assert.equal(f.record().since, saved.since);
+  assert.equal(fs.readFileSync(path.join(f.session, '.credentials.json'), 'utf8'), 'not credentials');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.session, '.claude.json'), 'utf8')).oauthAccount.emailAddress, 'stale@example.test');
+  f.status('inspector@example.test', {}, f.inspector);
+  const before = fs.readFileSync(f.ownerFile, 'utf8');
+  r = f.call(['agents', '--json'], { CLAUDE_CONFIG_DIR: f.inspector }, 'other'); assert.equal(r.code, 0, r.out);
+  assert.equal(fs.readFileSync(f.ownerFile, 'utf8'), before, 'Inspection cannot rewrite the owner');
+  const time = Date.now(), owner = f.record(), core = { state: 'live', t: { status: { app: 'claude-code' }, labels: {} } };
+  const detect = (patch = {}, env = {}) => coordinatorIdentity(owner, { time, env, core: patch });
+  assert.equal(coordinatorIdentity(owner, { time, env: { CREW_TERMINAL: 'other', CLAUDE_CONFIG_DIR: f.inspector }, core }).account, 'two@example.test');
+  assert.equal(coordinatorIdentity(null, { time, env: f.env, core }).status, 'unknown');
+  for (const app of ['a1', 'pi', 'codex']) assert.equal(detect({ ...core, t: { status: { app }, labels: f.labels('one@example.test') } }).status, 'non-claude');
+  for (const state of ['absent', 'finished']) assert.equal(detect({ state }).status, 'unknown');
+  for (const patch of [{ at: time - 60001 }, { at: time + 5001 }, { state: 'unknown' }, { state: 'unavailable' }, { isolated: false }, { apiEmail: 'not an email' }, { expiresAt: time - 1 }]) {
+    f.status('one@example.test', { at: time, ...patch });
+    assert.equal(coordinatorIdentity(owner, { time, env: {}, core }).status, 'unknown', JSON.stringify(patch));
+  }
+  fs.writeFileSync(path.join(f.session, 'account-switcher-status.json'), '{broken');
+  assert.equal(coordinatorIdentity(owner, { time, env: {}, core }).status, 'unknown');
+  f.status('one@example.test', { at: time });
+  const withLabels = labels => ({ ...core, t: { ...core.t, labels } });
+  assert.equal(detect(withLabels(f.labels('other@example.test', { 'custom.claude.at': String(time) }))).status, 'unknown', 'Conflicting fresh verification is not guessed through');
+  assert.equal(detect(withLabels(f.labels('one@example.test', { 'custom.claude.state': 'switching', 'custom.claude.at': String(time) }))).status, 'unknown');
+  f.write('account-switcher-session.json', { email: 'two@example.test', at: time + 1 });
+  assert.equal(coordinatorIdentity(owner, { time, env: {}, core }).status, 'unknown', 'New intent invalidates old confirmation');
+  f.write('account-switcher-session.json', { email: 'two@example.test', at: time - 1 });
+  const oldOwner = { terminal: f.owner, since: saved.since };
+  const verified = coordinatorIdentity(oldOwner, { time, env: {}, core: withLabels(f.labels('API@EXAMPLE.TEST', { 'custom.claude.at': String(time), 'custom.claude.state': 'mismatch' })) });
+  assert.equal(verified.account, 'api@example.test'); assert.equal(verified.source, 'owner-terminal');
+  assert.equal(coordinatorIdentity(oldOwner, { time, env: { CREW_CLAUDE_ACCOUNT: 'hint@example.test' }, core }).status, 'unknown', 'Hints alone are not identity');
+  const log = readWorld().log;
+  assert.ok(!log.some(a => ['send', 'kill'].includes(a[0]) && a.includes(f.owner)), 'No coordinator input or process mutation');
+});
+gapTests['coordinator-dispatch'] = isolatedCore(() => {
+  const f = identityFixture('dispatch'), dispatch = path.join(f.home, 'config', 'crew-dispatch.json');
+  fs.mkdirSync(path.dirname(dispatch), { recursive: true });
+  const example = JSON.parse(/### Coordinator-specific worker lists[\s\S]*?```json\r?\n([\s\S]*?)```/.exec(fs.readFileSync(path.join(here, 'README.md'), 'utf8'))[1]);
+  const business = 'tymur.prokopiev@ameria.com', personal = 'masha.shmakova@gmail.com';
+  assert.deepEqual(Object.keys(example.coordinators), [business, personal]);
+  assert.deepEqual(example.coordinators[business].default, [{ harness: 'claude', model: 'claude-opus-5-5', account: 'aicoder-de13@ameria.com' }]);
+  assert.deepEqual(example.coordinators[personal].default, [{ harness: 'a1', model: 'openai-codex/gpt-6.1-sol' }]);
+  const config = value => fs.writeFileSync(dispatch, JSON.stringify(value));
+  const show = (args = [], extra = {}, terminal) => { const r = f.call(['agents', '--json', ...args], extra, terminal); assert.equal(r.code, 0, r.out); return JSON.parse(r.out); };
+  const profiles = shown => shown.candidates.map(({ harness, model, effort, account }) => Object.fromEntries(Object.entries({ harness, model, effort, account }).filter(([, v]) => v !== undefined)));
+  const env = { CREW_CLAUDE_ACCOUNTS: 'one@example.test,two@example.test', CREW_CLAUDE_ACCOUNT: 'two@example.test' };
+  config(example); f.status(business.toUpperCase()); assert.equal(f.call(['start']).code, 0);
+  for (const [email, expected] of [[business, example.coordinators[business].default], [personal, example.coordinators[personal].default]]) {
+    f.status(email);
+    for (const role of ['scout', 'ship', 'review', 'fix']) {
+      const shown = show(['--role', role], env); assert.deepEqual(profiles(shown), expected);
+      assert.equal(shown.coordinator.account, email); assert.equal(shown.coordinator.section, `coordinators.${email}`); assert.equal(shown.source, `coordinators.${email}.default`);
+      assert.equal(shown.candidates.length, 1, 'The README singleton has nobody behind it');
+    }
+  }
+  f.status(business);
+  const scoped = { default: [{ harness: 'a1', model: 'base/model' }], roles: { review: [{ harness: 'pi' }] },
+    projects: { demo: { default: [{ harness: 'claude', account: 'project@example.test' }], roles: { ship: [{ harness: 'pi', model: 'project/ship' }] } }, 'crew:self': [{ harness: 'a1', model: 'self/fix' }] },
+    rules: [{ when: 'Selected rule', why: 'local', use: [{ harness: 'a1', model: 'rule/local' }] }], shared_quota: true };
+  const rootConfig = { default: [{ harness: 'claude' }], roles: { fix: [{ harness: 'pi', model: 'wrong/fix' }], review: [{ harness: 'a1', model: 'wrong/review' }] },
+    projects: { absent: [{ harness: 'pi', model: 'wrong/project' }] }, rules: [{ when: 'Global rule', use: { harness: 'pi' } }], coordinators: { [business.toUpperCase()]: scoped } };
+  config(rootConfig);
+  assert.deepEqual(profiles(show(['--project', 'demo', '--role', 'ship'])), [{ harness: 'pi', model: 'project/ship' }]);
+  assert.deepEqual(profiles(show(['--project', 'demo', '--role', 'review'])), [{ harness: 'claude', account: 'project@example.test' }], 'Project default precedes section role');
+  assert.deepEqual(profiles(show(['--project', 'absent', '--role', 'fix'])), scoped.default, 'Global project and fix role cannot leak');
+  assert.deepEqual(profiles(show(['--project', 'crew:self', '--role', 'fix'])), [{ harness: 'a1', model: 'self/fix' }]);
+  assert.equal(show().sharedQuota, true); assert.equal(show(['--rule', '1']).rules[0].when, 'Selected rule');
+  assert.deepEqual(profiles(show(['--rule', '1'])), [{ harness: 'a1', model: 'rule/local' }]);
+  let r = f.call(['agents', '--rule', '2']); assert.equal(r.code, 2); assert.match(r.out, /No rule 2/);
+  assert.deepEqual(profiles(show(['--model', 'override/model'])), [{ harness: 'a1', model: 'override/model' }, ...scoped.default]);
+  assert.deepEqual(profiles(show(['--effort', 'high'])), [{ harness: 'a1', model: 'base/model', effort: 'high' }], 'Deduplication keeps the adjusted choice');
+  assert.deepEqual(profiles(show(['--agent', 'pi', '--model', 'override/model'])), [{ harness: 'pi', model: 'override/model' }, ...scoped.default]);
+  assert.deepEqual(profiles(show(['--agent', 'claude'], env)), [{ harness: 'claude', account: 'two@example.test' }, { harness: 'claude', account: 'one@example.test' }, ...scoped.default], 'Explicit overrides retain old expansion');
+  assert.deepEqual(profiles(show(['--agent', 'claude', '--account', 'named@example.test', '--no-fallback'], env)), [{ harness: 'claude', account: 'named@example.test' }]);
+  assert.deepEqual(profiles(show(['--model', 'override/model', '--no-fallback'])), [{ harness: 'a1', model: 'override/model' }]);
+  config({ ...rootConfig, coordinators: { [business]: { default: [{ harness: 'claude', model: 'opus' }] } } });
+  assert.deepEqual(profiles(show([], env)), [{ harness: 'claude', model: 'opus' }], 'Account-less scoped profiles never expand');
+  assert.deepEqual(profiles(show(['--account', 'named@example.test'], env)), [{ harness: 'claude', model: 'opus', account: 'named@example.test' }, { harness: 'claude', model: 'opus' }]);
+  r = f.call(['agents'], env); assert.equal((r.out.match(/^coordinator /gm) ?? []).length, 1); assert.ok(r.out.includes(business)); assert.ok(r.out.includes(`coordinators.${business}.default`));
+  config(example); f.status('aicoder-de13@ameria.com');
+  let shown = show([], env); assert.equal(shown.coordinator.section, 'global'); assert.match(shown.coordinator.reason, /no coordinator section/);
+  assert.deepEqual(profiles(shown).slice(0, 2), example.default.slice(0, 2)); assert.equal(shown.candidates.length, 4, 'Unlisted account keeps legacy Claude expansion');
+  r = f.call(['agents'], env); assert.match(r.out, /coordinator aicoder-de13@ameria.com .*using global dispatch/); assert.equal((r.out.match(/^coordinator /gm) ?? []).length, 1);
+  f.status(business); f.status(personal, {}, f.inspector);
+  const ownerBefore = fs.readFileSync(f.ownerFile, 'utf8');
+  assert.equal(show([], { CLAUDE_CONFIG_DIR: f.inspector }, 'inspector').coordinator.account, business);
+  assert.equal(fs.readFileSync(f.ownerFile, 'utf8'), ownerBefore);
+  for (const app of ['a1', 'pi', 'codex']) {
+    setTerminal(f.owner, { status: { app } }); shown = show([], env); assert.equal(shown.coordinator.section, 'global'); assert.equal(shown.coordinator.status, 'non-claude');
+    r = f.call(['agents'], env); assert.match(r.out, /not a Claude coordinator.*using global dispatch/);
+  }
+  setTerminal(f.owner, { status: null, labels: {} });
+  fs.rmSync(path.join(f.session, 'account-switcher-status.json'));
+  shown = show([], env); assert.equal(shown.coordinator.account, null); assert.equal(shown.coordinator.section, 'global');
+  assert.match(f.call(['agents'], env).out, /coordinator account unknown .*using global dispatch/);
+  fs.rmSync(f.ownerFile); assert.equal(show().coordinator.reason, 'no home owner');
+  config({ default: [{ harness: 'claude' }] });
+  assert.deepEqual(profiles(show([], env)), [{ harness: 'claude', account: 'two@example.test' }, { harness: 'claude', account: 'one@example.test' }], 'No-map compatibility');
+  for (const [value, field] of [
+    [null, 'coordinators'], [[], 'coordinators'], ['bad', 'coordinators'], [{ bad: { default: ['a1'] } }, 'coordinators.bad'],
+    [{ [business]: { default: ['a1'] }, [business.toUpperCase()]: { default: ['pi'] } }, business.toUpperCase()],
+    ...[null, [], 'bad', {}, { default: [] }, { default: null }, { default: [{ harness: 'no-such-agent' }] }, { default: ['a1'], nested: {} },
+      { default: ['a1'], coordinators: {} }, { default: ['a1'], roles: null }, { default: ['a1'], roles: { unknown: ['a1'] } },
+      { default: ['a1'], projects: [] }, { default: ['a1'], projects: { demo: { roles: [] } } },
+      { default: ['a1'], projects: { demo: { default: ['a1'], oops: [] } } }, { default: ['a1'], rules: {} },
+      { default: ['a1'], rules: [{ use: [] }] }, { default: ['a1'], rules: [{ use: ['pi'], oops: true }] },
+      { default: ['a1'], rules: [{ use: ['pi'], when: 5 }] }, { default: ['a1'], shared_quota: 'yes' },
+      { default: [{ harness: 'a1', account: 'bad@example.test' }] }, { default: [{ harness: 'a1', provider: [] }] },
+      { default: [{ harness: 'a1', floor: 101 }] }].map(section => [{ [business]: section }, `coordinators.${business}`])
+  ]) {
+    config({ default: ['a1'], coordinators: value }); r = f.call(['agents', '--json']);
+    assert.equal(r.code, 2, JSON.stringify(value) + r.out); assert.ok(r.out.includes('crew-dispatch.json'), r.out); assert.ok(r.out.includes(field), r.out);
+  }
+});
+gapTests['coordinator-harness'] = isolatedCore(() => {
+  const f = identityFixture('harness'), malformed = 'bad@example.test', other = 'other@example.test';
+  const dispatch = path.join(f.home, 'config', 'crew-dispatch.json');
+  fs.mkdirSync(path.dirname(dispatch), { recursive: true });
+  f.status(malformed); assert.equal(f.call(['start']).code, 0);
+  const profiles = [
+    { harness: 'constructor' }, { harness: '__proto__' }, { harness: 'toString' }, { harness: ['a1'] },
+    { agent: 'constructor' }, { agent: ['a1'] }, 'constructor', { harness: null },
+  ];
+  for (const selected of [true, false]) {
+    f.status(selected ? malformed : other);
+    for (const profile of profiles) {
+      fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: {
+        [malformed]: { default: [profile] }, [other]: { default: ['pi'] },
+      } }));
+      const r = f.call(['agents', '--json']);
+      assert.equal(r.code, 2, `${selected ? 'Selected' : 'Unselected'} malformed harness: ${JSON.stringify(profile)}\n${r.out}`);
+      assert.ok(r.out.includes('crew-dispatch.json'), r.out);
+      assert.ok(r.out.includes(`coordinators.${malformed}.default[0]`), r.out);
+      assert.match(r.out, /Unknown agent|harness must be a string/);
+    }
+  }
+  for (const harness of ['constructor', '__proto__', 'toString', ['a1'], {}, 1, true]) {
+    assert.throws(() => cleanProfile({ harness }), /Unknown agent|harness must be a string/);
+  }
+  for (const harness of Object.keys(AGENTS)) assert.equal(cleanProfile({ harness }).harness, harness);
+});
+gapTests['coordinator-probe-failures'] = isolatedCore(() => {
+  const f = identityFixture('probe-failures'), email = 'probe@example.test', dispatch = path.join(f.home, 'config', 'crew-dispatch.json');
+  fs.mkdirSync(path.dirname(dispatch), { recursive: true }); f.status(email); assert.equal(f.call(['start']).code, 0);
+  const broken = path.join(f.dir, 'broken-hc.mjs'), slow = path.join(f.dir, 'slow-hc.mjs');
+  fs.writeFileSync(broken, "process.stdout.write('{not JSON');\n");
+  fs.writeFileSync(slow, "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000); console.log('{\"state\":\"live\"}');\n");
+  for (const scoped of [false, true]) {
+    fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], shared_quota: true,
+      ...(scoped ? { coordinators: { [email]: { default: ['pi'] } } } : {}) }));
+    for (const hc of [path.join(f.dir, 'missing-hc'), broken, slow]) {
+      const r = f.call(['agents', '--json'], { CREW_HC: hc }); assert.equal(r.code, 0, r.out);
+      const shown = JSON.parse(r.out); assert.equal(shown.coordinator.status, 'unknown'); assert.equal(shown.coordinator.account, null);
+      assert.equal(shown.coordinator.section, 'global'); assert.ok(shown.coordinator.reason); assert.deepEqual(shown.candidates.map(c => c.harness), ['a1']);
+    }
+    const text = f.call(['agents'], { CREW_HC: path.join(f.dir, 'missing-hc') }); assert.equal(text.code, 0, text.out);
+    assert.match(text.out, /coordinator account unknown .*using global dispatch/); assert.equal((text.out.match(/^coordinator /gm) ?? []).length, 1);
+  }
+  const owner = f.record(), core = { state: 'live', t: { status: { app: 'claude-code' }, labels: {} } };
+  for (const options of [
+    { env: { CREW_TERMINAL: f.owner, CLAUDE_CONFIG_DIR: { toString: 0 } }, core },
+    { env: {}, core: { state: 'live', t: { status: { app: { toString: 0 } } } } },
+    { get core() { throw new Error('injected identity failure'); } },
+    { env: { CREW_TERMINAL: f.owner }, core, home: { get owner() { throw new Error('injected identity cache failure'); } } },
+  ]) {
+    const identity = coordinatorIdentity(owner, options); assert.equal(identity.status, 'unknown'); assert.equal(identity.account, null);
+    assert.match(identity.reason, /unavailable/);
+  }
+  // No private switcher record is also uncertainty, not the saved account/hint.
+  fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: { [email]: { default: ['pi'] } } }));
+  const missingSwitcher = f.call(['agents', '--json'], { CLAUDE_CONFIG_DIR: path.join(f.dir, 'missing-switcher') });
+  assert.equal(missingSwitcher.code, 0, missingSwitcher.out); assert.equal(JSON.parse(missingSwitcher.out).coordinator.status, 'unknown');
+});
+gapTests['coordinator-profile-types'] = isolatedCore(() => {
+  const f = identityFixture('profile-types'), email = 'typed@example.test', other = 'other@example.test', dispatch = path.join(f.home, 'config', 'crew-dispatch.json');
+  fs.mkdirSync(path.dirname(dispatch), { recursive: true }); f.status(email); assert.equal(f.call(['start']).code, 0);
+  const cases = [];
+  for (const field of ['model', 'effort', 'account']) for (const value of [{ toString: 0 }, [], 5, false, null, '']) cases.push([field, value]);
+  for (const value of [{ toString: 0 }, [], '50', false, null, -1, 101]) cases.push(['floor', value]);
+  for (const field of ['provider', 'family']) for (const value of [{ toString: 0 }, [], null, '']) cases.push([field, value]);
+  cases.push(['extra', true]);
+  for (const selected of [true, false]) {
+    f.status(selected ? email : other);
+    for (const [field, value] of cases) {
+      fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: {
+        [email]: { default: [{ harness: 'claude', [field]: value }] }, [other]: { default: ['a1'] },
+      } }));
+      const r = f.call(['agents', '--json']); assert.equal(r.code, 2, `${field}: ${JSON.stringify(value)}\n${r.out}`);
+      assert.ok(r.out.includes('crew-dispatch.json'), r.out); assert.ok(r.out.includes(`coordinators.${email}.default[0].${field}`), r.out);
+    }
+    fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: { [email]: { default: [{ harness: 'a1', floor: 'overflow-floor' }] } } }).replace('"overflow-floor"', '1e400'));
+    const overflow = f.call(['agents', '--json']); assert.equal(overflow.code, 2, overflow.out); assert.ok(overflow.out.includes(`coordinators.${email}.default[0].floor`), overflow.out);
+  }
+  // Even an unexpected validator exception must become a path-qualified refusal.
+  const script = path.join(f.dir, 'throwing-profile.mjs');
+  fs.writeFileSync(script, `import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const parse = JSON.parse; JSON.parse = (...args) => {
+  const value = parse(...args), section = value?.coordinators?.[${JSON.stringify(email)}], profile = section?.default?.[0];
+  if (profile?.model === 'throw-section') Object.defineProperty(section, 'projects', { get() { throw new TypeError('injected section validator failure'); } });
+  if (profile?.model === 'throw-validation') Object.defineProperty(profile, 'model', { get() { throw new TypeError('injected profile validator failure'); } });
+  return value;
+}; main(process.argv.slice(2));`);
+  for (const model of ['throw-validation', 'throw-section']) for (const selected of [true, false]) {
+    fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: { [email]: { default: [{ harness: 'claude', model }] } } }));
+    f.status(selected ? email : other);
+    const r = crew(['agents', '--json'], { script, cwd: f.home, terminal: f.owner, env: f.env });
+    assert.equal(r.code, 2, r.out); assert.ok(r.out.includes(`coordinators.${email}${model === 'throw-validation' ? '.default[0]' : ''}`), r.out); assert.ok(r.out.includes('crew-dispatch.json'), r.out);
+  }
+  // Legitimate primitive fields still normalize normally; strictness stays scoped.
+  fs.writeFileSync(dispatch, JSON.stringify({ default: [{ harness: 'a1', model: 123, floor: '50' }], coordinators: {
+    [email]: { default: [{ harness: 'claude', model: 'opus', effort: 'high', account: 'worker@example.test', floor: 50, provider: 'claude' }] },
+  } }));
+  f.status(email); let shown = JSON.parse(f.call(['agents', '--json']).out); assert.equal(shown.candidates[0].floor, 50); assert.equal(shown.candidates[0].account, 'worker@example.test');
+  f.status(other); shown = JSON.parse(f.call(['agents', '--json']).out); assert.equal(shown.candidates[0].model, '123'); assert.equal(shown.candidates[0].floor, 50);
+});
 gapTests['repair-scope'] = () => {
   for (const file of ['crew.mjs', 'crew.test.mjs', 'README.md', 'bin/crew', 'bin/crew.cmd', 'docs/guide.md']) assert.ok(repairFile(file), file);
   for (const file of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', 'package.json', 'scripts/build.mjs', 'LICENSE', '.gitignore', '.gitattributes', 'openspec/specs/tool-maintenance/spec.md', 'crew/crew.mjs', 'other.mjs', 'bin-other/file']) assert.ok(!repairFile(file), file);
@@ -331,7 +592,7 @@ function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), termina
   const child = spawn(process.execPath, [script, ...args], { cwd: f.home, env: {
     ...process.env, HOME: path.join(f.dir, 'user'), USERPROFILE: path.join(f.dir, 'user'),
     CREW_CLAUDE_CONFIG: path.join(f.dir, 'claude.json'),
-    CREW_HOME: f.home, CREW_HC: fake, CREW_TERMINAL: terminal, HC_TERMINAL_ID: '',
+    CREW_HOME: f.home, CREW_HC: fake, CREW_TERMINAL: terminal, HC_TERMINAL_ID: '', CLAUDE_CONFIG_DIR: '', CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '',
     CREW_TOOL_PATH: path.join(root, 'no-tools'), CREW_WORKTREES: path.join(f.dir, 'copies'),
     ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...env,
   }, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -722,6 +983,67 @@ console.log(JSON.stringify({providers: families.map(provider => q[provider] === 
   assert.equal(f.call(['relaunch', task.id, '--agent', 'a1', '--model', 'openai-codex/gpt-x']).code, 0, 'A named relaunch may retry an earlier choice');
   assert.equal(f.call(['finish', task.id, '--force']).code, 0);
 };
+
+gapTests['coordinator-recovery'] = isolatedCore(() => {
+  const f = gapFixture('coordinator-recovery'), owner = 'owner-coordinator-recovery';
+  const bin = path.join(f.dir, 'agents'), launcher = path.join(f.dir, 'claude-as.sh'), quota = path.join(f.dir, 'quota.mjs'), quotaLog = path.join(f.dir, 'quota.log');
+  fs.mkdirSync(bin); for (const name of ['a1', 'pi', 'claude']) fs.writeFileSync(path.join(bin, name), '');
+  fs.writeFileSync(launcher, '#!/bin/sh\n'); fs.writeFileSync(quotaLog, '');
+  fs.writeFileSync(quota, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(quotaLog)}, 'read\\n'); console.log('{"providers":[]}');`);
+  const env = { CREW_AGENT_PATH: bin, CREW_CLAUDE_LAUNCHER: launcher, CREW_CLAUDE_ACCOUNTS: 'saved-one@example.test,saved-two@example.test', CREW_TOOL_QUOTA_AXI: quota,
+    CREW_WORKTREES: path.join(f.dir, 'copies'), CREW_CLAUDE_CONFIG: path.join(f.dir, 'claude.json'), CREW_RECOVERY_SECONDS: '0', CREW_DEAD_SECONDS: '0', DELIVERY_LABELS_ENABLED: 'false' };
+  const call = args => f.call(args, env);
+  const business = 'tymur.prokopiev@ameria.com', personal = 'masha.shmakova@gmail.com';
+  const login = email => setTerminal(owner, { status: { app: 'claude-code', state: 'working' }, labels: { 'custom.claude.email': email, 'custom.claude.state': 'ok', 'custom.claude.at': String(Date.now()), 'custom.claude.session': 'coordinator-process' } });
+  const config = { default: [{ harness: 'pi', model: 'wrong/global' }], roles: { review: [{ harness: 'pi', model: 'wrong/review' }], fix: [{ harness: 'pi', model: 'wrong/fix' }] },
+    coordinators: { [business]: { shared_quota: true, default: [{ harness: 'claude', model: 'claude-opus-5-5', account: 'aicoder-de13@ameria.com' }] },
+      [personal]: { default: [{ harness: 'a1', model: 'openai-codex/gpt-6.1-sol' }] } } };
+  const writeConfig = () => { fs.mkdirSync(path.join(f.home, 'config'), { recursive: true }); fs.writeFileSync(path.join(f.home, 'config', 'crew-dispatch.json'), JSON.stringify(config)); };
+  const spawnTask = (id, flags = []) => { const r = call(['spawn', id, '--project', 'demo', ...flags, 'Count lines.']); assert.equal(r.code, 0, r.out); assert.equal((r.out.match(/^coordinator /gm) ?? []).length, 1); return f.task(id); };
+  const launches = () => readWorld().log.filter(a => a[0] === 'run').length;
+  login(business); writeConfig(); let task = spawnTask('solo-quota');
+  assert.equal(task.candidates.length, 1); assert.deepEqual(task.chain, []); assert.equal(task.dispatch.coordinator.account, business); assert.equal(task.dispatch.sharedQuota, true);
+  const count = launches();
+  setTerminal(task.terminal, { status: { state: 'error', app: 'claude-code' }, screen: 'usage limit reached' });
+  let r = call(['wait', task.id, '--timeout', '3']); assert.equal(r.code, 7, r.out);
+  assert.match(r.out, /usage limit reached/); assert.match(r.out, /no other candidate/); assert.match(r.out, /Nobody can take this work now/); assert.equal(launches(), count);
+  r = call(['relaunch', task.id]); assert.equal(r.code, 8, r.out); assert.match(r.out, /Nobody can take this work now/); assert.ok(fs.existsSync(task.worktree)); assert.equal(f.task(task.id).terminal, task.terminal);
+  login(personal); task = spawnTask('solo-crash'); const count2 = launches();
+  setTerminal(task.terminal, { status: null, screen: 'worker crashed' });
+  r = call(['wait', task.id, '--timeout', '3']); assert.equal(r.code, 7, r.out);
+  assert.match(r.out, /agent ended without a report/); assert.match(r.out, /Nobody can take this work now/); assert.equal(launches(), count2);
+  // A multi-profile section's saved chain and measurement flag survive a new login/config.
+  const chain = [{ harness: 'a1', model: 'openai-codex/first' }, { harness: 'pi', model: 'openai-codex/second' }];
+  config.coordinators[business].default = chain; writeConfig(); login(business); task = spawnTask('saved-policy');
+  assert.equal(fs.readFileSync(quotaLog, 'utf8'), '', 'Section shared_quota suppresses all measurement');
+  config.coordinators[business].default = [{ harness: 'pi', model: 'wrong/new-config' }]; config.coordinators[business].shared_quota = false; writeConfig(); login(personal);
+  r = call(['relaunch', task.id]); assert.equal(r.code, 0, r.out); assert.ok(r.out.includes(`saved task policy: coordinator ${business}`), 'Saved provenance must not impersonate the current coordinator');
+  let moved = f.task(task.id); assert.equal(moved.agent, 'pi'); assert.equal(moved.launch.model, 'openai-codex/second'); assert.deepEqual(moved.candidates, chain);
+  assert.equal(moved.dispatch.coordinator.account, business); assert.equal(moved.dispatch.sharedQuota, true); assert.equal(fs.readFileSync(quotaLog, 'utf8'), '');
+  assert.equal(call(['relaunch', task.id]).code, 8, 'The saved policy cannot widen after all candidates were tried');
+  r = call(['relaunch', task.id, '--model', 'openai-codex/explicit']); assert.equal(r.code, 0, r.out);
+  moved = f.task(task.id); assert.equal(moved.launch.model, 'openai-codex/explicit'); assert.equal(moved.dispatch.coordinator.account, personal); assert.equal(moved.dispatch.sharedQuota, false);
+  assert.deepEqual(moved.candidates.map(c => c.model), ['openai-codex/explicit', 'openai-codex/gpt-6.1-sol']); assert.ok(fs.readFileSync(quotaLog, 'utf8').includes('read'));
+  // Automatic handover follows the same saved policy after a coordinator switch.
+  config.coordinators[business].default = chain; config.coordinators[business].shared_quota = true; writeConfig(); login(business);
+  const automatic = spawnTask('saved-auto'); login(personal);
+  setTerminal(automatic.terminal, { status: { state: 'error', app: 'a1' }, screen: 'Please run /login' });
+  fs.writeFileSync(quotaLog, '');
+  r = call(['wait', automatic.id, '--timeout', '2']); assert.equal(r.code, 124, r.out);
+  assert.equal(f.task(automatic.id).launch.model, 'openai-codex/second'); assert.deepEqual(f.task(automatic.id).candidates, chain);
+  assert.equal(f.task(automatic.id).dispatch.coordinator.account, business); assert.equal(fs.readFileSync(quotaLog, 'utf8'), '');
+  // Older saved tasks are still saved tasks: provenance absence never authorizes rebuilding.
+  const legacy = spawnTask('legacy-policy'); const { dispatch, ...old } = legacy;
+  f.save({ ...old, candidates: [old.launch, { harness: 'pi', model: 'legacy/saved' }], chain: [{ harness: 'pi', model: 'legacy/saved' }] });
+  r = call(['relaunch', legacy.id]); assert.equal(r.code, 0, r.out); assert.equal(f.task(legacy.id).launch.model, 'legacy/saved');
+  // The real review/fix entry points, not just agents --role, stay in section defaults.
+  const ship = spawnTask('section-ship', ['--kind', 'ship']); fs.writeFileSync(ship.report, 'Implementation complete.'); f.save({ ...ship, state: 'reported' });
+  r = call(['review', ship.id]); assert.equal(r.code, 0, r.out); assert.equal(f.task('section-ship-review').launch.model, 'openai-codex/gpt-6.1-sol');
+  r = f.call(['fix', 'Check coordinator policy.'], { ...env, CREW_TOOL_ROOT: f.repo }); assert.equal(r.code, 0, r.out); assert.equal(f.task('fix-1').launch.model, 'openai-codex/gpt-6.1-sol');
+  // Non-Claude/unlisted owners emit their reason once on a command that launches work.
+  login('aicoder-de13@ameria.com'); r = call(['spawn', 'global-policy', '--project', 'demo', 'Count.']); assert.equal(r.code, 0, r.out);
+  assert.equal((r.out.match(/^coordinator /gm) ?? []).length, 1); assert.match(r.out, /no coordinator section.*using global dispatch/); assert.equal(f.task('global-policy').launch.model, 'wrong/global');
+});
 
 gapTests['wait-relaunch'] = async () => {
   const f = gapFixture('wait-relaunch'), task = f.spawn('racing', ['--agent', 'pi']);
@@ -3053,7 +3375,7 @@ console.log(JSON.stringify({ schemaVersion: 5, providers: who ? [row('claude', q
 if (a[0] === '--version') process.exit(0);`);
     const setQuota = q => fs.writeFileSync(quotaFile, JSON.stringify(q));
     const E = { CREW_AGENT_PATH: bin, CREW_CLAUDE_LAUNCHER: path.join(switcher, 'claude-as.sh'), CREW_TOOL_QUOTA_AXI: fakeQuota, CREW_HOME: home2 };
-    const crew2 = (args, terminal = 'k1', more = {}) => { const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: root, env: { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_WORKTREES: path.join(root, 'copies2'), HC_TERMINAL_ID: '', CREW_TERMINAL: terminal, CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...E, ...more } }); return { code: r.status, out: r.stdout + r.stderr }; };
+    const crew2 = (args, terminal = 'k1', more = {}) => { const r = spawnSync(process.execPath, [path.join(here, 'crew.mjs'), ...args], { encoding: 'utf8', cwd: root, env: { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_WORKTREES: path.join(root, 'copies2'), HC_TERMINAL_ID: '', CREW_TERMINAL: terminal, CLAUDE_CONFIG_DIR: '', CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: undefined, CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...E, ...more } }); return { code: r.status, out: r.stdout + r.stderr }; };
     const task2 = id => JSON.parse(fs.readFileSync(path.join(home2, 'tasks', id, 'task.json'), 'utf8'));
     const lastRun = () => readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
     assert.equal(crew2(['init', home2]).code, 0); assert.equal(crew2(['project', 'add', 'demo', project]).code, 0); assert.equal(crew2(['start']).code, 0);
