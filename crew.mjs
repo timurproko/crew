@@ -1399,7 +1399,7 @@ function replaceWorker(h, task, reason, flags) {
   // (or a legacy task without a chain) asks the *current* coordinator policy again.
   const rebuilt = named || !task.chain ? workChain(h, role, flags ?? {}, task.agent, task.project) : null;
   const dispatch = rebuilt ? { coordinator: rebuilt.coordinator, source: rebuilt.source, sharedQuota: rebuilt.config.shared } : task.dispatch;
-  if (config.hasCoordinators && dispatch) console.log(coordinatorLine(dispatch.coordinator, dispatch.source));
+  if (config.hasCoordinators && dispatch) console.log(`${rebuilt ? '' : 'saved task policy: '}${coordinatorLine(dispatch.coordinator, dispatch.source)}`);
   const original = rebuilt ? rebuilt.candidates : task.candidates ?? task.chain;
   const candidates = original.filter(c => named ? pickKey(c) !== pickKey(before) : !tried.has(pickKey(c)));
   const scoped = dispatch && dispatch.coordinator.section !== 'global';

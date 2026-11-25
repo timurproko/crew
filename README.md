@@ -323,7 +323,8 @@ coordinator path on a match. JSON represents an unknown account with null and it
 
 Scoped tasks save their complete selected candidates and quota-measurement policy. Quota/login
 loss, a crashed worker and relaunch without selection flags use only that saved chain,
-even after the coordinator changes account or the config changes. A singleton has nobody
+even after the coordinator changes account or the config changes; its diagnostic says
+`saved task policy` rather than claiming the old account is the current coordinator. A singleton has nobody
 to hand over to: crew says `Nobody can take this work now`, with the stop/no-other-candidate
 reason, and keeps the working copy for a person. Relaunch with selection flags deliberately
 rebuilds from the coordinator's current policy, excluding the current worker as before.

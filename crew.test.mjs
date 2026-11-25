@@ -65,18 +65,7 @@ fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
 fs.writeFileSync(fake, `
 import fs from 'node:fs';
 const file = ${JSON.stringify(world)}, w = JSON.parse(fs.readFileSync(file, 'utf8')), a = process.argv.slice(2);
-w.log.push(a); const save = () => {
-  // Readers in race tests must see one complete fake-Core snapshot, not a truncate/write.
-  const tmp = file + '.' + process.pid + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(w));
-  const deadline = Date.now() + 1000;
-  for (;;) {
-    try { fs.renameSync(tmp, file); return; }
-    catch (error) {
-      if (!['EPERM', 'EACCES', 'EBUSY'].includes(error.code) || Date.now() >= deadline) throw error;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-    }
-  }
-};
+w.log.push(a); const save = () => fs.writeFileSync(file, JSON.stringify(w));
 if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forEach((v, i) => { if (v === '--label') { const [k, ...r] = a[i + 1].split('='); labels[k] = r.join('='); } });
   w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; save(); console.log(JSON.stringify({ address })); }
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
@@ -100,7 +89,18 @@ else if (a[0] === 'send') {
 }
 else save();
 `);
-const readWorld = () => JSON.parse(fs.readFileSync(world, 'utf8'));
+const readWorld = () => {
+  // The fake child publishes via truncate/write. A barrier reader can land between those
+  // operations; wait for a complete fixture snapshot, but still fail persistent corruption.
+  const deadline = Date.now() + 1000;
+  for (;;) {
+    try { return JSON.parse(fs.readFileSync(world, 'utf8')); }
+    catch (error) {
+      if (!(error instanceof SyntaxError) || Date.now() >= deadline) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+  }
+};
 const setTerminal = (address, patch) => { const w = readWorld(); Object.assign(w.terminals[address], patch); fs.writeFileSync(world, JSON.stringify(w)); };
 
 const homeDir = path.join(root, 'home'), project = path.join(root, 'project'), fakeUser = path.join(root, 'user');
@@ -916,7 +916,7 @@ gapTests['coordinator-recovery'] = isolatedCore(() => {
   config.coordinators[business].default = chain; writeConfig(); login(business); task = spawnTask('saved-policy');
   assert.equal(fs.readFileSync(quotaLog, 'utf8'), '', 'Section shared_quota suppresses all measurement');
   config.coordinators[business].default = [{ harness: 'pi', model: 'wrong/new-config' }]; config.coordinators[business].shared_quota = false; writeConfig(); login(personal);
-  r = call(['relaunch', task.id]); assert.equal(r.code, 0, r.out);
+  r = call(['relaunch', task.id]); assert.equal(r.code, 0, r.out); assert.ok(r.out.includes(`saved task policy: coordinator ${business}`), 'Saved provenance must not impersonate the current coordinator');
   let moved = f.task(task.id); assert.equal(moved.agent, 'pi'); assert.equal(moved.launch.model, 'openai-codex/second'); assert.deepEqual(moved.candidates, chain);
   assert.equal(moved.dispatch.coordinator.account, business); assert.equal(moved.dispatch.sharedQuota, true); assert.equal(fs.readFileSync(quotaLog, 'utf8'), '');
   assert.equal(call(['relaunch', task.id]).code, 8, 'The saved policy cannot widen after all candidates were tried');
