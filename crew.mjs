@@ -2001,6 +2001,7 @@ function tryReturnWaiting(h, task, { force = false } = {}) {
     try {
       const result = stopTaskWorkers(task, { force });
       copyToReturn.pendingTerminals = result.pending;
+      copyToReturn.cleanupTerminal = true;
       copyToReturn.stoppedTerminals = ownedTerminals(task).filter(t => !result.pending.includes(t.address)).map(t => t.address);
       saveTask(h, task);
       if (!result.stopped) return { state: 'held', line: `The working copy of ${task.id} is kept: its worker stop is not confirmed (${result.how}). The next crew finish or crew start retries it.` };

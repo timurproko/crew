@@ -739,6 +739,13 @@ gapTests['owned-terminals'] = () => {
   w = readWorld(); w.failRm = false; fs.writeFileSync(world, JSON.stringify(w));
   r = f.call(['finish', pending.id]); assert.equal(r.code, 0, r.out); assert.ok(!readWorld().terminals[second] && !readWorld().terminals[pending.terminal]);
 
+  const resumed = f.spawn('resumed', ['--agent', 'pi']);
+  w = readWorld(); delete w.terminals[resumed.terminal]; w.terminals['late-resumed'] = { address: 'late-resumed', state: 'live', cwd: resumed.worktree, status: { app: 'pi', state: 'idle' } }; fs.writeFileSync(world, JSON.stringify(w));
+  f.save({ ...resumed, state: 'closed', terminals: [...resumed.terminals, { address: 'late-resumed', agent: 'pi' }],
+    copyToReturn: { left: snapshotCopy(resumed.worktree), cleanupTerminal: false, stopPending: false, stoppedTerminals: [resumed.terminal] } });
+  r = f.call(['finish', resumed.id]); assert.equal(r.code, 0, r.out);
+  assert.ok(!readWorld().terminals['late-resumed'], 'A newly stopped historical terminal must also be removed on retry');
+
   const legacy = f.spawn('legacy', ['--agent', 'pi']); const { terminals, ...record } = legacy; f.save(record);
   assert.equal(f.call(['finish', legacy.id]).code, 0); assert.ok(!readWorld().terminals[legacy.terminal]);
 };
