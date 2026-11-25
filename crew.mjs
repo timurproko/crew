@@ -97,21 +97,21 @@ function run(command, args, options = {}) {
 // --- Core --------------------------------------------------------------------
 // CREW_HC names another hc binary; a .mjs path is run with node (the tests' fake Core).
 const HC = process.env.CREW_HC || 'hc';
-function hc(args) {
-  const r = HC.endsWith('.mjs') ? run(process.execPath, [HC, ...args]) : run(HC, args);
+function hc(args, options = {}) {
+  const r = HC.endsWith('.mjs') ? run(process.execPath, [HC, ...args], options) : run(HC, args, options);
   if (r.error) refuse(`herdr-core (hc) could not be run: ${r.error.message}`, 4);
   return r;
 }
-function hcJson(args) {
-  const r = hc(args);
+function hcJson(args, options) {
+  const r = hc(args, options);
   try { return { code: r.code, value: JSON.parse(r.stdout || r.stderr) }; } catch { return { code: r.code, value: null }; }
 }
 // What Core says about a terminal, in three distinct answers. `absent` only when Core
 // itself says it has no such terminal; any other failed query is `unknown`, and an unknown
 // answer never justifies taking a home over, failing a task or deleting a worker's files.
-function probe(address) {
+function probe(address, options) {
   if (!address) return { state: 'absent', t: null };
-  const { code, value } = hcJson(['get', '--json', address]);
+  const { code, value } = hcJson(['get', '--json', address], options);
   if (code === 0 && value && !value.error && typeof value.state === 'string') return { state: value.state === 'live' ? 'live' : 'finished', t: value };
   if (value?.error?.kind === 'not_found') return { state: 'absent', t: null };
   return { state: 'unknown', t: null };
@@ -399,14 +399,31 @@ function requireOwner(h, operation = 'control work in this home') {
 // ~/.claude.json (the engine can rewrite that from stale memory after a switch).
 const EMAIL = /^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 const accountEmail = value => typeof value === 'string' && value.trim().length <= 100 && EMAIL.test(value.trim()) ? value.trim().toLowerCase() : null;
-export function coordinatorIdentity(owner, { env = process.env, core, time = Date.now() } = {}) {
+export function coordinatorIdentity(owner, options = {}) {
+  let terminal = null;
+  try {
+    terminal = typeof owner?.terminal === 'string' ? owner.terminal : null;
+    const identity = detectCoordinatorIdentity(owner, options), h = options.home, caller = options.env ?? process.env;
+    // Identity and its optional cache are advisory: inspectors never write, and replaced
+    // owners cannot inherit this observation. Any failure stays inside this one boundary.
+    if (h && terminal && terminal === (caller.CREW_TERMINAL || caller.HC_TERMINAL_ID) && JSON.stringify(readJson(h.owner)) === JSON.stringify(owner)) {
+      writeJson(h.owner, { ...owner, coordinator: identity });
+    }
+    return identity;
+  } catch {
+    return { terminal, harness: null, account: null, status: 'unknown', source: null,
+      reason: 'owner-session identity probe is unavailable', configDir: null, observedAt: null };
+  }
+}
+function detectCoordinatorIdentity(owner, { env = process.env, core, time = Date.now() } = {}) {
   const mine = owner?.terminal && owner.terminal === (env.CREW_TERMINAL || env.HC_TERMINAL_ID);
   const configDir = mine && env.CLAUDE_CONFIG_DIR ? path.resolve(env.CLAUDE_CONFIG_DIR) : owner?.coordinator?.configDir ?? null;
   const result = { terminal: owner?.terminal ?? null, harness: null, account: null, status: 'unknown', source: null, reason: 'no home owner', configDir, observedAt: null };
   const unknown = reason => ({ ...result, reason });
   if (!owner?.terminal) return unknown('no home owner');
-  const seen = core ?? probe(owner.terminal);
+  const seen = core ?? probe(owner.terminal, { timeout: 2000 });
   if (['absent', 'finished'].includes(seen.state)) return unknown('owner terminal is not live');
+  if (seen.state !== 'live') return unknown('Core owner-session metadata is unavailable');
   const app = String(seen.t?.status?.app ?? seen.t?.agent ?? '').split(/[\\/]/).pop().replace(/\.exe$/i, '').toLowerCase();
   if (['a1', 'pi', 'codex'].includes(app)) return { ...result, harness: app, status: 'non-claude', source: 'core', reason: `${app} is not a Claude coordinator`, configDir: null };
   if (['claude', 'claude-code'].includes(app)) result.harness = 'claude';
@@ -436,12 +453,7 @@ export function coordinatorIdentity(owner, { env = process.env, core, time = Dat
   return { ...result, harness: 'claude', account: best.account, status: 'known', source: best.source, reason: null, observedAt: best.at };
 }
 function currentCoordinator(h) {
-  const owner = readJson(h.owner), identity = coordinatorIdentity(owner);
-  // Inspectors never write, and a replaced owner must not inherit this observation.
-  if (owner?.terminal === me() && JSON.stringify(readJson(h.owner)) === JSON.stringify(owner)) {
-    writeJson(h.owner, { ...owner, coordinator: identity });
-  }
-  return identity;
+  return coordinatorIdentity(readJson(h.owner), { home: h });
 }
 
 // --- Claude Code folder trust ---------------------------------------------------
@@ -852,6 +864,10 @@ const dispatchFile = h => path.join(h.dir, 'config', 'crew-dispatch.json');
 function coordinatorSections(raw, file, shared) {
   if (raw === undefined) return {};
   const fail = (where, why) => refuse(`${slash(file)}: ${where} ${why}.`);
+  const guard = (where, validate) => {
+    try { return validate(); }
+    catch (error) { if (error instanceof Refusal) throw error; fail(where, 'could not be validated'); }
+  };
   const object = (value, where, allowed) => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) fail(where, 'must be an object');
     const bad = allowed && Object.keys(value).find(key => !allowed.includes(key));
@@ -864,16 +880,27 @@ function coordinatorSections(raw, file, shared) {
     if (required && !entries.length) fail(where, 'must contain at least one profile');
     return entries.map((p, i) => {
       const at = `${where}[${i}]`;
-      if (typeof p !== 'string') {
-        object(p, at, ['harness', 'agent', 'model', 'effort', 'account', 'floor', 'provider', 'family']);
-        for (const key of ['provider', 'family']) if (p[key] !== undefined && (typeof p[key] !== 'string' || !WORD.test(p[key]))) fail(`${at}.${key}`, 'is not a usable quota provider');
-      }
-      return cleanProfile(p, `${at} in ${slash(file)}`);
+      return guard(at, () => {
+        const profile = typeof p === 'string' ? { harness: p } : object(p, at, ['harness', 'agent', 'model', 'effort', 'account', 'floor', 'provider', 'family']);
+        for (const key of ['harness', 'agent']) if (Object.hasOwn(profile, key)) {
+          if (typeof profile[key] !== 'string') fail(`${at}.${key}`, 'harness must be a string');
+          if (!Object.hasOwn(AGENTS, profile[key])) fail(`${at}.${key}`, `Unknown agent: ${profile[key]}`);
+        }
+        const harness = profile.harness ?? profile.agent;
+        if (harness === undefined) fail(`${at}.harness`, 'must name an agent');
+        for (const key of ['model', 'effort', 'account', 'provider', 'family']) if (Object.hasOwn(profile, key)) {
+          if (typeof profile[key] !== 'string' || !profile[key].length) fail(`${at}.${key}`, 'must be a non-empty string');
+          if (!(key === 'account' ? ACCOUNT : WORD).test(profile[key])) fail(`${at}.${key}`, 'is not a usable value');
+        }
+        if (Object.hasOwn(profile, 'floor') && (typeof profile.floor !== 'number' || !Number.isFinite(profile.floor) || profile.floor < 0 || profile.floor > 100)) fail(`${at}.floor`, 'must be a finite number from 0 to 100');
+        if (Object.hasOwn(profile, 'account') && harness !== 'claude') fail(`${at}.account`, 'is only supported for Claude Code');
+        return cleanProfile(profile, `${at} in ${slash(file)}`);
+      });
     });
   };
   const roles = (value, where) => Object.fromEntries(Object.entries(value === undefined ? {} : object(value, where, ROLES)).map(([role, profiles]) => [role, list(profiles, `${where}.${role}`)]));
   const sections = new Map();
-  for (const [key, value] of Object.entries(object(raw, 'coordinators'))) {
+  for (const [key, value] of Object.entries(object(raw, 'coordinators'))) guard(`coordinators.${key}`, () => {
     const where = `coordinators.${key}`, email = accountEmail(key);
     if (!email) fail(where, 'must be keyed by a complete account email');
     if (sections.has(email)) fail(where, `duplicates coordinator ${email} after case normalization`);
@@ -893,7 +920,7 @@ function coordinatorSections(raw, file, shared) {
       return { when: rule.when ?? '', why: rule.why ?? '', use: list(rule.use, `${at}.use`, true) };
     });
     sections.set(email, { default: list(section.default, `${where}.default`, true), roles: roles(section.roles, `${where}.roles`), projects, rules, shared: section.shared_quota ?? shared });
-  }
+  });
   return Object.fromEntries(sections);
 }
 function dispatchConfig(h) {

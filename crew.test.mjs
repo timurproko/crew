@@ -309,6 +309,80 @@ gapTests['coordinator-harness'] = isolatedCore(() => {
   }
   for (const harness of Object.keys(AGENTS)) assert.equal(cleanProfile({ harness }).harness, harness);
 });
+gapTests['coordinator-probe-failures'] = isolatedCore(() => {
+  const f = identityFixture('probe-failures'), email = 'probe@example.test', dispatch = path.join(f.home, 'config', 'crew-dispatch.json');
+  fs.mkdirSync(path.dirname(dispatch), { recursive: true }); f.status(email); assert.equal(f.call(['start']).code, 0);
+  const broken = path.join(f.dir, 'broken-hc.mjs'), slow = path.join(f.dir, 'slow-hc.mjs');
+  fs.writeFileSync(broken, "process.stdout.write('{not JSON');\n");
+  fs.writeFileSync(slow, "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000); console.log('{\"state\":\"live\"}');\n");
+  for (const scoped of [false, true]) {
+    fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], shared_quota: true,
+      ...(scoped ? { coordinators: { [email]: { default: ['pi'] } } } : {}) }));
+    for (const hc of [path.join(f.dir, 'missing-hc'), broken, slow]) {
+      const r = f.call(['agents', '--json'], { CREW_HC: hc }); assert.equal(r.code, 0, r.out);
+      const shown = JSON.parse(r.out); assert.equal(shown.coordinator.status, 'unknown'); assert.equal(shown.coordinator.account, null);
+      assert.equal(shown.coordinator.section, 'global'); assert.ok(shown.coordinator.reason); assert.deepEqual(shown.candidates.map(c => c.harness), ['a1']);
+    }
+    const text = f.call(['agents'], { CREW_HC: path.join(f.dir, 'missing-hc') }); assert.equal(text.code, 0, text.out);
+    assert.match(text.out, /coordinator account unknown .*using global dispatch/); assert.equal((text.out.match(/^coordinator /gm) ?? []).length, 1);
+  }
+  const owner = f.record(), core = { state: 'live', t: { status: { app: 'claude-code' }, labels: {} } };
+  for (const options of [
+    { env: { CREW_TERMINAL: f.owner, CLAUDE_CONFIG_DIR: { toString: 0 } }, core },
+    { env: {}, core: { state: 'live', t: { status: { app: { toString: 0 } } } } },
+    { get core() { throw new Error('injected identity failure'); } },
+    { env: { CREW_TERMINAL: f.owner }, core, home: { get owner() { throw new Error('injected identity cache failure'); } } },
+  ]) {
+    const identity = coordinatorIdentity(owner, options); assert.equal(identity.status, 'unknown'); assert.equal(identity.account, null);
+    assert.match(identity.reason, /unavailable/);
+  }
+  // No private switcher record is also uncertainty, not the saved account/hint.
+  fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: { [email]: { default: ['pi'] } } }));
+  const missingSwitcher = f.call(['agents', '--json'], { CLAUDE_CONFIG_DIR: path.join(f.dir, 'missing-switcher') });
+  assert.equal(missingSwitcher.code, 0, missingSwitcher.out); assert.equal(JSON.parse(missingSwitcher.out).coordinator.status, 'unknown');
+});
+gapTests['coordinator-profile-types'] = isolatedCore(() => {
+  const f = identityFixture('profile-types'), email = 'typed@example.test', other = 'other@example.test', dispatch = path.join(f.home, 'config', 'crew-dispatch.json');
+  fs.mkdirSync(path.dirname(dispatch), { recursive: true }); f.status(email); assert.equal(f.call(['start']).code, 0);
+  const cases = [];
+  for (const field of ['model', 'effort', 'account']) for (const value of [{ toString: 0 }, [], 5, false, null, '']) cases.push([field, value]);
+  for (const value of [{ toString: 0 }, [], '50', false, null, -1, 101]) cases.push(['floor', value]);
+  for (const field of ['provider', 'family']) for (const value of [{ toString: 0 }, [], null, '']) cases.push([field, value]);
+  cases.push(['extra', true]);
+  for (const selected of [true, false]) {
+    f.status(selected ? email : other);
+    for (const [field, value] of cases) {
+      fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: {
+        [email]: { default: [{ harness: 'claude', [field]: value }] }, [other]: { default: ['a1'] },
+      } }));
+      const r = f.call(['agents', '--json']); assert.equal(r.code, 2, `${field}: ${JSON.stringify(value)}\n${r.out}`);
+      assert.ok(r.out.includes('crew-dispatch.json'), r.out); assert.ok(r.out.includes(`coordinators.${email}.default[0].${field}`), r.out);
+    }
+    fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: { [email]: { default: [{ harness: 'a1', floor: 'overflow-floor' }] } } }).replace('"overflow-floor"', '1e400'));
+    const overflow = f.call(['agents', '--json']); assert.equal(overflow.code, 2, overflow.out); assert.ok(overflow.out.includes(`coordinators.${email}.default[0].floor`), overflow.out);
+  }
+  // Even an unexpected validator exception must become a path-qualified refusal.
+  const script = path.join(f.dir, 'throwing-profile.mjs');
+  fs.writeFileSync(script, `import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const parse = JSON.parse; JSON.parse = (...args) => {
+  const value = parse(...args), section = value?.coordinators?.[${JSON.stringify(email)}], profile = section?.default?.[0];
+  if (profile?.model === 'throw-section') Object.defineProperty(section, 'projects', { get() { throw new TypeError('injected section validator failure'); } });
+  if (profile?.model === 'throw-validation') Object.defineProperty(profile, 'model', { get() { throw new TypeError('injected profile validator failure'); } });
+  return value;
+}; main(process.argv.slice(2));`);
+  for (const model of ['throw-validation', 'throw-section']) for (const selected of [true, false]) {
+    fs.writeFileSync(dispatch, JSON.stringify({ default: ['a1'], coordinators: { [email]: { default: [{ harness: 'claude', model }] } } }));
+    f.status(selected ? email : other);
+    const r = crew(['agents', '--json'], { script, cwd: f.home, terminal: f.owner, env: f.env });
+    assert.equal(r.code, 2, r.out); assert.ok(r.out.includes(`coordinators.${email}${model === 'throw-validation' ? '.default[0]' : ''}`), r.out); assert.ok(r.out.includes('crew-dispatch.json'), r.out);
+  }
+  // Legitimate primitive fields still normalize normally; strictness stays scoped.
+  fs.writeFileSync(dispatch, JSON.stringify({ default: [{ harness: 'a1', model: 123, floor: '50' }], coordinators: {
+    [email]: { default: [{ harness: 'claude', model: 'opus', effort: 'high', account: 'worker@example.test', floor: 50, provider: 'claude' }] },
+  } }));
+  f.status(email); let shown = JSON.parse(f.call(['agents', '--json']).out); assert.equal(shown.candidates[0].floor, 50); assert.equal(shown.candidates[0].account, 'worker@example.test');
+  f.status(other); shown = JSON.parse(f.call(['agents', '--json']).out); assert.equal(shown.candidates[0].model, '123'); assert.equal(shown.candidates[0].floor, 50);
+});
 gapTests['repair-scope'] = () => {
   for (const file of ['crew.mjs', 'crew.test.mjs', 'README.md', 'bin/crew', 'bin/crew.cmd', 'docs/guide.md']) assert.ok(repairFile(file), file);
   for (const file of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', 'package.json', 'scripts/build.mjs', 'LICENSE', '.gitignore', '.gitattributes', 'openspec/specs/tool-maintenance/spec.md', 'crew/crew.mjs', 'other.mjs', 'bin-other/file']) assert.ok(!repairFile(file), file);
