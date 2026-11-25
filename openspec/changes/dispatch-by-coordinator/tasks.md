@@ -8,11 +8,11 @@
 
 ## 2. Coordinator policies resolve isolated worker lists and agents explains the selected account and source
 
-- [ ] 2.1 Parse the optional coordinators map with case-insensitive exact keys and required section defaults; targeted tests reject invalid containers, colliding/invalid keys, malformed unselected sections, nested fields, profiles, roles, rules and quota flags with field-path diagnostics.
-- [ ] 2.2 Select the coordinator policy before project/role resolution, including review, fix and crew:self, and keep each scoped base profile one candidate; fixtures prove both requested singleton examples, project precedence, section-default fallback and unchanged no-map/global expansion.
-- [ ] 2.3 Apply existing agent/model/effort/account/rule/no-fallback transforms over the selected base, preserving explicit override expansion while leaving scoped profiles unexpanded; targeted cases assert exact ordered/deduplicated candidate arrays and section-local rule errors.
-- [ ] 2.4 Add human and JSON agents identity/section/source diagnostics and one-line unknown-account fallback for current-chain selection; output tests prove valid JSON, non-owner read-only inspection and one diagnostic per human command.
-- [ ] 2.5 Add the exact two-account JSON example, schema constraints, precedence and override-expansion distinction to README; disposable fixtures use that example and assert one candidate per configured singleton.
+- [x] 2.1 Parse the optional coordinators map with case-insensitive exact keys and required section defaults; targeted tests reject invalid containers, colliding/invalid keys, malformed unselected sections, nested fields, profiles, roles, rules and quota flags with field-path diagnostics.
+- [x] 2.2 Select the coordinator policy before project/role resolution, including review, fix and crew:self, and keep each scoped base profile one candidate; fixtures prove both requested singleton examples, project precedence, section-default fallback and unchanged no-map/global expansion.
+- [x] 2.3 Apply existing agent/model/effort/account/rule/no-fallback transforms over the selected base, preserving explicit override expansion while leaving scoped profiles unexpanded; targeted cases assert exact ordered/deduplicated candidate arrays and section-local rule errors.
+- [x] 2.4 Add human and JSON agents identity/section/source diagnostics and one-line unknown-account fallback for current-chain selection; output tests prove valid JSON, non-owner read-only inspection and one diagnostic per human command.
+- [x] 2.5 Add the exact two-account JSON example, schema constraints, precedence and override-expansion distinction to README; disposable fixtures use that example and assert one candidate per configured singleton.
 
 ## 3. Recovery and relaunch preserve the selected task chain without implicit fallback workers
 

@@ -182,6 +182,86 @@ gapTests['coordinator-identity'] = () => {
   const log = readWorld().log;
   assert.ok(!log.some(a => ['send', 'kill'].includes(a[0]) && a.includes(f.owner)), 'No coordinator input or process mutation');
 };
+gapTests['coordinator-dispatch'] = () => {
+  const f = identityFixture('dispatch'), dispatch = path.join(f.home, 'config', 'crew-dispatch.json');
+  fs.mkdirSync(path.dirname(dispatch), { recursive: true });
+  const example = JSON.parse(/### Coordinator-specific worker lists[\s\S]*?```json\r?\n([\s\S]*?)```/.exec(fs.readFileSync(path.join(here, 'README.md'), 'utf8'))[1]);
+  const business = 'tymur.prokopiev@ameria.com', personal = 'masha.shmakova@gmail.com';
+  assert.deepEqual(Object.keys(example.coordinators), [business, personal]);
+  assert.deepEqual(example.coordinators[business].default, [{ harness: 'claude', model: 'claude-opus-5-5', account: 'aicoder-de13@ameria.com' }]);
+  assert.deepEqual(example.coordinators[personal].default, [{ harness: 'a1', model: 'openai-codex/gpt-6.1-sol' }]);
+  const config = value => fs.writeFileSync(dispatch, JSON.stringify(value));
+  const show = (args = [], extra = {}, terminal) => { const r = f.call(['agents', '--json', ...args], extra, terminal); assert.equal(r.code, 0, r.out); return JSON.parse(r.out); };
+  const profiles = shown => shown.candidates.map(({ harness, model, effort, account }) => Object.fromEntries(Object.entries({ harness, model, effort, account }).filter(([, v]) => v !== undefined)));
+  const env = { CREW_CLAUDE_ACCOUNTS: 'one@example.test,two@example.test', CREW_CLAUDE_ACCOUNT: 'two@example.test' };
+  config(example); f.status(business.toUpperCase()); assert.equal(f.call(['start']).code, 0);
+  for (const [email, expected] of [[business, example.coordinators[business].default], [personal, example.coordinators[personal].default]]) {
+    f.status(email);
+    for (const role of ['scout', 'ship', 'review', 'fix']) {
+      const shown = show(['--role', role], env); assert.deepEqual(profiles(shown), expected);
+      assert.equal(shown.coordinator.account, email); assert.equal(shown.coordinator.section, `coordinators.${email}`); assert.equal(shown.source, `coordinators.${email}.default`);
+      assert.equal(shown.candidates.length, 1, 'The README singleton has nobody behind it');
+    }
+  }
+  f.status(business);
+  const scoped = { default: [{ harness: 'a1', model: 'base/model' }], roles: { review: [{ harness: 'pi' }] },
+    projects: { demo: { default: [{ harness: 'claude', account: 'project@example.test' }], roles: { ship: [{ harness: 'pi', model: 'project/ship' }] } }, 'crew:self': [{ harness: 'a1', model: 'self/fix' }] },
+    rules: [{ when: 'Selected rule', why: 'local', use: [{ harness: 'a1', model: 'rule/local' }] }], shared_quota: true };
+  const rootConfig = { default: [{ harness: 'claude' }], roles: { fix: [{ harness: 'pi', model: 'wrong/fix' }], review: [{ harness: 'a1', model: 'wrong/review' }] },
+    projects: { absent: [{ harness: 'pi', model: 'wrong/project' }] }, rules: [{ when: 'Global rule', use: { harness: 'pi' } }], coordinators: { [business.toUpperCase()]: scoped } };
+  config(rootConfig);
+  assert.deepEqual(profiles(show(['--project', 'demo', '--role', 'ship'])), [{ harness: 'pi', model: 'project/ship' }]);
+  assert.deepEqual(profiles(show(['--project', 'demo', '--role', 'review'])), [{ harness: 'claude', account: 'project@example.test' }], 'Project default precedes section role');
+  assert.deepEqual(profiles(show(['--project', 'absent', '--role', 'fix'])), scoped.default, 'Global project and fix role cannot leak');
+  assert.deepEqual(profiles(show(['--project', 'crew:self', '--role', 'fix'])), [{ harness: 'a1', model: 'self/fix' }]);
+  assert.equal(show().sharedQuota, true); assert.equal(show(['--rule', '1']).rules[0].when, 'Selected rule');
+  assert.deepEqual(profiles(show(['--rule', '1'])), [{ harness: 'a1', model: 'rule/local' }]);
+  let r = f.call(['agents', '--rule', '2']); assert.equal(r.code, 2); assert.match(r.out, /No rule 2/);
+  assert.deepEqual(profiles(show(['--model', 'override/model'])), [{ harness: 'a1', model: 'override/model' }, ...scoped.default]);
+  assert.deepEqual(profiles(show(['--effort', 'high'])), [{ harness: 'a1', model: 'base/model', effort: 'high' }], 'Deduplication keeps the adjusted choice');
+  assert.deepEqual(profiles(show(['--agent', 'pi', '--model', 'override/model'])), [{ harness: 'pi', model: 'override/model' }, ...scoped.default]);
+  assert.deepEqual(profiles(show(['--agent', 'claude'], env)), [{ harness: 'claude', account: 'two@example.test' }, { harness: 'claude', account: 'one@example.test' }, ...scoped.default], 'Explicit overrides retain old expansion');
+  assert.deepEqual(profiles(show(['--agent', 'claude', '--account', 'named@example.test', '--no-fallback'], env)), [{ harness: 'claude', account: 'named@example.test' }]);
+  assert.deepEqual(profiles(show(['--model', 'override/model', '--no-fallback'])), [{ harness: 'a1', model: 'override/model' }]);
+  config({ ...rootConfig, coordinators: { [business]: { default: [{ harness: 'claude', model: 'opus' }] } } });
+  assert.deepEqual(profiles(show([], env)), [{ harness: 'claude', model: 'opus' }], 'Account-less scoped profiles never expand');
+  assert.deepEqual(profiles(show(['--account', 'named@example.test'], env)), [{ harness: 'claude', model: 'opus', account: 'named@example.test' }, { harness: 'claude', model: 'opus' }]);
+  r = f.call(['agents'], env); assert.equal((r.out.match(/^coordinator /gm) ?? []).length, 1); assert.ok(r.out.includes(business)); assert.ok(r.out.includes(`coordinators.${business}.default`));
+  config(example); f.status('aicoder-de13@ameria.com');
+  let shown = show([], env); assert.equal(shown.coordinator.section, 'global'); assert.match(shown.coordinator.reason, /no coordinator section/);
+  assert.deepEqual(profiles(shown).slice(0, 2), example.default.slice(0, 2)); assert.equal(shown.candidates.length, 4, 'Unlisted account keeps legacy Claude expansion');
+  r = f.call(['agents'], env); assert.match(r.out, /coordinator aicoder-de13@ameria.com .*using global dispatch/); assert.equal((r.out.match(/^coordinator /gm) ?? []).length, 1);
+  f.status(business); f.status(personal, {}, f.inspector);
+  const ownerBefore = fs.readFileSync(f.ownerFile, 'utf8');
+  assert.equal(show([], { CLAUDE_CONFIG_DIR: f.inspector }, 'inspector').coordinator.account, business);
+  assert.equal(fs.readFileSync(f.ownerFile, 'utf8'), ownerBefore);
+  for (const app of ['a1', 'pi', 'codex']) {
+    setTerminal(f.owner, { status: { app } }); shown = show([], env); assert.equal(shown.coordinator.section, 'global'); assert.equal(shown.coordinator.status, 'non-claude');
+    r = f.call(['agents'], env); assert.match(r.out, /not a Claude coordinator.*using global dispatch/);
+  }
+  setTerminal(f.owner, { status: null, labels: {} });
+  fs.rmSync(path.join(f.session, 'account-switcher-status.json'));
+  shown = show([], env); assert.equal(shown.coordinator.account, null); assert.equal(shown.coordinator.section, 'global');
+  assert.match(f.call(['agents'], env).out, /coordinator account unknown .*using global dispatch/);
+  fs.rmSync(f.ownerFile); assert.equal(show().coordinator.reason, 'no home owner');
+  config({ default: [{ harness: 'claude' }] });
+  assert.deepEqual(profiles(show([], env)), [{ harness: 'claude', account: 'two@example.test' }, { harness: 'claude', account: 'one@example.test' }], 'No-map compatibility');
+  for (const [value, field] of [
+    [null, 'coordinators'], [[], 'coordinators'], ['bad', 'coordinators'], [{ bad: { default: ['a1'] } }, 'coordinators.bad'],
+    [{ [business]: { default: ['a1'] }, [business.toUpperCase()]: { default: ['pi'] } }, business.toUpperCase()],
+    ...[null, [], 'bad', {}, { default: [] }, { default: null }, { default: [{ harness: 'no-such-agent' }] }, { default: ['a1'], nested: {} },
+      { default: ['a1'], coordinators: {} }, { default: ['a1'], roles: null }, { default: ['a1'], roles: { unknown: ['a1'] } },
+      { default: ['a1'], projects: [] }, { default: ['a1'], projects: { demo: { roles: [] } } },
+      { default: ['a1'], projects: { demo: { default: ['a1'], oops: [] } } }, { default: ['a1'], rules: {} },
+      { default: ['a1'], rules: [{ use: [] }] }, { default: ['a1'], rules: [{ use: ['pi'], oops: true }] },
+      { default: ['a1'], rules: [{ use: ['pi'], when: 5 }] }, { default: ['a1'], shared_quota: 'yes' },
+      { default: [{ harness: 'a1', account: 'bad@example.test' }] }, { default: [{ harness: 'a1', provider: [] }] },
+      { default: [{ harness: 'a1', floor: 101 }] }].map(section => [{ [business]: section }, `coordinators.${business}`])
+  ]) {
+    config({ default: ['a1'], coordinators: value }); r = f.call(['agents', '--json']);
+    assert.equal(r.code, 2, JSON.stringify(value) + r.out); assert.ok(r.out.includes('crew-dispatch.json'), r.out); assert.ok(r.out.includes(field), r.out);
+  }
+};
 gapTests['repair-scope'] = () => {
   for (const file of ['crew.mjs', 'crew.test.mjs', 'README.md', 'bin/crew', 'bin/crew.cmd', 'docs/guide.md']) assert.ok(repairFile(file), file);
   for (const file of ['.github/workflows/ci.yml', 'AGENTS.md', 'CLAUDE.md', 'package.json', 'scripts/build.mjs', 'LICENSE', '.gitignore', '.gitattributes', 'openspec/specs/tool-maintenance/spec.md', 'crew/crew.mjs', 'other.mjs', 'bin-other/file']) assert.ok(!repairFile(file), file);

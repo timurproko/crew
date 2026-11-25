@@ -848,8 +848,55 @@ export function cleanProfile(raw, where = '') {
 }
 
 const dispatchFile = h => path.join(h.dir, 'config', 'crew-dispatch.json');
+function coordinatorSections(raw, file, shared) {
+  if (raw === undefined) return {};
+  const fail = (where, why) => refuse(`${slash(file)}: ${where} ${why}.`);
+  const object = (value, where, allowed) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) fail(where, 'must be an object');
+    const bad = allowed && Object.keys(value).find(key => !allowed.includes(key));
+    if (bad) fail(`${where}.${bad}`, 'is not a supported field');
+    return value;
+  };
+  const list = (value, where, required = false) => {
+    if (value === null) fail(where, 'must be a profile or list of profiles');
+    const entries = value === undefined ? [] : Array.isArray(value) ? value : [value];
+    if (required && !entries.length) fail(where, 'must contain at least one profile');
+    return entries.map((p, i) => {
+      const at = `${where}[${i}]`;
+      if (typeof p !== 'string') {
+        object(p, at, ['harness', 'agent', 'model', 'effort', 'account', 'floor', 'provider', 'family']);
+        for (const key of ['provider', 'family']) if (p[key] !== undefined && (typeof p[key] !== 'string' || !WORD.test(p[key]))) fail(`${at}.${key}`, 'is not a usable quota provider');
+      }
+      return cleanProfile(p, `${at} in ${slash(file)}`);
+    });
+  };
+  const roles = (value, where) => Object.fromEntries(Object.entries(value === undefined ? {} : object(value, where, ROLES)).map(([role, profiles]) => [role, list(profiles, `${where}.${role}`)]));
+  const sections = new Map();
+  for (const [key, value] of Object.entries(object(raw, 'coordinators'))) {
+    const where = `coordinators.${key}`, email = accountEmail(key);
+    if (!email) fail(where, 'must be keyed by a complete account email');
+    if (sections.has(email)) fail(where, `duplicates coordinator ${email} after case normalization`);
+    const section = object(value, where, ['default', 'roles', 'projects', 'rules', 'shared_quota']);
+    if (section.shared_quota !== undefined && typeof section.shared_quota !== 'boolean') fail(`${where}.shared_quota`, 'must be a boolean');
+    const projects = Object.fromEntries(Object.entries(section.projects === undefined ? {} : object(section.projects, `${where}.projects`)).map(([name, project]) => {
+      const at = `${where}.projects.${name}`;
+      if (name !== SELF_PROJECT && projectNameError(name)) fail(at, `has an invalid project name (${projectNameError(name)})`);
+      if (Array.isArray(project) || typeof project === 'string' || project?.harness || project?.agent) return [name, { default: list(project, at), roles: {} }];
+      object(project, at, ['default', 'roles']);
+      return [name, { default: list(project.default, `${at}.default`), roles: roles(project.roles, `${at}.roles`) }];
+    }));
+    if (section.rules !== undefined && !Array.isArray(section.rules)) fail(`${where}.rules`, 'must be an array');
+    const rules = (section.rules ?? []).map((rule, i) => {
+      const at = `${where}.rules[${i}]`; object(rule, at, ['when', 'why', 'use']);
+      for (const key of ['when', 'why']) if (rule[key] !== undefined && typeof rule[key] !== 'string') fail(`${at}.${key}`, 'must be text');
+      return { when: rule.when ?? '', why: rule.why ?? '', use: list(rule.use, `${at}.use`, true) };
+    });
+    sections.set(email, { default: list(section.default, `${where}.default`, true), roles: roles(section.roles, `${where}.roles`), projects, rules, shared: section.shared_quota ?? shared });
+  }
+  return Object.fromEntries(sections);
+}
 function dispatchConfig(h) {
-  const file = dispatchFile(h), none = { file, present: false, shared: false, default: [], roles: {}, rules: [], projects: {} };
+  const file = dispatchFile(h), none = { file, present: false, shared: false, default: [], roles: {}, rules: [], projects: {}, coordinators: {}, hasCoordinators: false };
   if (!fs.existsSync(file)) return none;
   let raw;
   try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { refuse(`${slash(file)} is not valid JSON (${error.message}). Correct it, or remove it to use the built-in default.`); }
@@ -864,7 +911,7 @@ function dispatchConfig(h) {
   const projects = Object.fromEntries(Object.entries(raw.projects ?? {}).map(([name, value]) => [name, Array.isArray(value) || typeof value !== 'object' || value === null || value.harness || value.agent
     ? { default: list(value, `projects.${name}`), roles: {} } : { default: list(value.default, `projects.${name}.default`), roles: roles(value.roles, `projects.${name}.roles`) }]));
   return { file, present: true, shared: raw.shared_quota === true, default: list(raw.default, 'default'),
-    roles: roles(raw.roles, 'roles'), projects,
+    roles: roles(raw.roles, 'roles'), projects, coordinators: coordinatorSections(raw.coordinators, file, raw.shared_quota === true), hasCoordinators: Object.hasOwn(raw, 'coordinators'),
     rules: (Array.isArray(raw.rules) ? raw.rules : []).map((r, i) => ({ when: String(r?.when ?? ''), why: String(r?.why ?? ''), use: list(r?.use, `rules[${i}].use`) })) };
 }
 
@@ -883,8 +930,14 @@ function claudeAccounts(env = process.env) {
 // the configured chain follows it as its fallback; `--no-fallback` keeps only the first.
 // `legacy` is the agent crew used before there was any configuration.
 function workChain(h, role, flags, legacy, project = null, env = process.env) {
-  const coordinator = currentCoordinator(h);
-  const config = dispatchConfig(h), own = ownEntry(config.projects, project) ?? null;
+  const root = dispatchConfig(h), identity = currentCoordinator(h);
+  const section = identity.account ? ownEntry(root.coordinators, identity.account) : null;
+  const sectionPath = section ? `coordinators.${identity.account}` : 'global';
+  const config = section ? { ...root, ...section } : root;
+  const { terminal, harness, account, status, source: identitySource, reason } = identity;
+  const coordinator = { terminal, harness, account, status, source: identitySource,
+    reason: reason ?? (!section ? account ? `no coordinator section for ${account}` : 'no matching coordinator section' : null), section: sectionPath };
+  const own = ownEntry(config.projects, project) ?? null;
   // The project's own list comes before the general one, a role's list before a default.
   const [configured, from] = own?.roles[role]?.length ? [own.roles[role], `projects.${project}.roles.${role}`] : own?.default.length ? [own.default, `projects.${project}`]
     : config.roles[role]?.length ? [config.roles[role], `roles.${role}`] : [config.default, config.default.length ? 'default' : 'built-in'];
@@ -899,16 +952,22 @@ function workChain(h, role, flags, legacy, project = null, env = process.env) {
   // over; --model, --effort or --account alone adjust the first configured profile.
   const start = flags.agent !== undefined ? {} : base[0] ?? { harness: legacy };
   const first = named ? cleanProfile({ ...start, ...Object.fromEntries(['model', 'effort', 'account'].filter(k => flags[k] !== undefined).map(k => [k, flags[k]])), ...(flags.agent !== undefined ? { harness: flags.agent } : {}) }) : null;
-  let chain = first ? [first, ...base] : base.length ? base : [cleanProfile({ harness: legacy })];
+  // Scoped config profiles are literal candidates. Only legacy profiles and deliberate
+  // named overrides retain the existing account expansion, never the scoped base behind them.
+  let chain = base.map(profile => ({ profile, expand: !section }));
+  if (first) chain.unshift({ profile: first, expand: true });
+  if (!chain.length) chain = [{ profile: cleanProfile({ harness: legacy }), expand: true }];
   if (flags['no-fallback']) chain = chain.slice(0, 1);
-  const saved = claudeAccounts(env), preferred = String(env.CREW_CLAUDE_ACCOUNT ?? '').trim();
+  const saved = chain.some(({ profile, expand }) => expand && profile.harness === 'claude' && !profile.account) ? claudeAccounts(env) : [];
+  const preferred = String(env.CREW_CLAUDE_ACCOUNT ?? '').trim();
   const accounts = saved.includes(preferred) ? [preferred, ...saved.filter(a => a !== preferred)] : saved;
   const candidates = [], seen = new Set();
-  for (const profile of chain) {
-    const each = profile.harness === 'claude' && !profile.account && accounts.length ? accounts.map(account => ({ ...profile, account })) : [profile];
+  for (const { profile, expand } of chain) {
+    const each = expand && profile.harness === 'claude' && !profile.account && accounts.length ? accounts.map(account => ({ ...profile, account })) : [profile];
     for (const c of each) { if (!seen.has(pickKey(c))) { seen.add(pickKey(c)); candidates.push(c); } }
   }
-  return { candidates, config, coordinator, source: flags.rule !== undefined ? `rule ${flags.rule}` : named ? 'named' : from };
+  const source = flags.rule !== undefined ? `rule ${flags.rule}` : named ? 'named' : from;
+  return { candidates, config, coordinator, source: section ? `${sectionPath}.${source}` : source };
 }
 
 // The provider an A1 or Pi profile without a model spends from: the agent's own saved default.
@@ -1014,7 +1073,8 @@ const candidateChecks = rows => ({ checkedAt: now(), facts: Object.fromEntries(r
 
 // Who takes a new piece of work, and who stands behind them.
 function chooseWorker(h, role, flags, legacy, project = null) {
-  const { candidates, config, source } = workChain(h, role, flags, legacy, project);
+  const { candidates, config, coordinator, source } = workChain(h, role, flags, legacy, project);
+  if (config.hasCoordinators) console.log(coordinatorLine(coordinator, source));
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared });
   if (!usable.length) refuse(`Nobody can take this work now:\n${candidateLines(rows)}\nAdd another profile to ${slash(config.file)}, or name one: --agent <agent> [--model <id>] [--account <account>].`, 8);
   const taken = rows.find(r => pickKey(r) === pickKey(usable[0]));
@@ -1023,20 +1083,22 @@ function chooseWorker(h, role, flags, legacy, project = null) {
   return { pick: usable[0], rest: candidates.filter(c => pickKey(c) !== pickKey(usable[0])), candidates, checks: candidateChecks(rows), available: usable.length - 1, source };
 }
 
+const coordinatorLine = (c, source) => `coordinator ${c.account ?? (c.status === 'non-claude' ? c.harness : 'account unknown')} (${c.reason ?? c.source}); using ${c.section === 'global' ? 'global dispatch' : c.section} (${source})`;
 function cmdAgents(args) {
   const h = home();
   const { flags } = takeFlags(args, ['role', 'project', ...PICK_FLAGS], ['json', 'no-fallback']);
   if (flags.role !== undefined && !ROLES.includes(flags.role)) refuse(`Unknown role: ${flags.role}. Roles: ${ROLES.join(', ')}`);
   if (flags.project !== undefined && flags.project !== SELF_PROJECT) requireProjectName(flags.project);
-  const role = flags.role ?? 'scout', { candidates, config, source } = workChain(h, role, flags, 'a1', flags.project ?? null);
+  const role = flags.role ?? 'scout', { candidates, config, coordinator, source } = workChain(h, role, flags, 'a1', flags.project ?? null);
   const { rows, usable } = usableCandidates(candidates, { shared: config.shared, always: true });
   const first = usable[0] ? pickKey(usable[0]) : null;
   if (flags.json) {
-    console.log(JSON.stringify({ config: config.present ? slash(config.file) : null, role, source, sharedQuota: config.shared,
+    console.log(JSON.stringify({ config: config.present ? slash(config.file) : null, role, source, coordinator, sharedQuota: config.shared,
       candidates: rows.map(({ fact, family, ...c }) => ({ ...c, label: pickLabel(c), status: fact.status, remaining: fact.remaining ?? null, note: fact.note, next: pickKey(c) === first })),
       rules: config.rules.map((r, i) => ({ rule: i + 1, when: r.when, why: r.why, use: r.use.map(pickLabel) })) }));
     return;
   }
+  console.log(coordinatorLine(coordinator, source));
   console.log(config.present ? `profiles from ${slash(config.file)} (${source}), for ${role} work${flags.project ? ` in ${flags.project}` : ''}:` : `no ${slash(config.file)}: the built-in default, for ${role} work:`);
   for (const r of rows) console.log(`${pickKey(r) === first ? '->' : '  '} ${pickLabel(r).padEnd(52)} ${r.fact.status.padEnd(11)}${r.fact.note}`);
   if (!first) console.log('Nobody can take work now.');
