@@ -150,10 +150,27 @@ const homeDir = path.join(root, 'home'), project = path.join(root, 'project'), f
 fs.mkdirSync(fakeUser);
 const claudeConfig = path.join(root, 'claude.json');
 fs.writeFileSync(claudeConfig, JSON.stringify({ theme: 'dark', projects: { 'C:/mine': { hasTrustDialogAccepted: true, history: [1] } } }));
+// HOME alone does not isolate ancestor discovery when TMPDIR sits under a real
+// Crew home. Present only fixture registries to child CLIs, without even probing
+// a host crew.json. Production discovery and every fixture-local check stay real.
+const homeSandbox = path.join(root, 'home-discovery-sandbox.cjs');
+fs.writeFileSync(homeSandbox, `const fs = require('node:fs'), path = require('node:path'), exists = fs.existsSync;
+const root = ${JSON.stringify(root)};
+fs.existsSync = function(file) {
+  if (typeof file === 'string' && path.basename(file) === 'crew.json') {
+    const relative = path.relative(root, path.resolve(file));
+    if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) return false;
+  }
+  return exists.call(fs, file);
+};`);
 function crew(args, { terminal, cwd = homeDir, env: extra = {}, script = path.join(here, 'crew.mjs') } = {}) {
   const env = { ...process.env, CREW_CLAUDE_CONFIG: claudeConfig, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake, CREW_SETTLE_SECONDS: '2', CREW_WORKTREES: path.join(root, 'copies'), CREW_HOME: '', HC_TERMINAL_ID: '', CREW_TERMINAL: terminal ?? '', CLAUDE_CONFIG_DIR: '', CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '',
     // No tool of the machine the suite runs on is seen, unless a test names a fake one.
-    CREW_TOOL_PATH: path.join(root, 'no-tools'), ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...extra };
+    CREW_TOOL_PATH: path.join(root, 'no-tools'),
+    // Initialized fixture cwd already terminates discovery. Avoid propagating an
+    // unnecessary preload into its timing-sensitive lifecycle subprocesses.
+    NODE_OPTIONS: `${fs.existsSync(path.join(cwd, 'crew.json')) ? '' : `--require ${JSON.stringify(homeSandbox)}`} ${process.env.NODE_OPTIONS ?? ''}`,
+    ...Object.fromEntries(TOOLS.map(t => [`CREW_TOOL_${t.id.toUpperCase().replace(/-/g, '_')}`, ''])), ...extra };
   delete env.CREW_HOME;
   const r = spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', cwd: fs.existsSync(cwd) ? cwd : root, env, shell: false });
   return { code: r.status, out: r.stdout + r.stderr };
@@ -176,6 +193,15 @@ console.log = () => { throw new TypeError('injected project list failure'); }; m
 
 // Run a focused regression with --gaps=ignored (or all new regressions with --gaps).
 const gapTests = {};
+gapTests['home-discovery-sandbox'] = () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    const r = crew(['status'], { cwd: root });
+    assert.equal(r.code, 2, r.out); assert.match(r.out, /No crew home yet/);
+    const f = gapFixture('discovery-sandbox');
+    assert.ok(f.call(['status']).out.startsWith(`home ${slash(f.home)} - `), 'Fixture-local discovery still uses real registry checks');
+  } finally { fs.writeFileSync(world, before); }
+};
 // New dispatch fixtures own their fake Core history as well as their home. In particular,
 // their polling logs must not enlarge the shared world used by later concurrency tests.
 const isolatedCore = test => () => {
@@ -619,7 +645,7 @@ function gapFixture(name, extra = {}) {
   fs.mkdirSync(repo, { recursive: true }); git('-C', repo, 'init', '-q');
   commit(repo, { 'README.md': 'baseline\n', '.gitignore': 'scratch/\nloose.log\n' }, 'baseline');
   const owner = `owner-${name}`, w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
-  const call = (args, env = {}) => crew(args, { cwd: home, terminal: owner, env: { CREW_CLAUDE_ACCOUNTS: '', ...extra, ...env } });
+  const call = (args, env = {}, script) => crew(args, { cwd: home, terminal: owner, env: { CREW_CLAUDE_ACCOUNTS: '', ...extra, ...env }, ...(script ? { script } : {}) });
   assert.equal(call(['init', home]).code, 0);
   assert.equal(call(['project', 'add', 'demo', repo]).code, 0);
   assert.equal(call(['start']).code, 0);
@@ -632,8 +658,8 @@ function gapFixture(name, extra = {}) {
   return { dir, home, repo, call, task, save, spawn, guest, leave };
 }
 // Concurrent CLIs with test-only filesystem barriers: no timing guesses or production hooks.
-function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), terminal = '', env = {} } = {}) {
-  const child = spawn(process.execPath, [script, ...args], { cwd: f.home, env: {
+function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), terminal = '', env = {}, cwd = f.home } = {}) {
+  const child = spawn(process.execPath, [script, ...args], { cwd, env: {
     ...process.env, HOME: path.join(f.dir, 'user'), USERPROFILE: path.join(f.dir, 'user'),
     CREW_CLAUDE_CONFIG: path.join(f.dir, 'claude.json'),
     CREW_HOME: f.home, CREW_HC: fake, CREW_TERMINAL: terminal, HC_TERMINAL_ID: '', CLAUDE_CONFIG_DIR: '', CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '',
@@ -814,6 +840,10 @@ function workerSpaceFixTests() {
     let r = f.call(['fix', '--agent', 'pi', '--model', 'first', 'Repair.']); assert.equal(r.code, 0, r.out);
     const t = f.task('fix-1'), binding = t.workerSpace;
     assert.equal(t.project, 'crew:self'); assert.equal(binding.project, registration === 'matching' ? 'crew' : 'crew:self');
+    const full = JSON.parse(f.call(['status', '--all', '--json']).out).tasks.find(task => task.id === t.id);
+    const fleet = JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.find(task => task.id === t.id);
+    assert.equal(fleet.project, full.project); assert.equal(fleet.project, 'crew:self');
+    assert.equal(readWorld().terminals[t.terminal].labels['crew.space.project'], binding.project, 'Fleet task identity never rewrites the repair placement alias');
     assert.equal(binding.name, 'crew'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
     assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
     r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: '' }); assert.equal(r.code, 0, r.out);
@@ -902,7 +932,10 @@ function workerSpaceSessionTests() {
   assert.ok(status.tasks.some(t => t.id === legacy.id)); assert.ok(status.tasks.every(t => !Object.hasOwn(t, 'workerSpace')));
   const fleet = JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out);
   assert.deepEqual(Object.keys(fleet).sort(), ['home', 'owner', 'prDiscovery', 'tasks', 'view']);
-  for (const t of fleet.tasks) assert.deepEqual(Object.keys(t).sort(), ['id', 'pr', 'prDiscovery', 'state', 'terminal']);
+  for (const t of fleet.tasks) {
+    assert.deepEqual(Object.keys(t).sort(), ['id', 'pr', 'prDiscovery', 'project', 'state', 'terminal']);
+    assert.equal(t.project, status.tasks.find(task => task.id === t.id).project);
+  }
   let r = f.call(['wait', legacy.id, '--timeout', '0.02', '--no-fallback']); assert.equal(r.code, 124, r.out);
   assert.equal(fs.readFileSync(path.join(f.home, 'tasks', legacy.id, 'task.json'), 'utf8'), before, 'Reading old tasks does not migrate them');
   const terminals = structuredClone(readWorld().terminals);
@@ -932,6 +965,257 @@ gapTests['worker-spaces'] = async () => {
     await workerSpaceConfigTests(); workerSpacePlacementTests(); workerSpaceInheritanceTests(); workerSpaceFixTests();
     await workerSpaceRepairAdmissionTest(); workerSpaceLifecycleTests(); workerSpaceSessionTests();
   } finally { fs.writeFileSync(world, before); }
+};
+
+gapTests['worker-space-local-setter'] = async () => {
+  const beforeWorld = fs.readFileSync(world, 'utf8');
+  try {
+    const f = gapFixture('local-space'), registry = path.join(f.home, 'crew.json'), owner = path.join(f.home, 'owner.json');
+    const read = () => JSON.parse(fs.readFileSync(registry, 'utf8'));
+    const ambient = path.join(f.dir, 'ambient'); assert.equal(f.call(['init', ambient]).code, 0);
+    const ambientBefore = fs.readFileSync(path.join(ambient, 'crew.json'), 'utf8');
+    const call = (args, { script = path.join(here, 'crew.mjs'), env = {} } = {}) => {
+      const r = spawnSync(process.execPath, [script, 'config', 'worker-space', ...args], { cwd: ambient, encoding: 'utf8', env: {
+        ...process.env, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HOME: ambient, CREW_HC: fake,
+        CREW_TERMINAL: '', HC_TERMINAL_ID: '', ...env,
+      } });
+      assert.equal(r.stderr, '', r.stderr);
+      const value = JSON.parse(r.stdout); assert.equal(r.stdout.trim().split('\n').length, 1);
+      assert.equal(value.capability, 'worker-space-local-set'); assert.equal(value.version, 1);
+      return { code: r.status, value };
+    };
+    const args = (mode = 'per-project', home = f.home) => ['--set-local', mode, '--home', home, '--json'];
+    const success = (mode, changed, options) => {
+      const r = call(args(mode), options); assert.equal(r.code, 0, JSON.stringify(r.value));
+      assert.deepEqual(r.value, { capability: 'worker-space-local-set', version: 1, ok: true,
+        home: slash(fs.realpathSync(f.home)), mode, changed });
+    };
+    const failure = (tail, code, reason, options) => {
+      const before = fs.readFileSync(registry, 'utf8'), r = call(tail, options);
+      assert.equal(r.code, code, JSON.stringify(r.value)); assert.equal(r.value.ok, false);
+      assert.equal(r.value.mode, null); assert.equal(r.value.changed, false); assert.equal(r.value.error.code, reason);
+      assert.ok(r.value.error.message); assert.equal(fs.readFileSync(registry, 'utf8'), before);
+      return r.value;
+    };
+    const probeFiles = fs.readdirSync(ambient), logBefore = readWorld().log.length;
+    assert.deepEqual(call(['--capabilities', '--json'], { env: { CREW_HOME: path.join(f.dir, 'missing'), CREW_HC: path.join(f.dir, 'no-core') } }), {
+      code: 0, value: { capability: 'worker-space-local-set', version: 1, modes: ['combined', 'per-project'], explicitHome: true },
+    });
+    assert.deepEqual(fs.readdirSync(ambient), probeFiles);
+    assert.match(f.call(['--help']).out, /worker-space-local-set v1/);
+    fs.writeFileSync(registry, JSON.stringify({ ...read(), future: { nested: ['kept', 1] } }));
+    const baseline = read(), bytes = fs.readFileSync(registry, 'utf8');
+    const task = f.spawn('existing', ['--agent', 'pi']);
+    const untouched = [owner, path.join(f.home, 'tasks', task.id, 'task.json'), path.join(f.home, 'coordinator', 'AGENTS.md')];
+    const snapshots = untouched.map(file => fs.readFileSync(file, 'utf8'));
+    const coreBefore = fs.readFileSync(world, 'utf8');
+    success('combined', false); assert.equal(fs.readFileSync(registry, 'utf8'), bytes, 'Default combined does not materialize the setting');
+    success('per-project', true); success('per-project', false); success('combined', true);
+    for (const [i, file] of untouched.entries()) assert.equal(fs.readFileSync(file, 'utf8'), snapshots[i]);
+    const { workerSpaceMode, ...rest } = read(); assert.deepEqual(rest, baseline);
+    assert.equal(fs.readFileSync(world, 'utf8'), coreBefore, 'Live-owner local calls never query/mutate Core');
+    for (const state of ['unknown', 'unowned', 'stale']) {
+      if (state === 'unknown') { const w = readWorld(); w.silent = true; fs.writeFileSync(world, JSON.stringify(w)); }
+      if (state === 'unowned') fs.unlinkSync(owner);
+      if (state === 'stale') fs.writeFileSync(owner, JSON.stringify({ terminal: 'missing-owner', future: 5 }));
+      const ownerBefore = fs.existsSync(owner) ? fs.readFileSync(owner, 'utf8') : null, core = fs.readFileSync(world, 'utf8');
+      success('per-project', true); success('combined', true);
+      assert.equal(fs.existsSync(owner) ? fs.readFileSync(owner, 'utf8') : null, ownerBefore);
+      assert.equal(fs.readFileSync(world, 'utf8'), core, state);
+    }
+    fs.writeFileSync(owner, snapshots[0]);
+    const w = readWorld(); delete w.silent; fs.writeFileSync(world, JSON.stringify(w));
+    for (const tail of [
+      ['--set-local'], ['--set-local', ''], ['--set-local', 'combined'], ['--home', f.home, '--json'],
+      ['--set-local', 'combined', '--home', f.home], [...args(), '--json'], [...args(), '--home', f.home],
+      [...args(), '--extra'], [...args(), '--help'], ['combined', ...args()], ['--capabilities'],
+      ['--capabilities', '--json', '--home', f.home], ['--json'],
+    ]) failure(tail, 2, 'invalid-arguments');
+    for (const mode of ['bad', 'Combined', 'null', '../combined']) failure(args(mode), 2, 'invalid-mode');
+    const missing = path.join(f.dir, 'missing', 'home');
+    assert.equal(failure(args('combined', missing), 2, 'home-not-found').home, null); assert.ok(!fs.existsSync(path.dirname(missing)));
+    for (const target of [f.repo, ambient + '/..']) failure(args('combined', target), 2, 'home-not-initialized');
+    for (const target of ['.', 'C:relative', registry, ...(WINDOWS ? ['\\\\server\\share', '\\\\?\\C:\\home', '/rooted'] : [])]) failure(args('combined', target), 2, 'invalid-home');
+    for (const bad of ['{broken', JSON.stringify({ ...read(), tag: '' }), JSON.stringify({ ...read(), projects: [] }),
+      JSON.stringify({ ...read(), workerSpaceMode: 'bad' }), JSON.stringify({ ...read(), version: 2 })]) {
+      const good = fs.readFileSync(registry, 'utf8'); fs.writeFileSync(registry, bad);
+      failure(args(), 2, 'invalid-registry'); fs.writeFileSync(registry, good);
+    }
+    const outside = path.join(f.dir, 'outside.json'); fs.copyFileSync(registry, outside);
+    const outsideBefore = fs.readFileSync(outside, 'utf8'), good = fs.readFileSync(registry, 'utf8');
+    fs.unlinkSync(registry); fs.linkSync(outside, registry);
+    failure(args(), 2, 'invalid-home'); fs.unlinkSync(registry); fs.writeFileSync(registry, good);
+    // Junctions are available without Windows symlink privileges; file symlinks may not be.
+    try {
+      fs.unlinkSync(registry); fs.symlinkSync(outside, registry, 'file');
+      failure(args(), 2, 'invalid-home');
+    } catch (error) { if (!WINDOWS || !['EPERM', 'EACCES'].includes(error.code)) throw error; }
+    finally { fs.rmSync(registry, { force: true }); fs.writeFileSync(registry, good); }
+    assert.equal(fs.readFileSync(outside, 'utf8'), outsideBefore);
+    const tasks = path.join(f.home, 'tasks'), savedTasks = path.join(f.home, 'tasks-saved');
+    fs.renameSync(tasks, savedTasks); fs.symlinkSync(savedTasks, tasks, WINDOWS ? 'junction' : 'dir');
+    failure(args(), 2, 'invalid-home'); fs.unlinkSync(tasks); fs.renameSync(savedTasks, tasks);
+    const alias = path.join(f.dir, 'home-alias'); fs.symlinkSync(f.home, alias, WINDOWS ? 'junction' : 'dir');
+    const aliasResult = call(args('per-project', alias)); assert.equal(aliasResult.code, 0); assert.equal(aliasResult.value.home, slash(fs.realpathSync(f.home)));
+    for (const verb of ['spawn', 'stop', 'finish', 'end']) assert.equal(crew([verb, ...(verb === 'end' ? [] : ['existing'])], { cwd: f.home }).code, 3);
+    assert.equal(crew(['config', 'worker-space', 'combined'], { cwd: f.home }).code, 3);
+    assert.equal(crew(['config', 'something-else', ...args()], { cwd: f.home }).code, 2);
+    assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
+    assert.match(crew(['config', 'worker-space'], { cwd: f.home }).out, /worker-space: combined/);
+    const lock = path.join(f.home, 'projects.lock'); fs.writeFileSync(lock, 'held');
+    failure(args(), 3, 'registry-busy'); assert.equal(fs.readFileSync(lock, 'utf8'), 'held'); fs.unlinkSync(lock);
+    // Fault injection wraps real main/fs only in disposable fixture processes.
+    for (const [label, patch, code, reason] of [
+      ['lock-io', "const original = fs.openSync; fs.openSync = (file, ...rest) => { if (String(file).endsWith('projects.lock')) throw Object.assign(Error('denied'), {code:'EACCES'}); return original(file, ...rest); };", 4, 'io-error'],
+      ['read-io', "const original = fs.readFileSync; fs.readFileSync = (file, ...rest) => { if (String(file).endsWith('crew.json')) throw Object.assign(Error('denied'), {code:'EACCES'}); return original(file, ...rest); };", 4, 'io-error'],
+      ['publish-io', "fs.renameSync = () => { throw Object.assign(Error('full'), {code:'ENOSPC'}); };", 4, 'io-error'],
+      ['publish-defect', "fs.renameSync = () => { throw TypeError('injected defect'); };", 70, 'internal-error'],
+      ['temp-collision', "const original = fs.openSync; fs.openSync = (file, ...rest) => { if (String(file).endsWith('.tmp')) { fs.writeFileSync(file, 'foreign'); throw Object.assign(Error('collision'), {code:'EEXIST'}); } return original(file, ...rest); };", 4, 'io-error'],
+    ]) {
+      const script = path.join(f.dir, `${label}.mjs`);
+      fs.writeFileSync(script, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}; ${patch} main(process.argv.slice(2));`);
+      failure(args(), code, reason, { script }); assert.ok(!fs.existsSync(lock));
+      const temps = fs.readdirSync(f.home).filter(n => n.endsWith('.tmp'));
+      if (label === 'temp-collision') {
+        assert.equal(temps.length, 1); assert.equal(fs.readFileSync(path.join(f.home, temps[0]), 'utf8'), 'foreign'); fs.unlinkSync(path.join(f.home, temps[0]));
+      } else assert.deepEqual(temps, []);
+      assert.ok(!fs.existsSync(path.join(ambient, 'state', 'crashes')));
+    }
+    for (const persistent of [false, true]) {
+      const script = path.join(f.dir, `sharing-${persistent}.mjs`), evidence = path.join(f.dir, `sharing-${persistent}.json`);
+      fs.writeFileSync(script, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const original = fs.renameSync, clock = Date.now, attempts = [];
+fs.renameSync = (from, to) => {
+  attempts.push({from, registry:fs.readFileSync(to, 'utf8'), temp:fs.readFileSync(from, 'utf8'), lock:fs.readFileSync(${JSON.stringify(lock)}, 'utf8')});
+  fs.writeFileSync(${JSON.stringify(evidence)}, JSON.stringify(attempts));
+  if (${persistent} || attempts.length < 4) {
+    if (${persistent} && attempts.length === 2) Date.now = () => clock() + 10000;
+    throw Object.assign(Error('sharing'), {code:['EPERM','EACCES','EBUSY'][(attempts.length - 1) % 3]});
+  }
+  return original(from, to);
+}; main(process.argv.slice(2));`);
+      const before = fs.readFileSync(registry, 'utf8'), r = call(args(), { script });
+      assert.equal(r.code, WINDOWS && !persistent ? 0 : 4);
+      if (r.code) { assert.equal(r.value.error.code, 'io-error'); assert.equal(fs.readFileSync(registry, 'utf8'), before); }
+      const attempts = JSON.parse(fs.readFileSync(evidence, 'utf8'));
+      assert.equal(attempts.length, WINDOWS ? persistent ? 2 : 4 : 1);
+      for (const attempt of attempts) {
+        assert.equal(attempt.registry, before); assert.equal(attempt.from, attempts[0].from);
+        assert.equal(attempt.temp, attempts[0].temp); assert.equal(attempt.lock, attempts[0].lock);
+        assert.ok(JSON.parse(attempt.lock).token);
+      }
+      assert.ok(!fs.existsSync(lock)); assert.ok(!fs.readdirSync(f.home).some(n => n.endsWith('.tmp')));
+      assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
+    }
+    // Old initialized layouts do not need coordinator/ or a migration.
+    const rules = path.join(f.home, 'coordinator'), savedRules = path.join(f.home, 'rules-saved');
+    fs.renameSync(rules, savedRules); success('per-project', true); fs.renameSync(savedRules, rules);
+    assert.equal(fs.readFileSync(path.join(ambient, 'crew.json'), 'utf8'), ambientBefore);
+    assert.ok(readWorld().log.length >= logBefore);
+  } finally { fs.writeFileSync(world, beforeWorld); }
+};
+
+gapTests['worker-space-local-ordering'] = async () => {
+  const beforeWorld = fs.readFileSync(world, 'utf8');
+  const localArgs = (home, mode) => ['config', 'worker-space', '--set-local', mode, '--home', home, '--json'];
+  const set = (f, mode) => {
+    const r = crew(localArgs(f.home, mode), { cwd: f.home }); assert.equal(r.code, 0, r.out);
+    const v = JSON.parse(r.out); assert.equal(v.ok, true); assert.equal(v.mode, mode);
+  };
+  try {
+    // Fake Core records launches without executing them. Availability checks must
+    // also use a fixture, never a pi installation on the developer's real PATH.
+    const agents = path.join(root, 'local-order-agents'); fs.mkdirSync(agents);
+    fs.writeFileSync(path.join(agents, WINDOWS ? 'pi.cmd' : 'pi'), 'fixture availability marker; never executed\n');
+    const env = { CREW_AGENT_PATH: agents, CREW_NO_QUOTA: '1' };
+    for (const phase of ['before', 'after']) {
+      const name = `local-order-${phase}`, f = gapFixture(name, env), gate = projectBarrier(f, phase);
+      const file = path.join(f.home, 'crew.json'), ownerBefore = fs.readFileSync(path.join(f.home, 'owner.json'), 'utf8');
+      const fullBefore = f.call(['status', '--json']).out, fleetBefore = f.call(['status', '--json', '--view', 'fleet']).out;
+      const coreBefore = structuredClone(readWorld().terminals);
+      set(f, 'per-project');
+      assert.equal(f.call(['status', '--json']).out, fullBefore, 'Mode adds no legacy JSON fields');
+      assert.equal(f.call(['status', '--json', '--view', 'fleet']).out, fleetBefore, 'Mode adds no fleet JSON fields');
+      const emptyStatus = f.call(['status']).out.split('\n');
+      assert.match(emptyStatus[1], /^worker-space: per-project \(new task admissions only; existing workers keep their placement\)$/);
+      assert.match(emptyStatus[2], /no unfinished tasks/);
+      set(f, 'combined');
+      const pending = projectProcess(f, ['spawn', 'race', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { script: gate.script, terminal: `owner-${name}`, env });
+      try {
+        await until(() => fs.existsSync(gate.ready));
+        if (phase === 'after') {
+          assert.equal(f.task('race').workerSpace.mode, 'combined');
+          assert.equal(f.task('race').state, 'preparing', 'Reservation exists before the setting changes');
+          assert.ok(!fs.existsSync(path.join(f.home, 'projects.lock')), 'Slow launch does not retain the registry lock');
+        }
+        set(f, 'per-project');
+        assert.equal(crew(['project', 'add', 'concurrent', f.repo], { cwd: f.home }).code, 0);
+        fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
+        const t = f.task('race'), expected = phase === 'before' ? 'per-project' : 'combined';
+        assert.equal(t.workerSpace.mode, expected); assert.equal(readWorld().terminals[t.terminal].labels['crew.space.mode'], expected);
+        const saved = structuredClone(t.workerSpace), terminals = structuredClone(readWorld().terminals);
+        assert.match(f.call(['status']).out, /worker-space: per-project/);
+        assert.deepEqual(readWorld().terminals, terminals, 'Status never relabels/moves a mixed population');
+        const next = f.spawn('later', ['--agent', 'pi']); assert.equal(next.workerSpace.mode, 'per-project');
+        assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).projects.concurrent);
+        const beforeRefusal = structuredClone(readWorld().terminals);
+        const unavailable = f.call(['relaunch', 'race', '--agent', 'pi', '--model', 'replacement'], { CREW_AGENT_PATH: path.join(f.dir, 'no-agents') });
+        assert.equal(unavailable.code, 8, unavailable.out); assert.match(unavailable.out, /pi is not installed on this machine/);
+        assert.equal(f.task('race').terminal, t.terminal); assert.deepEqual(f.task('race').workerSpace, saved);
+        assert.deepEqual(readWorld().terminals, beforeRefusal, 'Missing agent cannot stop the existing worker');
+        const relaunched = f.call(['relaunch', 'race', '--agent', 'pi', '--model', 'replacement']);
+        assert.equal(relaunched.code, 0, relaunched.out);
+        assert.deepEqual(f.task('race').workerSpace, saved); assert.equal(readWorld().terminals[f.task('race').terminal].labels['crew.space.mode'], expected);
+        const current = f.task('race'); fs.writeFileSync(current.report, 'Complete.');
+        assert.equal(crew(['done', 'race'], { cwd: f.home, terminal: current.terminal }).code, 0);
+        assert.equal(f.call(['review', 'race', '--agent', 'pi']).code, 0);
+        assert.deepEqual(f.task('race-review').workerSpace, saved);
+        const fleet = JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out);
+        for (const id of ['race', 'later', 'race-review']) {
+          assert.equal(fleet.tasks.find(task => task.id === id).project, f.task(id).project);
+          assert.equal(fleet.tasks.find(task => task.id === id).project, readWorld().terminals[f.task(id).terminal].labels['crew.space.project']);
+        }
+        assert.equal(fs.readFileSync(path.join(f.home, 'owner.json'), 'utf8'), ownerBefore);
+        for (const [address, terminal] of Object.entries(coreBefore)) assert.deepEqual(readWorld().terminals[address], terminal);
+      } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+    }
+    const f = gapFixture('local-stale'), file = path.join(f.home, 'crew.json'), gate = projectBarrier(f, 'before', 'local-stale');
+    const original = JSON.parse(fs.readFileSync(file, 'utf8')); fs.writeFileSync(file, JSON.stringify({ ...original, future: { kept: [1, 'yes'] } }));
+    const pending = projectProcess(f, localArgs(f.home, 'per-project'), { script: gate.script });
+    try {
+      await until(() => fs.existsSync(gate.ready));
+      assert.equal(crew(['project', 'add', 'new-project', f.repo], { cwd: f.home }).code, 0);
+      fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
+      const registry = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.equal(registry.workerSpaceMode, 'per-project'); assert.ok(registry.projects['new-project']); assert.ok(registry.projects.demo);
+      assert.deepEqual(registry.future, { kept: [1, 'yes'] }); assert.equal(registry.tag, original.tag);
+    } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+    // Revalidate after lock acquisition: neither malformed nor redirected registries are repaired.
+    for (const kind of ['corrupt', 'missing-tasks', 'linked-registry', 'replaced-directory']) {
+      const g = gapFixture(`local-recheck-${kind}`), barrier = projectBarrier(g, 'before');
+      const registry = path.join(g.home, 'crew.json'), before = fs.readFileSync(registry, 'utf8');
+      const writer = projectProcess(g, localArgs(g.home, 'per-project'), { script: barrier.script, cwd: g.dir });
+      let backup;
+      try {
+        await until(() => fs.existsSync(barrier.ready));
+        if (kind === 'corrupt') fs.writeFileSync(registry, '{broken');
+        if (kind === 'missing-tasks') fs.renameSync(path.join(g.home, 'tasks'), path.join(g.home, 'tasks-old'));
+        if (kind === 'linked-registry') {
+          backup = path.join(g.dir, 'outside.json'); fs.writeFileSync(backup, before); fs.unlinkSync(registry); fs.linkSync(backup, registry);
+        }
+        if (kind === 'replaced-directory') {
+          backup = `${g.home}-old`; fs.renameSync(g.home, backup); fs.mkdirSync(g.home);
+          fs.writeFileSync(registry, before); fs.mkdirSync(path.join(g.home, 'tasks'));
+        }
+        fs.writeFileSync(barrier.release, 'go'); const r = await writer.result; assert.equal(r.code, 2, r.out);
+        const v = JSON.parse(r.out); assert.equal(v.ok, false); assert.equal(v.mode, null);
+        assert.equal(v.error.code, kind === 'corrupt' ? 'invalid-registry' : kind === 'missing-tasks' ? 'home-not-initialized' : 'invalid-home');
+        assert.equal(fs.readFileSync(registry, 'utf8'), kind === 'corrupt' ? '{broken' : before);
+        assert.ok(!fs.existsSync(path.join(g.home, 'projects.lock')));
+        if (kind === 'linked-registry') assert.equal(fs.readFileSync(backup, 'utf8'), before);
+      } finally { fs.writeFileSync(barrier.release, 'go'); await writer.result; }
+    }
+  } finally { fs.writeFileSync(world, beforeWorld); }
 };
 
 gapTests['registry-sharing'] = async () => {
@@ -2412,10 +2696,11 @@ cp.spawnSync = (command,args,options) => {
 }; syncBuiltinESMExports();
 const {main} = await import(${JSON.stringify(new URL('./crew.mjs', import.meta.url).href)}); main(process.argv.slice(2));`);
   const legacy = args => crew(args, { cwd: f.home, terminal: reader, script: guard, env: { CREW_GH: f.fakeGh } });
+  const expectedText = mode => `home ${slash(f.home)} - owner ${owner} (live, you are read-only)\nworker-space: ${mode} (new task admissions only; existing workers keep their placement)\ndraft\tworking\tship/pi\tdemo\t-\t-\nscout\tworking\tscout/pi\tdemo\t-\t-`;
   let r = legacy(['status']); assert.equal(r.code, 0, r.out);
-  assert.equal(r.out.trim(), `home ${slash(f.home)} - owner ${owner} (live, you are read-only)\ndraft\tworking\tship/pi\tdemo\t-\t-\nscout\tworking\tscout/pi\tdemo\t-\t-`);
+  assert.equal(r.out.trim(), expectedText('combined'));
   r = legacy(['status', '--json']); assert.equal(r.code, 0, r.out);
-  const original = JSON.parse(r.out);
+  const originalBytes = r.out, original = JSON.parse(r.out);
   assert.deepEqual(Object.keys(original), ['home', 'owner', 'tasks', 'copiesToReturn']);
   assert.deepEqual(original.owner, { terminal: owner, live: true, mine: false });
   assert.deepEqual(original.tasks.map(t => t.id), ['draft', 'scout']);
@@ -2436,6 +2721,11 @@ const {main} = await import(${JSON.stringify(new URL('./crew.mjs', import.meta.u
   assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 2, 'only the unrecorded ship has repo/head requests');
   assert.deepEqual(variants.map(a => legacy(a).out), beforeFacts, 'all legacy forms remain byte-identical after observation caching');
   assert.equal(f.call(['status', '--all', '--json', '--discover-prs'], reader).out, enhancedBytes, 'discovery output remains byte-identical too');
+  const changed = crew(['config', 'worker-space', '--set-local', 'per-project', '--home', f.home, '--json'], { cwd: f.home });
+  assert.equal(changed.code, 0, changed.out);
+  assert.equal(legacy(['status']).out.trim(), expectedText('per-project'));
+  assert.equal(legacy(['status', '--json']).out, originalBytes, 'Mode changes only plain status, not legacy JSON bytes');
+  assert.equal(f.call(['status', '--all', '--json', '--discover-prs'], reader).out, enhancedBytes, 'Mode cannot change discovery JSON bytes');
 };
 
 // Snapshot all authority/prose/Git bytes. Only the separate PR observation is
@@ -2635,7 +2925,8 @@ gapTests['fleet-view'] = () => {
   assert.deepEqual(Object.keys(fleet), ['home', 'owner', 'tasks', 'prDiscovery', 'view']);
   assert.deepEqual(fleet.view, { name: 'fleet', version: 1 }); assert.deepEqual(fleet.prDiscovery, { version: 1 }); assert.equal(fleet.owner, null);
   for (const t of fleet.tasks) {
-    assert.deepEqual(Object.keys(t), ['id', 'state', 'terminal', 'pr', 'prDiscovery']);
+    assert.deepEqual(Object.keys(t), ['id', 'state', 'project', 'terminal', 'pr', 'prDiscovery']);
+    assert.equal(t.project, 'demo');
     assert.deepEqual(Object.keys(t.prDiscovery), ['status', 'url', 'source', 'reason']);
     assert.ok(!omitted.includes(t.id));
   }
@@ -2647,6 +2938,7 @@ gapTests['fleet-view'] = () => {
   assert.deepEqual(JSON.parse(fs.readFileSync(f.log)), [], 'offline fleet performs no GitHub reads');
   r = call([...args, '--discover-prs']); assert.equal(r.code, 0, r.out);
   const discovered = JSON.parse(r.out); assert.deepEqual(discovered.view, fleet.view);
+  for (const task of discovered.tasks) assert.equal(task.project, 'demo');
   assert.deepEqual(discovered.tasks.find(t => t.id === 'draft').prDiscovery,
     { status: 'known', url, source: 'github', reason: null }, 'Herdr consumes the unchanged complete discovery v1 shape');
   assert.equal(discovered.tasks.find(t => t.id === 'saved-only').prDiscovery.url, url, 'copy return cannot hide a saved PR');
@@ -2667,6 +2959,46 @@ gapTests['fleet-view'] = () => {
   }
   r = call(['status', '--all', '--json']); assert.equal(r.code, 0, r.out);
   assert.equal(JSON.parse(r.out).tasks.length, samples.length + 1, 'legacy --all still includes every historical task');
+};
+
+gapTests['fleet-project'] = () => {
+  const f = prDiscoveryFixture('fleet-project'), args = ['status', '--json', '--view', 'fleet'];
+  const samples = [
+    { id: 'combined-dot', project: '.xrbuild', workerSpace: { mode: 'combined', project: '.xrbuild' } },
+    { id: 'project-domain', project: 'agentnumberone.dev', workerSpace: { mode: 'per-project', project: 'agentnumberone.dev' } },
+    { id: 'repair-shared', project: 'crew:self', selfFix: true, workerSpace: { mode: 'per-project', project: 'crew' } },
+    { id: 'repair-internal', project: 'crew:self', selfFix: true, workerSpace: { mode: 'per-project', project: 'crew:self' } },
+    { id: 'retained', project: 'removed.registration', state: 'closed', worktree: path.join(f.dir, 'gone'), pr: 'https://github.com/acme/demo/pull/13' },
+    ...[undefined, null, '', false, 42, {}].map((project, i) => ({ id: `unknown-${i}`, project, terminal: null, workerSpace: { project: 'do-not-infer' } })),
+  ];
+  for (const sample of samples) f.save({ ...f.task, ...sample, created: 'invalid' });
+  const files = samples.map(t => path.join(f.home, 'tasks', t.id, 'task.json'));
+  const before = files.map(file => fs.readFileSync(file, 'utf8'));
+  const full = JSON.parse(f.call(['status', '--all', '--json']).out);
+  const core = fs.readFileSync(world, 'utf8'), github = fs.readFileSync(f.log, 'utf8');
+  const call = () => { const r = f.call(args); assert.equal(r.code, 0, r.out); return r; };
+  const cold = call(), fleet = JSON.parse(cold.out);
+  assert.deepEqual(Object.keys(fleet), ['home', 'owner', 'tasks', 'prDiscovery', 'view']);
+  assert.deepEqual(fleet.view, { name: 'fleet', version: 1 });
+  for (const sample of samples) {
+    const task = fleet.tasks.find(t => t.id === sample.id), original = full.tasks.find(t => t.id === sample.id);
+    assert.deepEqual(Object.keys(task), ['id', 'state', 'project', 'terminal', 'pr', 'prDiscovery']);
+    assert.equal(task.project, typeof sample.project === 'string' && sample.project ? sample.project : null);
+    if (typeof sample.project === 'string' && sample.project) assert.equal(task.project, original.project);
+    assert.equal(task.state, original.state); assert.equal(task.terminal, original.terminal ?? null); assert.equal(task.pr, original.pr);
+  }
+  assert.equal(call().out, cold.out, 'Warm index preserves exact fleet bytes including project');
+  assert.equal(fs.readFileSync(world, 'utf8'), core, 'Project projection adds no Core probes');
+  assert.equal(fs.readFileSync(f.log, 'utf8'), github, 'Project projection adds no GitHub calls');
+  for (const [i, file] of files.entries()) assert.equal(fs.readFileSync(file, 'utf8'), before[i], 'Project reads never rewrite task authority');
+  f.save({ ...f.task, ...samples[0], project: '.changed', created: 'invalid' });
+  let changed = call().out;
+  assert.equal(JSON.parse(changed).tasks.find(t => t.id === samples[0].id).project, '.changed', 'Changed source invalidates cached project');
+  f.save({ ...f.task, ...samples[0], project: undefined, created: 'invalid' });
+  changed = call().out;
+  assert.equal(JSON.parse(changed).tasks.find(t => t.id === samples[0].id).project, null, 'Removed source project cannot survive in the cache');
+  const index = path.join(f.home, 'state', 'status-fleet-index.json');
+  fs.writeFileSync(index, '{broken'); assert.equal(call().out, changed, 'Rebuilt index preserves null evidence and every other field');
 };
 
 gapTests['fleet-scale'] = () => {
@@ -2761,7 +3093,34 @@ console.log(JSON.stringify({providers:providers.map(provider=>({provider,quotaSe
   const quotaReads = () => fs.readFileSync(quotaLog, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
   const finishResult = id => path.join(dir, `${id}.finish.json`), finishScript = path.join(dir, 'finish.mjs');
   fs.writeFileSync(finishScript, `import fs from 'node:fs'; import path from 'node:path'; import {main} from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const barrier=process.env.CREW_TEST_FINISH_BARRIER, taskFile=path.join(${JSON.stringify(f.home)},'tasks',process.argv[2],'task.json'), rename=fs.renameSync;let paused=false;
+fs.renameSync=(from,to)=>{
+  if(barrier && !paused && to===taskFile && JSON.parse(fs.readFileSync(from,'utf8')).state==='closed'){
+    paused=true;fs.writeFileSync(barrier+'.ready','ready');const deadline=Date.now()+15000;
+    while(!fs.existsSync(barrier+'.go')){if(Date.now()>deadline)throw Error('finish publication barrier timed out');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);}
+  }
+  return rename(from,to);
+};
 main(['finish',process.argv[2]]); const file=path.join(${JSON.stringify(dir)},process.argv[2]+'.finish.json');fs.writeFileSync(file+'.tmp',JSON.stringify({code:process.exitCode??0}));fs.renameSync(file+'.tmp',file);`);
+  // Prewarm expensive copy/Core checks before a bounded API request, then publish
+  // closure during that request. This tests the race, not local process speed.
+  const cancelStart = path.join(dir, 'cancel-start.mjs');
+  fs.writeFileSync(cancelStart, `import fs from 'node:fs';import cp from 'node:child_process';import {syncBuiltinESMExports} from 'node:module';
+const original=cp.spawnSync;
+cp.spawnSync=(command,args,options)=>{
+  if(command===process.execPath && args[0]===${JSON.stringify(fakeGh)}){
+    const s=JSON.parse(fs.readFileSync(${JSON.stringify(state)},'utf8')), endpoint=args.find(a=>a.startsWith('repos/'));
+    const suffix={variables:'/actions/variables',manifest:'/contents/labels/base.json',labels:'/issues/42/labels',definition:'/labels/'+encodeURIComponent(${JSON.stringify(under)})}[s.duringAt];
+    const record=${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json';let task;try{task=JSON.parse(fs.readFileSync(record,'utf8'))}catch{}
+    if(s.duringFinish && task?.state==='working' && endpoint?.endsWith(suffix)){
+      const barrier=${JSON.stringify(dir)}+'/'+task.id+'.finish-barrier';
+      const child=cp.spawn(process.execPath,[${JSON.stringify(finishScript)},task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TEST_FINISH_BARRIER:barrier},stdio:'ignore',detached:true});child.unref();
+      const deadline=Date.now()+15000;while(!fs.existsSync(barrier+'.ready')){if(Date.now()>deadline)throw Error('finish did not reach publication barrier');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);}
+      if(JSON.parse(fs.readFileSync(record,'utf8')).state!=='working')throw Error('closure happened before the API request');
+    }
+  }
+  return original(command,args,options);
+};syncBuiltinESMExports();const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));`);
   fs.writeFileSync(fakeGh, `import fs from 'node:fs'; import {spawn,spawnSync} from 'node:child_process';
 const a=process.argv.slice(2), file=${JSON.stringify(state)}, s=JSON.parse(fs.readFileSync(file,'utf8')), log=${JSON.stringify(log)};
 let task; try { task=JSON.parse(fs.readFileSync(${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json','utf8')); } catch {}
@@ -2778,7 +3137,9 @@ if((s.duringVerdict || s.duringFinish) && task?.state==='working' && endpoint.en
   if(finish) {
     // Wait only for the real lifecycle publication, not full copy/label cleanup
     // inside this API's two-second budget. The test awaits completion separately.
-    const child=spawn(process.execPath,[${JSON.stringify(finishScript)},task.id],{cwd:${JSON.stringify(f.home)},env:process.env,stdio:'ignore',detached:true});child.unref();
+    const barrier=${JSON.stringify(dir)}+'/'+task.id+'.finish-barrier';
+    if(fs.existsSync(barrier+'.ready'))fs.writeFileSync(barrier+'.go','go');
+    else {const child=spawn(process.execPath,[${JSON.stringify(finishScript)},task.id],{cwd:${JSON.stringify(f.home)},env:process.env,stdio:'ignore',detached:true});child.unref();}
     const record=${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+task.id+'/task.json', deadline=Date.now()+1500;
     while(true){let closed=false;try{closed=JSON.parse(fs.readFileSync(record)).state==='closed'}catch{}
       if(closed)break;if(Date.now()>deadline)fail('finish did not publish closure');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);}
@@ -2817,11 +3178,11 @@ else fail('unexpected fake request');`);
   const headRead = (c, i) => c.saved === undefined && starts.some(([from, to]) => i >= from && i < to);
   const calls = () => allCalls().filter((c, i) => !headRead(c, i)), headReads = () => allCalls().filter(headRead);
   const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim(), branch: t.branch }); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
-  const start = (id = 'ship', suffix = '') => { const review = `${id}-review${suffix}`; control({ watch: review }); const from = allCalls().length, r = f.call(['review', id, '--agent', 'pi']); starts.push([from, allCalls().length]); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
+  const start = (id = 'ship', suffix = '', script) => { const review = `${id}-review${suffix}`; control({ watch: review }); const from = allCalls().length, r = f.call(['review', id, '--agent', 'pi'], {}, script); starts.push([from, allCalls().length]); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
   const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
   const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
   const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
-  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, headReads, parent, start, done, writes, warnings, quotaReads, finishResult };
+  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, headReads, parent, start, done, writes, warnings, quotaReads, finishResult, cancelStart };
 }
 function reviewRemote(f, task) {
   const remote = path.join(f.dir, 'remote.git');
@@ -2939,7 +3300,10 @@ gapTests['terminal-review-status'] = () => {
   for (const id of [reviewer.id, scout.id]) { assert.equal(row(id).reviewRound, null); assert.equal(row(id).lastFinding, null); }
   assert.ok(!readWorld().log.slice(before).some(a => a[0] === 'label'));
   const fleet = f.call(['status', '--json', '--view', 'fleet']); assert.equal(fleet.code, 0, fleet.out);
-  for (const t of JSON.parse(fleet.out).tasks) assert.deepEqual(Object.keys(t), ['id', 'state', 'terminal', 'pr', 'prDiscovery']);
+  for (const t of JSON.parse(fleet.out).tasks) {
+    assert.deepEqual(Object.keys(t), ['id', 'state', 'project', 'terminal', 'pr', 'prDiscovery']);
+    assert.equal(t.project, row(t.id).project, 'Fleet keeps task identity without adding ordinary-status review context');
+  }
 };
 gapTests['terminal-pr-discovery'] = () => {
   for (const fleet of [false, true]) {
@@ -3161,7 +3525,7 @@ gapTests['review-label-cancel-start'] = async () => {
   const f = reviewLabelsFixture('cancel-start');
   for (const duringAt of ['variables', 'manifest', 'labels', 'definition']) {
     f.parent(duringAt); f.control({ labels: ['unrelated', f.changes], duringFinish: true, duringAt });
-    const { task, result } = f.start(duringAt);
+    const { task, result } = f.start(duringAt, '', f.cancelStart);
     await until(() => fs.existsSync(f.finishResult(task.id)));
     assert.equal(JSON.parse(fs.readFileSync(f.finishResult(task.id))).code, 0, 'Real finish must complete successfully');
     assert.equal(f.warnings(result).length, 0, result.out);
@@ -4521,6 +4885,9 @@ if (a[0] === '--version') process.exit(0);`);
     assert.match(q.out, /relaunched cfg: a1 openai-codex\/gpt-x in terminal/); assert.equal(task2('cfg').agent, 'a1'); assert.ok(lastRun().includes('had to stop: quota is back'), lastRun());
 
     // Recovery uses Core send, not tell: its limits and history survive another wait.
+    // Earlier dispatch calls are irrelevant here; do not rewrite their large
+    // launch commands on every recovery observation in this state-machine test.
+    const recoveryWorld = readWorld(); recoveryWorld.log = []; fs.writeFileSync(world, JSON.stringify(recoveryWorld));
     const recovering = (id, terminalPatch = {}, taskPatch = {}) => {
       const dir = path.join(home2, 'tasks', id), address = `recover-${id}`;
       fs.mkdirSync(dir);
@@ -4535,13 +4902,15 @@ if (a[0] === '--version') process.exit(0);`);
       return task;
     };
     const sendsTo = address => readWorld().log.filter(a => a[0] === 'send' && a[1] === address);
-    const quickWait = (id, more = {}, args = [], terminal = 'k1', timeout = '4') => crew2(['wait', id, '--timeout', timeout, ...args], terminal, { CREW_RECOVERY_SECONDS: '0', ...more });
+    // This is a bounded watchdog for reaching the asserted state, not a speed
+    // requirement. Keep explicit short-timeout cases and all delay/count checks.
+    const quickWait = (id, more = {}, args = [], terminal = 'k1', timeout = '20') => crew2(['wait', id, '--timeout', timeout, ...args], terminal, { CREW_RECOVERY_SECONDS: '0', ...more });
     const errorState = { status: { state: 'error', app: 'a1' } }, workingState = { status: { state: 'working', app: 'a1' } };
     {
       const task = recovering('error-once', { steps: [errorState, workingState] });
       // The assertion depends on two Core subprocess observations, not on speed.
       // Shared Windows runners can spend most of 0.6 seconds just starting them.
-      q = quickWait(task.id); assert.equal(q.code, 124, q.out);
+      q = quickWait(task.id, {}, [], 'k1', '4'); assert.equal(q.code, 124, q.out);
       assert.equal(sendsTo(task.terminal).length, 0, 'One error observation is not a stop');
       const observed = readWorld().log.filter(a => a[0] === 'get' && a.at(-1) === task.terminal);
       assert.ok(observed.length >= 2, 'Both the error and working state were observed');
@@ -4568,7 +4937,7 @@ if (a[0] === '--version') process.exit(0);`);
         chain: [{ harness: 'a1', model: 'openai-codex/gpt-x' }],
         candidates: [{ harness: 'a1' }, { harness: 'a1', model: 'github-copilot/gpt-x' }, { harness: 'a1', model: 'openai-codex/gpt-x' }],
       });
-      q = quickWait(task.id, {}, [], 'k1', '2'); assert.equal(q.code, 124, q.out);
+      q = quickWait(task.id, {}, [], 'k1', '20'); assert.equal(q.code, 124, q.out);
       const moved = task2(task.id);
       assert.notEqual(moved.terminal, task.terminal, q.out); assert.equal(sendsTo(task.terminal).length, 3);
       assert.equal(moved.fallbacks.at(-1).why, lastError);
@@ -4639,7 +5008,7 @@ if (a[0] === '--version') process.exit(0);`);
     }
     {
       const task = recovering('idle-resumes', { status: { state: 'idle', app: 'a1' }, onSends: [workingState] });
-      q = quickWait(task.id, {}, [], 'k1', '0.5'); assert.equal(q.code, 124, q.out);
+      q = quickWait(task.id, {}, [], 'k1', '4'); assert.equal(q.code, 124, q.out);
       assert.equal(sendsTo(task.terminal).length, 1); assert.equal(task2(task.id).state, 'working');
     }
     {

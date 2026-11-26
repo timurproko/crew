@@ -57,6 +57,8 @@ crew project add <name> <git folder> [--gate-skip <steps>|none] [--workflow deli
 crew project remove <name>               forget a project with no unfinished tasks
 crew start | crew end                    take or release the home for this session
 crew config worker-space [combined|per-project]   show/change new-task space grouping (default combined)
+crew config worker-space --capabilities --json   discover local worker-space-only setter v1
+crew config worker-space --set-local <mode> --home <absolute-home> --json   set only this preference without terminal ownership
 crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
     who: [--agent a1|pi|claude] [--model <id>] [--effort <level>] [--account <claude account>] [--rule <n>] [--no-fallback]
 crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   candidates and quota now, next choice marked
@@ -154,6 +156,20 @@ never steals a lock based on its age or a guessed-dead PID. Registry format stay
 `crew config worker-space per-project` or `crew config worker-space combined`. It is stored
 as `workerSpaceMode` in the home's `crew.json`; absent means **combined**, today's shared
 worker space. No hand editing or session restart is needed.
+
+For same-user desktop callers, `crew config worker-space --capabilities --json` advertises
+`worker-space-local-set` version 1. After a successful probe, use
+`crew config worker-space --set-local per-project --home "C:/Users/me/.crew" --json`
+(or `combined`) to change only this preference in that explicit existing initialized home,
+including while another coordinator owns it or it is unowned. No terminal identity, Core
+query, start/end or takeover is needed or permitted by this interface. Registry transactions
+and all other ownership guards remain intact; missing/invalid homes refuse without creation.
+See the [JSON, exit-code and home-validation contract](docs/worker-spaces.md#desktoplocal-setter-contract-version-1).
+Plain `crew status` shows the effective mode for new admissions without sending a terminal
+message or restarting the coordinator; changing the setting does not alter full or fleet JSON.
+The fleet view independently adds the recorded task project described below.
+Each local call confirms one home only; Herdr owns cross-machine preference application
+and must keep unsupported, offline and refused homes distinct from successful ones.
 
 A change applies to **new independent task admissions** only. Existing workers never move,
 relabel or reshuffle; reviews, relaunches and automatic hand-overs inherit their task's
@@ -638,13 +654,21 @@ For a polling fleet reader use `crew status --json --view fleet`, optionally wit
   "home": "C:/Users/me/.crew",
   "owner": { "terminal": "t1", "live": true },
   "tasks": [{
-    "id": "ship", "state": "working", "terminal": "t2", "pr": null,
+    "id": "ship", "state": "working", "project": "demo", "terminal": "t2", "pr": null,
     "prDiscovery": { "status": "unavailable", "url": null, "source": null, "reason": "not-requested" }
   }],
   "prDiscovery": { "version": 1 },
   "view": { "name": "fleet", "version": 1 }
 }
 ```
+
+`tasks[].project` is an additive version-1 field: the exact recorded task project, as in
+full status, or null if absent/unusable. Dotted names keep their spelling. Internal repairs
+remain `crew:self`, even when their verified placement label uses the registered `crew`
+alias. Historical task identity does not depend on the registration still existing. No
+project is inferred from labels, cwd or headings. Older Crew may omit the field; clients
+requiring project evidence must check its value, not assume view version 1 guarantees it.
+Existing consumers may ignore this addition; all other fleet fields and behavior stay intact.
 
 Every non-closed task is included. A closed task is included only with a recorded or
 verified discovered PR. Open and unknown-state PRs stay visible however old the task is;

@@ -144,9 +144,24 @@ unbounded parallel queries or retries to fill gaps.
 `crew status --json --view fleet [--discover-prs]` uses the same version-1 discovery
 objects but a separate exact projection. Root keys are `home`, `owner`, `tasks`,
 `prDiscovery` (`{"version":1}`), and `view` (`{"name":"fleet","version":1}`). Owner is
-null or exactly `terminal`/`live`; tasks contain exactly `id`, `state`, `terminal`, `pr`
-and `prDiscovery`. Missing terminal and recorded PR values are null. No launch, standby,
+null or exactly `terminal`/`live`; tasks contain exactly `id`, `state`, `project`, `terminal`,
+`pr` and `prDiscovery`. Missing terminal and recorded PR values are null. No launch, standby,
 fallback, core, recovery, error, elapsed, report or copy-return details are emitted.
+
+`tasks[].project` is a backward-compatible additive field within fleet version 1. It is the
+exact nonempty recorded task project (the same identity as full status), or null for absent,
+empty or non-string evidence. No registry lookup or label/cwd/title inference fills a gap.
+Dotted names such as `.xrbuild` and `agentnumberone.dev` are preserved; historical task
+identity remains even if its registration/copy is gone. Internal repair tasks remain
+`crew:self`, including when a verified shared placement uses `crew.space.project=crew`.
+That is the existing placement alias, not a task-project rewrite.
+
+The metadata-validated fleet summary already retains project, so cold/warm reads, source
+updates and index rebuilds need no schema migration or extra Core/network request. Older
+Crew may omit project; consumers needing authoritative project evidence must check the
+actual field/value rather than rely on the unchanged view version. Old clients can ignore
+the added field. All other fields, markers, retention and discovery semantics are unchanged.
+The worker-space setter does not change this response shape when the preference changes.
 
 Every state except `closed` is retained. A closed task needs a recorded or verified
 saved/current discovered PR. Its age is irrelevant: open and unknown PR states stay;
