@@ -19,7 +19,7 @@ The maintainer integration decision accepts these scenarios:
   "archive": "openspec/changes/archive/2026-11-26-review-before-ci/",
   "acceptanceManifest": "openspec/changes/archive/2026-11-26-review-before-ci/acceptance.md",
   "finalizedDate": "2026-11-26",
-  "specBaseSha": "9cb78251288978fb0a300884aea1894b013071d4",
+  "specBaseSha": "73ee0136ca1d76c15efaf31ffa1520c7528efbf0",
   "acceptanceScenarios": [
     "Covered delivery finalization and clean base merges preserve approval; new work gets delta review and replaced history gets full review.",
     "Premature review exits 6; ship wait reports readiness, sends one failed-check repair message and escalates another failure.",
@@ -29,7 +29,7 @@ The maintainer integration decision accepts these scenarios:
     "Approved is immediate and independent of CI; stable manifest roles preserve opt-out, aliases, unrelated labels and closed-PR safeguards."
   ],
   "archiveDigest": "adb8961a47a20cdcd670e5d84861f464474ead1a616bfb0c055ee7c9165c73a7",
-  "specDigest": "b0e3cdb180cb6124fe129c0f5d1fb73d9a63d04086ce70913010870182d9f967",
+  "specDigest": "b6d476339efc7cab635518c0dd39c61da0567e4320167a405bae2442472ead67",
   "tasksDigest": "8e6acadb6fb38279ecc6fa05fa069049ece8dd14f6d26460cbc33d7d3aefcfe2",
   "evidenceDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "knownGaps": []
