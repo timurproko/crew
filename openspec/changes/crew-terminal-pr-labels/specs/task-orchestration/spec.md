@@ -102,7 +102,7 @@ Crew SHALL bound terminal-metadata writes and never fail an otherwise successful
 
 ### Requirement: Discovery is bounded and read-only for every caller
 
-Crew SHALL allow non-owner discovery without changing ownership, reports, delivery authority or Git state; only separate verified PR facts may be saved, with best-effort publication of their URL to the task's recorded terminal. GitHub reads SHALL be serial, bounded in size, limited to two seconds each and ten seconds total, without retries. Failures SHALL return per-task unavailable reasons without failing valid status requests. Non-ships without recorded PRs SHALL return none without remote reads.
+Crew SHALL allow non-owner discovery without changing ownership, reports, delivery authority or Git state; only separate verified PR facts may be saved, with best-effort URL publication to the task's recorded terminal. GitHub reads SHALL be serial, bounded in size, limited to two seconds each and ten seconds total, without retries. Failures SHALL return per-task unavailable reasons without failing valid status requests. Non-ships without recorded PRs SHALL return none without remote reads.
 
 #### Scenario: Non-owner inspects an active home
 
@@ -126,7 +126,7 @@ Crew SHALL allow non-owner discovery without changing ownership, reports, delive
 
 ### Requirement: Minimal review labels have explicit lifecycle limitations
 
-Crew SHALL use only Build, Review and Approved roles, with names from the shared manifest, and no approval-waiting-for-CI state. Tell, relaunch, verdict processing and plain land SHALL update relevant open-PR roles best-effort; status and reported-task wait SHALL remain read-only toward GitHub labels. No background sweep, lease or pending-label protocol SHALL be added. Abandoned reviews SHALL retain existing last-local-reviewer restoration safeguards. Closed/merged PRs SHALL receive no new role assignments.
+Crew SHALL use only Build, Review and Approved roles, with names from the shared manifest, and no approval-waiting-for-CI state. Tell, relaunch, verdicts and plain land SHALL update relevant open-PR roles best-effort; status and reported-task wait SHALL remain read-only toward GitHub labels. No background sweep, lease or pending-label protocol SHALL be added. Abandoned reviews SHALL retain last-local-reviewer restoration safeguards. Closed/merged PRs SHALL receive no new role assignments.
 
 #### Scenario: Reviewer stops without a valid verdict
 
