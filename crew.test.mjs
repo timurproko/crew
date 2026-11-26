@@ -1082,8 +1082,13 @@ gapTests['worker-space-local-ordering'] = async () => {
     const v = JSON.parse(r.out); assert.equal(v.ok, true); assert.equal(v.mode, mode);
   };
   try {
+    // Fake Core records launches without executing them. Availability checks must
+    // also use a fixture, never a pi installation on the developer's real PATH.
+    const agents = path.join(root, 'local-order-agents'); fs.mkdirSync(agents);
+    fs.writeFileSync(path.join(agents, WINDOWS ? 'pi.cmd' : 'pi'), 'fixture availability marker; never executed\n');
+    const env = { CREW_AGENT_PATH: agents, CREW_NO_QUOTA: '1' };
     for (const phase of ['before', 'after']) {
-      const name = `local-order-${phase}`, f = gapFixture(name), gate = projectBarrier(f, phase);
+      const name = `local-order-${phase}`, f = gapFixture(name, env), gate = projectBarrier(f, phase);
       const file = path.join(f.home, 'crew.json'), ownerBefore = fs.readFileSync(path.join(f.home, 'owner.json'), 'utf8');
       const fullBefore = f.call(['status', '--json']).out, fleetBefore = f.call(['status', '--json', '--view', 'fleet']).out;
       const coreBefore = structuredClone(readWorld().terminals);
@@ -1094,7 +1099,7 @@ gapTests['worker-space-local-ordering'] = async () => {
       assert.match(emptyStatus[1], /^worker-space: per-project \(new task admissions only; existing workers keep their placement\)$/);
       assert.match(emptyStatus[2], /no unfinished tasks/);
       set(f, 'combined');
-      const pending = projectProcess(f, ['spawn', 'race', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { script: gate.script, terminal: `owner-${name}` });
+      const pending = projectProcess(f, ['spawn', 'race', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { script: gate.script, terminal: `owner-${name}`, env });
       try {
         await until(() => fs.existsSync(gate.ready));
         if (phase === 'after') {
@@ -1112,7 +1117,13 @@ gapTests['worker-space-local-ordering'] = async () => {
         assert.deepEqual(readWorld().terminals, terminals, 'Status never relabels/moves a mixed population');
         const next = f.spawn('later', ['--agent', 'pi']); assert.equal(next.workerSpace.mode, 'per-project');
         assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).projects.concurrent);
-        assert.equal(f.call(['relaunch', 'race', '--agent', 'pi', '--model', 'replacement']).code, 0);
+        const beforeRefusal = structuredClone(readWorld().terminals);
+        const unavailable = f.call(['relaunch', 'race', '--agent', 'pi', '--model', 'replacement'], { CREW_AGENT_PATH: path.join(f.dir, 'no-agents') });
+        assert.equal(unavailable.code, 8, unavailable.out); assert.match(unavailable.out, /pi is not installed on this machine/);
+        assert.equal(f.task('race').terminal, t.terminal); assert.deepEqual(f.task('race').workerSpace, saved);
+        assert.deepEqual(readWorld().terminals, beforeRefusal, 'Missing agent cannot stop the existing worker');
+        const relaunched = f.call(['relaunch', 'race', '--agent', 'pi', '--model', 'replacement']);
+        assert.equal(relaunched.code, 0, relaunched.out);
         assert.deepEqual(f.task('race').workerSpace, saved); assert.equal(readWorld().terminals[f.task('race').terminal].labels['crew.space.mode'], expected);
         const current = f.task('race'); fs.writeFileSync(current.report, 'Complete.');
         assert.equal(crew(['done', 'race'], { cwd: f.home, terminal: current.terminal }).code, 0);

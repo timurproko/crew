@@ -266,9 +266,11 @@ sentinels, no-op writes, metadata preservation, unchanged orchestration guards, 
 exclusive temporary publication, Windows sharing retries, plain status/unchanged JSON,
 concurrent registration and before/after-reservation spawn/review/relaunch placement.
 They use isolated user/home paths and fake Core; deterministic filesystem barriers and
-fault injection exist only in fixture processes, not production hooks. Windows file-symlink
-coverage is skipped only if OS privileges deny creation; hard-link and junction coverage
-still runs. These are CLI/ordering proofs, not native Herdr rendering or fleet transport evidence.
+fault injection exist only in fixture processes, not production hooks. The ordering fixture
+supplies its own agent-availability marker, so it runs without Pi installed; a missing-agent
+relaunch must still refuse without stopping the current worker or changing its placement.
+Windows file-symlink coverage is skipped only if OS privileges deny creation; hard-link and
+junction coverage still runs. These are CLI/ordering proofs, not native Herdr rendering or fleet transport evidence.
 
 ## Named limits
 
