@@ -13,6 +13,6 @@
 
 ## 3. Inherited workers and mode rollback retain their task spaces
 
-- [ ] 3.1 Keep reviews, manual relaunches and automatic hand-overs bound to saved placement, including combined joins admitted under per-project policy; targeted inheritance cases assert original terminals stay untouched across both setting switches.
-- [ ] 3.2 Cover a later inherited other-project worker, historically mixed combined occupancy and unconditional combined rollback for new tasks; update switching examples and explicit inheritance exceptions in README.md and docs/worker-spaces.md.
-- [ ] 3.3 Run node crew.test.mjs --gaps=join-project-space, node crew.test.mjs --gaps=worker-spaces and node crew.test.mjs --gaps=worker-space-local-ordering in isolated homes, and openspec validate join-project-space --strict; record exact results without running the full local suite or touching the live coordinator.
+- [x] 3.1 Keep reviews, manual relaunches and automatic hand-overs bound to saved placement, including combined joins admitted under per-project policy; targeted inheritance cases assert original terminals stay untouched across both setting switches.
+- [x] 3.2 Cover a later inherited other-project worker, historically mixed combined occupancy and unconditional combined rollback for new tasks; update switching examples and explicit inheritance exceptions in README.md and docs/worker-spaces.md.
+- [x] 3.3 Run node crew.test.mjs --gaps=join-project-space, node crew.test.mjs --gaps=worker-spaces and node crew.test.mjs --gaps=worker-space-local-ordering in isolated homes, and openspec validate join-project-space --strict; record exact results without running the full local suite or touching the live coordinator.

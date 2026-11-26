@@ -1669,6 +1669,10 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   const deadline = Date.now() + 10000, pendingDeadline = Date.now() + 2000;
   for (;;) {
     h.config = readRegistry(h.dir);
+    if (extra.selfFix && h.config.workerSpaceMode === 'per-project'
+        && (registeredProject(h, 'crew')?.path ?? null) !== repairPlacement.path) {
+      refuse('The crew registration changed during repair admission; retry. No task or terminal was created.');
+    }
     const independent = !Object.hasOwn(record, 'workerSpace');
     const snapshot = independent && h.config.workerSpaceMode === 'per-project' ? workerSpaceSnapshot(h) : null;
     let reserved = false;

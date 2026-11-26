@@ -17,7 +17,7 @@ No restart is needed. The change affects **new independent tasks**, not existing
 | Combined to per-project, with A workers still combined | A new independent A task joins combined if its live unfinished workers are exclusively A; mixed combined is skipped and old workers never move. |
 | Per-project to combined, with A's project space still occupied | New A tasks and tasks for projects without a space all request combined. |
 | Review, relaunch or automatic hand-over | Inherit their source task's space, regardless of the current setting. |
-| Switch back to a previous mode | Reuse its matching space ID if still present; do not move workers from the other layout. |
+| Switch back to a previous mode | Combined always selects its fixed ID; per-project re-evaluates live exclusive occupancy, without moving workers from the other layout. |
 | End then start, possibly with another coordinator | Mode persists; older tasks retain placement; changing mode affects only later independent admissions. |
 
 The ordering point is the registry-locked **task reservation**, before worktree allocation
@@ -214,6 +214,14 @@ and constructs the expected identity; bindFleet checks the current task's live t
 native same-machine membership, crew.task/home and herdr.space. Neither title nor project
 resemblance grants child binding. A per-project label tuple inside combined is invalid. Combined
 children normalize their project/name internally so legitimate per-task project labels can differ.
+
+Review, relaunch and automatic hand-over never re-run occupancy selection: they inherit even
+when a task was admitted under per-project policy but saved combined placement. Independent
+per-project Q cannot join P-only combined. However, an old Q task's inherited worker or a launch
+reserved before the switch can still return there, and combined rollback deliberately allows
+new projects there. If that makes combined mixed, future independent per-project admissions
+skip it; Crew never evicts or migrates workers to preserve exclusivity. Historical mixed
+combined spaces are handled by the same current-occupancy rule.
 
 In combined mode `crew.space.project` remains the individual task's project, so different
 values legitimately coexist under the same combined ID; it is not a home/space grouping

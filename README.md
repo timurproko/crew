@@ -181,7 +181,9 @@ already has both eligible spaces, its occupied canonical project space wins. Wit
 space, the task requests its canonical project identity. Inspection uses task-owned local
 terminals and validated labels, not headings; ambiguous or unavailable evidence refuses before
 creating the task or copy. A combined join keeps combined placement labels and directory-derived
-headings, even though the home's admission policy is per-project. Switching back sends new tasks
+headings, even though the home's admission policy is per-project. An older other-project task's
+inherited review or replacement can still return to combined; if it becomes mixed, later
+independent per-project admissions skip it rather than moving anyone. Switching back sends new tasks
 into combined even if their project already has its own space. During a spawn, placement
 is frozen when its task is reserved: an already-admitted launch can start after a switch
 using its saved placement. Per-project occupancy is rechecked against task reservations after

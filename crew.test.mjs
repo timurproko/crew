@@ -877,6 +877,7 @@ async function workerSpaceRepairAdmissionTest() {
 function workerSpaceLifecycleTests() {
   const f = workerSpaceFixture('lifecycle'), w = readWorld(); w.spaces = {}; fs.writeFileSync(world, JSON.stringify(w));
   f.add('other');
+  const blocker = f.spawn('blocker', 'other'); // Keep combined mixed to exercise independent project cleanup.
   const legacy = f.spawn('legacy'), shared = f.space(legacy), { workerSpace, ...old } = legacy; f.save(old);
   f.mode('per-project');
   const first = f.spawn('first'), last = f.spawn('last'), other = f.spawn('other', 'other');
@@ -898,7 +899,7 @@ function workerSpaceLifecycleTests() {
   foreign.spaces[otherSpace].members.push('foreign'); fs.writeFileSync(world, JSON.stringify(foreign));
   const protectedTerminals = Object.fromEntries(['personal-guest', 'pc2/guest', 'foreign'].map(a => [a, structuredClone(readWorld().terminals[a])]));
   finish(other, ['--force']); assert.deepEqual(readWorld().spaces[otherSpace].members, ['foreign']);
-  finish(legacy); assert.equal(readWorld().spaces[shared], undefined, 'Legacy combined task still finishes after opt-in');
+  finish(blocker); finish(legacy); assert.equal(readWorld().spaces[shared], undefined, 'Legacy combined tasks still finish after opt-in');
   assert.ok(readWorld().spaces[`pc2/${shared}`], 'Remote matching suffix is untouched');
   // A foreign mod tab also prevents modeled zero-tab removal.
   const mod = f.spawn('with-mod'), modSpace = f.space(mod), mods = readWorld();
@@ -923,7 +924,8 @@ function workerSpaceLifecycleTests() {
   assert.ok(!calls.some(c => ['kill', 'rm'].includes(c[0]) && Object.hasOwn(protectedTerminals, c.at(-1))), 'Even force never closes foreign terminals');
 }
 function workerSpaceSessionTests() {
-  const f = workerSpaceFixture('sessions');
+  const f = workerSpaceFixture('sessions'); f.add('other');
+  const blocker = f.spawn('blocker', 'other'); // Retain a mixed legacy layout across coordinator sessions.
   const legacy = f.spawn('legacy-ship', 'demo', ['--kind', 'ship']);
   const { workerSpace: oldSpace, ...old } = legacy; f.save(old);
   f.mode('per-project'); const project = f.spawn('project-ship', 'demo', ['--kind', 'ship']);
@@ -956,13 +958,16 @@ function workerSpaceSessionTests() {
   r = call(['tell', legacy.id, 'Continue.']); assert.equal(r.code, 0, r.out);
   r = call(['relaunch', legacy.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
   assert.equal(f.space(legacy), oldSpace.id);
-  for (const id of [legacy.id, project.id, `${project.id}-review`, 'new-session']) {
+  for (const id of [blocker.id, legacy.id, project.id, `${project.id}-review`, 'new-session']) {
     r = call(['finish', id]); assert.equal(r.code, 0, r.out); assert.equal(f.task(id).state, 'closed');
   }
 }
 function joinSpaceFixture(name) {
   fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
-  return workerSpaceFixture(name);
+  const f = workerSpaceFixture(name), agents = path.join(f.dir, 'agents'); fs.mkdirSync(agents);
+  fs.writeFileSync(path.join(agents, WINDOWS ? 'pi.cmd' : 'pi'), 'fixture availability marker; never executed\n');
+  f.env.CREW_AGENT_PATH = agents;
+  return f;
 }
 function joinProjectSpaceTests() {
   const f = joinSpaceFixture('join'); f.add('other'); f.add('.xrbuild');
@@ -1008,6 +1013,9 @@ function joinProjectSpaceTests() {
   // Dotted combined joins preserve project spelling but omit the name label.
   const d = joinSpaceFixture('join-dot'); d.add('.xrbuild'); const before = d.spawn('first', '.xrbuild'); d.mode('per-project');
   assert.deepEqual(d.spawn('second', '.xrbuild').workerSpace, before.workerSpace);
+  const s = joinSpaceFixture('join-status'), pi = s.spawn('pi');
+  setTerminal(pi.terminal, { agent: null, status: { app: 'pi', state: 'idle' } }); s.mode('per-project');
+  assert.deepEqual(s.spawn('status-join').workerSpace, pi.workerSpace, 'Pi status supports workers absent from Core agent detection');
   // Foreign tabs, names, other homes and remote addresses are never positive evidence.
   const e = joinSpaceFixture('join-foreign'), w = readWorld();
   w.terminals.personal = { address: 'personal', state: 'live', agent: 'pi', labels: { 'herdr.space': 'personal', 'crew.space.name': 'demo' } };
@@ -1135,16 +1143,51 @@ async function joinProjectSpaceRaceTests() {
     } finally { fs.writeFileSync(barrier.release, 'go'); await writer.result; }
   }
 }
+function joinProjectSpaceInheritanceTests() {
+  for (const switched of ['combined', 'per-project']) {
+    const f = joinSpaceFixture(`join-inherit-${switched}`); f.add('other');
+    const old = f.spawn('old'), priorQ = f.spawn('prior-q', 'other', ['--kind', 'ship']); f.done(priorQ);
+    f.mode('per-project');
+    const manual = f.spawn('manual', 'demo', ['--kind', 'ship']), automatic = f.spawn('auto');
+    const source = f.spawn('source', 'demo', ['--kind', 'ship']); f.done(source);
+    assert.deepEqual(manual.workerSpace, old.workerSpace, 'New per-project admission selected combined placement');
+    const unchanged = structuredClone(readWorld().terminals[old.terminal]);
+    f.mode(switched);
+    let r = f.call(['review', source.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task('source-review').workerSpace, old.workerSpace);
+    r = f.call(['relaunch', manual.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task(manual.id).workerSpace, old.workerSpace); assert.equal(f.task(manual.id).terminals.length, 2);
+    f.save({ ...automatic, chain: [{ harness: 'pi', model: 'second' }], candidates: [{ harness: 'pi', model: 'first' }, { harness: 'pi', model: 'second' }] });
+    setTerminal(automatic.terminal, { status: { app: 'pi', state: 'idle' }, screen: 'quota exhausted' });
+    r = f.call(['wait', automatic.id, '--timeout', '0.2']); assert.equal(r.code, 124, r.out);
+    assert.notEqual(f.task('auto').terminal, automatic.terminal); assert.deepEqual(f.task('auto').workerSpace, old.workerSpace);
+    assert.deepEqual(readWorld().terminals[old.terminal], unchanged);
+    // Inheritance is intentionally stronger than the independent admission rule.
+    f.mode('per-project');
+    r = f.call(['review', priorQ.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task('prior-q-review').workerSpace, priorQ.workerSpace);
+    const canonical = f.spawn('now-mixed'); assert.equal(canonical.workerSpace.mode, 'per-project');
+    assert.notEqual(canonical.workerSpace.id, old.workerSpace.id, 'A returning Q reviewer makes combined mixed');
+    f.mode('combined');
+    assert.equal(f.spawn('rollback-existing').workerSpace.id, old.workerSpace.id);
+    assert.equal(f.spawn('rollback-other', 'other').workerSpace.id, old.workerSpace.id);
+    f.mode('per-project'); assert.equal(f.spawn('return-canonical').workerSpace.id, canonical.workerSpace.id);
+    assert.deepEqual(readWorld().terminals[old.terminal], unchanged, 'No switch or mixed occupancy reshuffles existing workers');
+  }
+}
 gapTests['join-project-space'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
-  try { joinProjectSpaceTests(); joinProjectSpaceRefusalTests(); joinProjectSpaceRepairTest(); await joinProjectSpaceRaceTests(); }
+  try { joinProjectSpaceTests(); joinProjectSpaceRefusalTests(); joinProjectSpaceRepairTest(); await joinProjectSpaceRaceTests(); joinProjectSpaceInheritanceTests(); }
   finally { fs.writeFileSync(world, before); }
 };
 gapTests['worker-spaces'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
   try {
-    await workerSpaceConfigTests(); workerSpacePlacementTests(); workerSpaceInheritanceTests(); workerSpaceFixTests();
-    await workerSpaceRepairAdmissionTest(); workerSpaceLifecycleTests(); workerSpaceSessionTests();
+    for (const test of [workerSpaceConfigTests, workerSpacePlacementTests, workerSpaceInheritanceTests, workerSpaceFixTests,
+      workerSpaceRepairAdmissionTest, workerSpaceLifecycleTests, workerSpaceSessionTests]) {
+      fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
+      await test(); // Each scenario owns its Core history, even during the aggregate CI run.
+    }
   } finally { fs.writeFileSync(world, before); }
 };
 
@@ -1304,6 +1347,7 @@ gapTests['worker-space-local-ordering'] = async () => {
     const v = JSON.parse(r.out); assert.equal(v.ok, true); assert.equal(v.mode, mode);
   };
   try {
+    fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
     // Fake Core records launches without executing them. Availability checks must
     // also use a fixture, never a pi installation on the developer's real PATH.
     const agents = path.join(root, 'local-order-agents'); fs.mkdirSync(agents);
