@@ -27,7 +27,9 @@ command returns. Independent per-project admission fingerprints the registry and
 terminal references before bounded read-only Core inspection, then rechecks that footprint under
 the registry lock. A concurrent reservation, completion or replacement refreshes the observation;
 no stale preflight can reserve a different identity. Unpublished preparing workers and active
-lifecycle writers constrain selection but never count as positive occupancy. Contenders wait
+task writers constrain selection but never count as positive occupancy. Both task.json.lock
+and task.json.lifecycle.lock participate in the footprint and pending check: observation-only
+automatic hand-overs hold only the former, including while the old terminal is absent. Contenders wait
 outside the lock, then retry or refuse with worker-space-busy before creating their own task/copy.
 Core reads share a ten-second admission budget with at most two seconds per probe; unpublished
 launches have a two-second grace before safe retry refusal. Failed reservations do not establish
@@ -322,6 +324,11 @@ foreign/remote/other-home exclusions and conservative malformed/unavailable evid
 fixture-only barriers cover same/different-project contenders, first launches, failed launches,
 post-Core stale preflights, terminal publication and both sides of a mode-switch reservation.
 An external-process guard asserts that no Core/Git/copy call runs under projects.lock.
+`--gaps=join-project-space-handover` isolates the automatic hand-over race: a fixture pauses
+after old-terminal removal while only task.json.lock exists. Admissions during replacement,
+including preflights begun before that lock appeared, refuse without creating a task or terminal;
+after publication their retry joins the inherited space. This regression also runs in the
+broader join-project-space group.
 
 The additional focused groups `--gaps=worker-space-local-setter` and
 `--gaps=worker-space-local-ordering` cover the desktop command, exact capability/results,

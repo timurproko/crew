@@ -1175,9 +1175,70 @@ function joinProjectSpaceInheritanceTests() {
     assert.deepEqual(readWorld().terminals[old.terminal], unchanged, 'No switch or mixed occupancy reshuffles existing workers');
   }
 }
+function joinCoreBarrier(f, label, verb, address = null, after = false) {
+  const ready = path.join(f.dir, `${label}-ready`), release = path.join(f.dir, `${label}-release`), script = path.join(f.dir, `${label}.mjs`);
+  fs.writeFileSync(script, `import cp from 'node:child_process'; import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+const original = cp.spawnSync; let paused = false;
+cp.spawnSync = (...args) => {
+  if (paused || !args[1]?.includes(${JSON.stringify(verb)}) || (${JSON.stringify(address)} && !args[1]?.includes(${JSON.stringify(address)}))) return original(...args);
+  paused = true; const result = ${after} ? original(...args) : undefined;
+  fs.writeFileSync(${JSON.stringify(ready)}, 'ready'); const deadline = Date.now() + 15000;
+  while (!fs.existsSync(${JSON.stringify(release)})) { if (Date.now() > deadline) throw Error('Core barrier timeout'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+  return ${after} ? result : original(...args);
+}; syncBuiltinESMExports();
+const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
+  return { ready, release, script };
+}
+async function joinProjectSpaceHandoverRaceTests(scope = 'integrated') {
+  for (const phase of ['during', 'preflight']) {
+    const f = joinSpaceFixture(`join-handover-${scope}-${phase}`), old = f.spawn('old');
+    f.save({ ...old, chain: [{ harness: 'pi', model: 'second' }], candidates: [{ harness: 'pi', model: 'first' }, { harness: 'pi', model: 'second' }] });
+    setTerminal(old.terminal, { status: { app: 'pi', state: 'idle' }, screen: 'quota exhausted' }); f.mode('per-project');
+    const owner = `owner-spaces-join-handover-${scope}-${phase}`, removal = joinCoreBarrier(f, 'handover', 'rm', old.terminal, true);
+    const preflight = phase === 'preflight' ? joinCoreBarrier(f, 'preflight', 'ls') : null;
+    let admission, handover;
+    const args = ['spawn', 'new', '--project', 'demo', '--agent', 'pi', 'Count.'];
+    try {
+      // Freeze admission after its task snapshot, before its Core inventory. The
+      // handover changes only the task lock, not the placement/terminal footprint.
+      if (preflight) {
+        admission = projectProcess(f, args, { script: preflight.script, terminal: owner, env: f.env });
+        await until(() => fs.existsSync(preflight.ready));
+      }
+      handover = projectProcess(f, ['wait', 'old', '--timeout', '0.2'], { script: removal.script, terminal: owner, env: f.env });
+      await until(() => fs.existsSync(removal.ready));
+      const file = path.join(f.home, 'tasks', old.id, 'task.json');
+      assert.ok(fs.existsSync(`${file}.lock`), 'Automatic handover owns the task transaction lock');
+      assert.ok(!fs.existsSync(`${file}.lifecycle.lock`), 'Observation-only handover has no lifecycle lock');
+      assert.ok(!readWorld().terminals[old.terminal], 'Old terminal is absent before its replacement starts');
+      assert.ok(!fs.existsSync(path.join(f.home, 'projects.lock')), 'Handover never holds the registry lock');
+      const log = readWorld().log.length;
+      if (preflight) fs.writeFileSync(preflight.release, 'go');
+      const refused = admission ? await admission.result : f.call(args);
+      assert.equal(refused.code, 4, refused.out); assert.match(refused.out, /worker-space-busy/);
+      assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'new')), 'No contender task is reserved during handover');
+      assert.ok(!readWorld().log.slice(log).some(c => ['run', 'kill', 'rm', 'label'].includes(c[0])), 'Refusal has no terminal side effects');
+      fs.writeFileSync(removal.release, 'go'); const result = await handover.result; assert.equal(result.code, 124, result.out);
+      const replacement = f.task(old.id); assert.notEqual(replacement.terminal, old.terminal);
+      assert.equal(replacement.workerSpace.id, old.workerSpace.id); assert.equal(readWorld().terminals[replacement.terminal].state, 'live');
+      const next = f.spawn('new'); assert.equal(next.workerSpace.id, old.workerSpace.id, 'Retry joins the inherited space, not a duplicate project space');
+      assert.equal(readWorld().terminals[next.terminal].state, 'live');
+    } finally {
+      if (preflight) fs.writeFileSync(preflight.release, 'go');
+      fs.writeFileSync(removal.release, 'go');
+      if (admission) await admission.result;
+      if (handover) await handover.result;
+    }
+  }
+}
+gapTests['join-project-space-handover'] = async () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try { await joinProjectSpaceHandoverRaceTests('focused'); }
+  finally { fs.writeFileSync(world, before); }
+};
 gapTests['join-project-space'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
-  try { joinProjectSpaceTests(); joinProjectSpaceRefusalTests(); joinProjectSpaceRepairTest(); await joinProjectSpaceRaceTests(); joinProjectSpaceInheritanceTests(); }
+  try { joinProjectSpaceTests(); joinProjectSpaceRefusalTests(); joinProjectSpaceRepairTest(); await joinProjectSpaceRaceTests(); joinProjectSpaceInheritanceTests(); await joinProjectSpaceHandoverRaceTests(); }
   finally { fs.writeFileSync(world, before); }
 };
 gapTests['worker-spaces'] = async () => {

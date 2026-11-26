@@ -1571,11 +1571,13 @@ const unfinishedSpaceWorker = task => ['preparing', 'working'].includes(task.sta
 function workerSpaceSnapshot(h) {
   const tasks = workerSpaceTasks(h);
   // Exclude prose, PR facts and timestamps; only admission-relevant mutations
-  // invalidate an observation. Lifecycle locks also fence unpublished replacements.
-  const footprint = JSON.stringify([h.config, tasks.map(t => [t.id, t.project, t.state, t.terminal,
-    t.terminals, t.workerSpace, t.selfFix, fs.existsSync(`${taskFile(h, t.id)}.lifecycle.lock`)])]);
-  const pending = tasks.some(t => unfinishedSpaceWorker(t) &&
-    ((t.state === 'preparing' && !t.terminal) || fs.existsSync(`${taskFile(h, t.id)}.lifecycle.lock`)));
+  // invalidate an observation. Automatic handover is an observation transaction:
+  // it holds task.json.lock but not the manual writer's lifecycle intent lock.
+  const writers = tasks.map(t => ['.lock', '.lifecycle.lock'].map(suffix => fs.existsSync(`${taskFile(h, t.id)}${suffix}`)));
+  const footprint = JSON.stringify([h.config, tasks.map((t, i) => [t.id, t.project, t.state, t.terminal,
+    t.terminals, t.workerSpace, t.selfFix, writers[i]])]);
+  const pending = tasks.some((t, i) => unfinishedSpaceWorker(t) &&
+    ((t.state === 'preparing' && !t.terminal) || writers[i].some(Boolean)));
   return { tasks, footprint, pending };
 }
 function workerSpaceOccupancy(h, tasks, deadline) {
