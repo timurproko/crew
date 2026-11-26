@@ -200,7 +200,27 @@ function readRegistry(dir) {
       || Object.values(config.projects).some(p => !p || typeof p.path !== 'string' || !p.path)) {
     refuse(`Crew home ${slash(dir)} has an invalid version 1 registry (crew.json); nothing was changed.`);
   }
+  if (Object.hasOwn(config, 'workerSpaceMode') && !WORKER_SPACE_MODES.includes(config.workerSpaceMode)) {
+    refuse(`Crew home ${slash(dir)}: workerSpaceMode must be combined or per-project; nothing was changed.`);
+  }
   return config;
+}
+
+const WORKER_SPACE_MODES = ['combined', 'per-project'];
+function cmdConfig(args) {
+  const [key, mode, ...extra] = args;
+  if (key !== 'worker-space' || extra.length || (mode !== undefined && !WORKER_SPACE_MODES.includes(mode))) {
+    refuse('Usage: crew config worker-space [combined|per-project]');
+  }
+  const h = home();
+  if (mode === undefined) { console.log(`worker-space: ${h.config.workerSpaceMode ?? 'combined'}`); return; }
+  requireOwner(h, 'change worker-space mode');
+  withRegistry(h, () => {
+    h.config.workerSpaceMode = mode;
+    writeJson(path.join(h.dir, 'crew.json'), h.config);
+  });
+  console.log(`worker-space: ${mode}; applies to new task admissions only; existing workers never move, reviews and replacements inherit their task's space.`);
+  if (mode === 'per-project') console.log('Connected project spaces and project names need compatible Herdr support; until installed, they may not appear connected under the coordinator.');
 }
 
 // Atomic rename alone cannot serialize read-modify-write or protect task admission.
@@ -1348,7 +1368,7 @@ const PICK_USAGE = `[--agent ${Object.keys(AGENTS).join('|')}] [--model <id>] [-
 // Starts the terminal in which `pick` works on a task. The agent starts with one instruction
 // as its argument, so nothing is typed into it and there is no race with its startup. The
 // shell stays afterwards so the terminal survives the agent leaving; `crew finish` removes it.
-function startTerminal(h, { id, worktree, label, pick, instruction }) {
+function startTerminal(h, { id, worktree, label, pick, instruction, workerSpace }) {
   const agent = AGENTS[pick.harness];
   if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
   const { command, note } = workerLaunch(agent, instruction, pick);
@@ -1361,11 +1381,19 @@ function startTerminal(h, { id, worktree, label, pick, instruction }) {
   return { note, ...hcJson(['run', '--json', '--bg', '--keep', '--no-parent', '--no-notify', '--cwd', worktree,
     // crew.kind is what the worker is, for anything that shows terminals (Herdr's pane header).
     '--label', `crew.task=${id}`, '--label', `crew.home=${tag}`, '--label', `crew.kind=${label}`,
-    '--label', `herdr.space=fm-crew-${tag}`, '--label', `herdr.tab=${tag}-${id}`, '--label', 'herdr.right-click=menu',
+    '--label', `herdr.space=${workerSpace.id}`, '--label', `herdr.tab=${tag}-${id}`, '--label', 'herdr.right-click=menu',
+    '--label', 'crew.space.version=1', '--label', `crew.space.mode=${workerSpace.mode}`, '--label', `crew.space.project=${workerSpace.project}`,
+    ...(workerSpace.name === null ? [] : ['--label', `crew.space.name=${workerSpace.name}`]),
     '--', bashProgram(), '--login', '-i', '-c', line]) };
 }
 const kindLabel = task => (task.selfFix ? 'fix' : task.reviews ? 'review' : task.kind);
 const roleOf = kindLabel;
+
+function makeWorkerSpace(h, mode, project) {
+  const base = `fm-crew-${h.config.tag}`;
+  return { version: 1, mode, id: mode === 'combined' ? base : project === SELF_PROJECT ? `${base}-self` : `${base}-project-${project}`,
+    project, name: mode === 'combined' ? null : project === SELF_PROJECT ? 'crew' : project };
+}
 
 // Creates the task, its working copy and its terminal. `extra` is kept on the task record.
 // `chosen` is who does it (`pick`), who stands behind them (`rest`) and where that came from.
@@ -1389,8 +1417,9 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     // The project may have been removed/replaced while selection was running.
     if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
     if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
+    record.workerSpace = makeWorkerSpace(h, h.config.workerSpaceMode ?? 'combined', opts.project);
     fs.mkdirSync(dir, { recursive: true });
-    saveTask(h, record); // reservation prevents removal/replacement before any external work
+    saveTask(h, record); // reservation freezes placement and prevents removal/replacement before external work
   });
   fs.mkdirSync(h.worktrees, { recursive: true });
   // Slow tools run outside the transaction; this preparing task now protects the path.
@@ -1422,7 +1451,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   if (workflow) { record = { ...record, workflow: 'delivery' }; saveTask(h, record); }
   fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project), workflow, branch }));
 
-  const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, instruction: `Read the brief at ${brief} and carry it out exactly.` });
+  const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, workerSpace: record.workerSpace, instruction: `Read the brief at ${brief} and carry it out exactly.` });
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
     if (delivered) runTool('delivery', ['finish', worktree, '--force'], { cwd: project.path, timeout: 120000 });
@@ -1496,7 +1525,7 @@ function replaceWorker(h, task, reason, flags) {
     if (seen !== 'absent') refuse(`Core still has terminal ${task.terminal}; task ${task.id} was not handed over.`, 6);
   }
   const instruction = `Read the brief at ${task.brief} and carry it out exactly. Another worker (${pickLabel(before)}) began this task and had to stop: ${reason}. What it did is already in this working copy: look at \`git status\` and \`git log\`, and at ${task.report} if it exists, then continue from there instead of starting again.`;
-  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, instruction });
+  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, workerSpace: task.workerSpace ?? makeWorkerSpace(h, 'combined', task.project), instruction });
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
     store({ ...task, state: 'failed', terminal: null, terminals: address ? launchedTerminals(task, address, pick.harness) : ownedTerminals(task), error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
@@ -3147,7 +3176,7 @@ function copyWaiting(task) {
   return { worktree: task.worktree, since: task.copyToReturn.since ?? null, why, heldBy: holders?.length ? describeHolders(holders, task.worktree) : null, kept: kept?.text ?? null, pending, free: why === 'free' };
 }
 
-const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
+const COMMANDS = { init: cmdInit, config: cmdConfig, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
   home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, agents: cmdAgents, relaunch: cmdRelaunch, selfrepair: cmdSelfmerge, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
@@ -3155,6 +3184,8 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
       re-adding replaces the registration: omitted workflow and gate-skip choices are dropped
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
+  crew config worker-space [combined|per-project]   show/change new-task grouping (default combined)
+      existing workers never move; reviews and replacements inherit their task's space; connected project names need compatible Herdr
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
       who: ${PICK_USAGE}
   crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   original rows and quota now, next choice marked

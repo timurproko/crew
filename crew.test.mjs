@@ -643,6 +643,59 @@ fs[method] = function(file, ...args) {
 }; main(process.argv.slice(2));`);
   return { ready, release, script };
 }
+async function workerSpaceConfigTests() {
+  const f = gapFixture('space-config'), file = path.join(f.home, 'crew.json');
+  const read = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...read(), future: { kept: true } }));
+  const inspect = args => crew(args, { cwd: f.home });
+  assert.match(inspect(['config', 'worker-space']).out, /worker-space: combined/);
+  assert.equal(inspect(['config', 'worker-space', 'per-project']).code, 3);
+  for (const args of [['worker-space', 'bad'], ['worker-space', 'combined', 'extra'], ['unknown'], []]) {
+    const before = fs.readFileSync(file, 'utf8');
+    const r = f.call(['config', ...args]); assert.equal(r.code, 2, r.out);
+    assert.equal(fs.readFileSync(file, 'utf8'), before);
+  }
+  const before = readWorld().log.length;
+  for (const mode of ['per-project', 'combined']) {
+    const r = f.call(['config', 'worker-space', mode]); assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /new task admissions only; existing workers never move/);
+    assert.equal(read().workerSpaceMode, mode);
+    assert.match(inspect(['config', 'worker-space']).out, new RegExp(`worker-space: ${mode}`));
+  }
+  assert.ok(readWorld().log.slice(before).every(c => c[0] === 'get'), 'Settings only query ownership, never mutate Core');
+  assert.ok(read().projects.demo); assert.deepEqual(read().future, { kept: true });
+  assert.match(f.call(['--help']).out, /config worker-space \[combined\|per-project\]/);
+  for (const mode of [null, false, 1, {}, [], 'unknown']) {
+    fs.writeFileSync(file, JSON.stringify({ ...read(), workerSpaceMode: mode }));
+    const r = inspect(['config', 'worker-space']); assert.equal(r.code, 2, r.out); assert.match(r.out, /workerSpaceMode must be/);
+  }
+  fs.writeFileSync(file, JSON.stringify({ ...read(), workerSpaceMode: 'combined' }));
+  // A setting writer rereads rather than replacing a concurrent registration.
+  const stale = projectBarrier(f, 'before', 'config-stale');
+  const writer = projectProcess(f, ['config', 'worker-space', 'per-project'], { script: stale.script, terminal: 'owner-space-config' });
+  try {
+    await until(() => fs.existsSync(stale.ready));
+    assert.equal(inspect(['project', 'add', 'extra', f.repo]).code, 0);
+    fs.writeFileSync(stale.release, 'go'); const r = await writer.result; assert.equal(r.code, 0, r.out);
+    assert.ok(read().projects.extra); assert.equal(read().workerSpaceMode, 'per-project'); assert.deepEqual(read().future, { kept: true });
+  } finally { fs.writeFileSync(stale.release, 'go'); await writer.result; }
+  for (const phase of ['before', 'after']) {
+    const g = gapFixture(`space-admission-${phase}`), gate = projectBarrier(g, phase);
+    const pending = projectProcess(g, ['spawn', 'race', '--project', 'demo', '--agent', 'pi', 'Count.'], { script: gate.script, terminal: `owner-space-admission-${phase}` });
+    try {
+      await until(() => fs.existsSync(gate.ready));
+      assert.equal(g.call(['config', 'worker-space', 'per-project']).code, 0);
+      assert.equal(g.call(['project', 'add', 'concurrent', g.repo]).code, 0);
+      fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
+      const t = g.task('race'), mode = phase === 'before' ? 'per-project' : 'combined';
+      assert.equal(t.workerSpace.mode, mode);
+      assert.equal(readWorld().terminals[t.terminal].labels['crew.space.mode'], mode);
+      assert.ok(JSON.parse(fs.readFileSync(path.join(g.home, 'crew.json'), 'utf8')).projects.concurrent);
+    } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+  }
+}
+gapTests['worker-spaces'] = async () => { await workerSpaceConfigTests(); };
+
 gapTests['registry-sharing'] = async () => {
   const f = gapFixture('registry-sharing'), registry = path.join(f.home, 'crew.json'), lock = path.join(f.home, 'projects.lock');
   const cases = [

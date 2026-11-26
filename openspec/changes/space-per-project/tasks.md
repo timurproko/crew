@@ -1,12 +1,12 @@
 # Tasks
 
-Implementation is not authorized yet. Groups match the draft PR's Implementation outcomes in order. All checks use isolated homes, repositories, fake Core and sandboxed tool/account paths; no live coordinator, spaces or tasks.
+Implementation approved by the coordinator. Groups match the draft PR's Implementation outcomes in order. All checks use isolated homes, repositories, fake Core and sandboxed tool/account paths; no live coordinator, spaces or tasks.
 
 ## 1. Home setting selects combined or per-project placement for new tasks without a restart
 
-- [ ] 1.1 Add effective-mode validation and `crew config worker-space [combined|per-project]` using `workerSpaceMode` in the version-1 home registry; verify absent/default, explicit modes, invalid values, read access and owner-only writes with focused config regressions.
-- [ ] 1.2 Serialize config writes and initial placement admission with the existing registry transaction; verify metadata/project preservation, concurrent registration and barriers before/after reservation while a setting change races spawn, without Core writes on setting changes.
-- [ ] 1.3 Document show/set usage, default combined and immediate new-task-only semantics in README/help; verify help advertises the command and isolated CLI output explains that running tasks do not move.
+- [x] 1.1 Add effective-mode validation and `crew config worker-space [combined|per-project]` using `workerSpaceMode` in the version-1 home registry; verify absent/default, explicit modes, invalid values, read access and owner-only writes with focused config regressions.
+- [x] 1.2 Serialize config writes and initial placement admission with the existing registry transaction; verify metadata/project preservation, concurrent registration and barriers before/after reservation while a setting change races spawn, without Core writes on setting changes.
+- [x] 1.3 Document show/set usage, default combined and immediate new-task-only semantics in README/help; verify help advertises the command and isolated CLI output explains that running tasks do not move.
 
 ## 2. Project spaces are reused and task placement survives reviews, recovery and mode switches
 
