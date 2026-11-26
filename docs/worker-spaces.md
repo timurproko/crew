@@ -13,8 +13,8 @@ No restart is needed. The change affects **new independent tasks**, not existing
 | Situation | Placement |
 | --- | --- |
 | Combined (default) | Every project's new workers use one home-wide automatic space. |
-| Per-project | New workers use their registered project's reusable automatic space. |
-| Combined to per-project, with A workers still combined | A new independent A task requests A's project space; old workers stay combined. |
+| Per-project | Join an occupied same-home local Crew space whose live unfinished workers are exclusively this project; otherwise request the canonical project identity. |
+| Combined to per-project, with A workers still combined | A new independent A task joins combined if its live unfinished workers are exclusively A; mixed combined is skipped and old workers never move. |
 | Per-project to combined, with A's project space still occupied | New A tasks and tasks for projects without a space all request combined. |
 | Review, relaunch or automatic hand-over | Inherit their source task's space, regardless of the current setting. |
 | Switch back to a previous mode | Reuse its matching space ID if still present; do not move workers from the other layout. |
@@ -173,6 +173,37 @@ New launches additionally carry:
 | `crew.space.mode` | `combined` or `per-project` |
 | `crew.space.project` | Placement project key: exact registered name, or `crew:self` for internal repair fallback. |
 | `crew.space.name` | Per-project only: exact registered name, or `crew` for internal repair fallback. Omitted in combined mode to preserve directory-derived headings. |
+
+### Occupancy-aware joins
+
+Independent per-project admission reads task records and bounded local Core inventory/labels.
+Only preparing/working tasks with recorded launched terminals and a live worker (Core agent or
+agent status app) establish occupancy. Reported, closed, stopped and failed tasks, ended terminals
+and agent-less kept shells do not count, even if tabs remain. An empty old combined space is not
+reused. Mixed live placement projects disqualify it. An occupied canonical project space wins
+when an already split home has both eligible identities; otherwise an exclusive combined space
+wins before canonical project creation. Dotted projects compare exactly. Verified repair aliases
+continue to use the registered crew placement project without rewriting task.project.
+
+Crew validates exact task-owned launch identities and matching home/task/space labels, accepting
+old combined labels or the complete v1 tuple. Unreadable records, unavailable Core or unrecorded/
+contradictory same-home Crew terminals refuse admission before task/copy/terminal creation rather
+than claiming exclusivity. Other homes, remote addresses and personal headings never establish
+reuse. Foreign tabs do not establish worker occupancy or grant Crew terminal ownership; native
+manual moves and mod-tab membership are not observable through Core's requested-space labels.
+
+A joining worker gets its own crew.task and herdr.tab, not another worker's identity. Joining
+`fm-crew-<home>` saves version 1, mode combined, project P, name null, and launches with
+crew.space.version=1, crew.space.mode=combined, crew.space.project=P and **no crew.space.name**.
+It keeps that space's directory-derived heading; it does not force P as a title. Joining
+`fm-crew-<home>-project-P` saves/labels version 1, mode per-project, project/name P. Both retain
+crew.home, crew.kind, herdr.right-click=menu and herdr.tab=<home>-<new-task>.
+
+This matches herdr-app main's `src/plugins/crew/fleet.js`: placement validates the mode/project/name
+and constructs the expected identity; bindFleet checks the current task's live terminal and exact
+native same-machine membership, crew.task/home and herdr.space. Neither title nor project
+resemblance grants child binding. A per-project label tuple inside combined is invalid. Combined
+children normalize their project/name internally so legitimate per-task project labels can differ.
 
 In combined mode `crew.space.project` remains the individual task's project, so different
 values legitimately coexist under the same combined ID; it is not a home/space grouping

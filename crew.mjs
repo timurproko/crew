@@ -1553,16 +1553,80 @@ function repairWorkerProject(h, task) {
   const identity = registered ? repositoryIdentity(task.projectPath) : null;
   return { path: registered?.path ?? null, project: identity && repositoryIdentity(registered.path) === identity ? 'crew' : SELF_PROJECT };
 }
-function admittedWorkerSpace(h, task, repair) {
+// Occupancy is a read-only observation, not native layout or terminal ownership.
+// Never use allTasks(): its legacy recovery projection can probe Core implicitly.
+function workerSpaceTasks(h) {
+  try {
+    return fs.readdirSync(h.tasks).filter(validId).sort().map(id => {
+      const task = readJson(taskFile(h, id));
+      if (!task || task.id !== id || (task.project !== SELF_PROJECT && projectNameError(task.project))
+          || !['preparing', 'working', 'reported', 'stopped', 'failed', 'closed'].includes(task.state)
+          || (task.terminal != null && typeof task.terminal !== 'string')
+          || (task.terminals !== undefined && (!Array.isArray(task.terminals) || task.terminals.some(t => typeof t?.address !== 'string')))) throw Error(`invalid task ${id}`);
+      return task;
+    });
+  } catch (error) { refuse(`worker-space-unavailable: cannot read task occupancy (${error.message}); retry. Nothing was launched.`, 4); }
+}
+const unfinishedSpaceWorker = task => ['preparing', 'working'].includes(task.state);
+function workerSpaceOccupancy(h, tasks) {
+  const deadline = Date.now() + 10000;
+  const options = () => {
+    const left = deadline - Date.now();
+    if (left <= 0) refuse('worker-space-unavailable: occupancy read budget expired; retry. Nothing was launched.', 4);
+    return { timeout: Math.min(left, 2000) };
+  };
+  const fail = why => refuse(`worker-space-unavailable: ${why}; retry. Nothing was launched.`, 4);
+  const listed = hcJson(['ls', '--json'], options());
+  if (listed.code !== 0 || !Array.isArray(listed.value?.terminals)) fail('Core did not provide terminal occupancy');
+  const records = new Map(tasks.map(t => [t.id, t])), projects = new Map();
+  const owned = new Map(tasks.filter(unfinishedSpaceWorker).flatMap(t => ownedTerminals(t).map(record => [record.address, t])));
+  const seen = new Set();
+  for (const entry of listed.value.terminals) {
+    if (typeof entry?.address !== 'string' || seen.has(entry.address)) fail('Core returned ambiguous terminal identities');
+    seen.add(entry.address);
+    if (entry.state !== 'live' || entry.address.includes('/') || entry.address === me()) continue;
+    const observed = probe(entry.address, options());
+    if (observed.state === 'unknown') fail(`Core did not answer about terminal ${entry.address}`);
+    if (observed.state !== 'live') continue; // a terminal can end after the inventory read
+    const terminal = observed.t, labels = terminal.labels ?? {}, task = records.get(labels['crew.task']);
+    if (labels['crew.home'] !== h.config.tag) {
+      if (owned.has(entry.address)) fail(`worker ${entry.address} has contradictory home labels`);
+      continue; // foreign terminals and other homes never establish occupancy
+    }
+    if (!task || !ownedTerminals(task).some(t => t.address === entry.address)) fail(`terminal ${entry.address} has no recorded task-owned launch`);
+    if (!unfinishedSpaceWorker(task)) continue; // finished history, even a live report terminal, does not count
+    const space = resolveWorkerSpace(h, task);
+    if (terminal.address !== entry.address || labels['herdr.space'] !== space.id) fail(`worker ${entry.address} has contradictory placement labels`);
+    const keys = ['crew.space.version', 'crew.space.mode', 'crew.space.project', 'crew.space.name'];
+    const legacy = keys.every(key => !Object.hasOwn(labels, key));
+    if (legacy ? space.mode !== 'combined' : labels[keys[0]] !== '1' || labels[keys[1]] !== space.mode
+        || labels[keys[2]] !== space.project || (space.name === null ? Object.hasOwn(labels, keys[3]) : labels[keys[3]] !== space.name)) {
+      fail(`worker ${entry.address} has invalid placement-v1 labels`);
+    }
+    // Kept shells are live terminals, not live workers. Pi can advertise status.app
+    // even on Core versions that do not recognize it in the inventory's agent field.
+    if (!entry.agent && !terminal.agent && !terminal.status?.app) continue;
+    if (!projects.has(space.id)) projects.set(space.id, new Set());
+    projects.get(space.id).add(space.project);
+  }
+  return projects;
+}
+function admittedWorkerSpace(h, task, repair, occupancy) {
   if (Object.hasOwn(task, 'workerSpace')) return resolveWorkerSpace(h, task);
   const mode = h.config.workerSpaceMode ?? 'combined';
   if (task.selfFix && mode === 'per-project') {
     // Identity probes stay outside the registry lock. A changed registration is
     // not permission to reuse the old proof or to guess a new project's space.
     if ((registeredProject(h, 'crew')?.path ?? null) !== repair.path) refuse('The crew registration changed during repair admission; retry. No task or terminal was created.');
-    return makeWorkerSpace(h, mode, repair.project);
   }
-  return makeWorkerSpace(h, mode, task.project);
+  const project = task.selfFix && mode === 'per-project' ? repair.project : task.project;
+  const canonical = makeWorkerSpace(h, mode, project);
+  if (mode === 'combined') return canonical;
+  if (!occupancy) refuse('worker-space-unavailable: the admission setting changed; retry. Nothing was launched.', 4);
+  const exclusive = id => occupancy.get(id)?.size === 1 && occupancy.get(id).has(project);
+  if (exclusive(canonical.id)) return canonical;
+  const combined = makeWorkerSpace(h, 'combined', project);
+  return exclusive(combined.id) ? combined : canonical;
 }
 function makeWorkerSpace(h, mode, project) {
   const base = `fm-crew-${h.config.tag}`;
@@ -1589,11 +1653,13 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks, dispatch: chosen.dispatch,
     ...(branch ? { branch, reviewRound: 1, lastFinding: null } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
   const repairPlacement = extra.selfFix ? repairWorkerProject(h, record) : null;
+  const occupancy = !Object.hasOwn(record, 'workerSpace') && h.config.workerSpaceMode === 'per-project'
+    ? workerSpaceOccupancy(h, workerSpaceTasks(h)) : null;
   withRegistry(h, () => {
     // The project may have been removed/replaced while selection was running.
     if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
     if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
-    record.workerSpace = admittedWorkerSpace(h, record, repairPlacement);
+    record.workerSpace = admittedWorkerSpace(h, record, repairPlacement, occupancy);
     fs.mkdirSync(dir, { recursive: true });
     saveTask(h, record); // reservation freezes placement and prevents removal/replacement before external work
   });

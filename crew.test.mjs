@@ -103,7 +103,7 @@ const forget = address => {
   if (!space.members.length && space.automatic) delete w.spaces[id];
 };
 if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forEach((v, i) => { if (v === '--label') { const [k, ...r] = a[i + 1].split('='); labels[k] = r.join('='); } });
-  w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; adopt(address, labels); save(); console.log(JSON.stringify({ address })); }
+  w.terminals[address] = { address, state: 'live', labels, status: null, ...(w.workerAgents ? { agent: 'pi' } : {}), cwd: a[a.indexOf('--cwd') + 1] }; adopt(address, labels); save(); console.log(JSON.stringify({ address })); }
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'kill' && w.unkillable) { save(); }
 else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; if (t?.steps?.length) Object.assign(t, t.steps.shift()); save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
@@ -742,6 +742,7 @@ async function workerSpaceConfigTests() {
   }
 }
 function workerSpaceFixture(name) {
+  const w = readWorld(); w.workerAgents = true; fs.writeFileSync(world, JSON.stringify(w));
   const noGh = path.join(root, 'space-no-gh.mjs'); fs.writeFileSync(noGh, 'process.exit(1);');
   const env = { CREW_GH: noGh, CREW_AGENT_PATH: '', CREW_NO_QUOTA: '1', CREW_RECOVERY_SECONDS: '0' };
   const f = gapFixture(`spaces-${name}`, env), call = (args, more = {}) => f.call(args, more);
@@ -959,6 +960,105 @@ function workerSpaceSessionTests() {
     r = call(['finish', id]); assert.equal(r.code, 0, r.out); assert.equal(f.task(id).state, 'closed');
   }
 }
+function joinSpaceFixture(name) {
+  fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
+  return workerSpaceFixture(name);
+}
+function joinProjectSpaceTests() {
+  const f = joinSpaceFixture('join'); f.add('other'); f.add('.xrbuild');
+  const tag = JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8')).tag;
+  const combined = `fm-crew-${tag}`, project = `${combined}-project-demo`;
+  const old = f.spawn('old'), untouched = structuredClone(readWorld().terminals[old.terminal]);
+  f.mode('per-project');
+  const joined = f.spawn('joined');
+  assert.deepEqual(joined.workerSpace, { version: 1, mode: 'combined', id: combined, project: 'demo', name: null });
+  assert.equal(f.labels(joined)['crew.task'], joined.id); assert.equal(f.labels(joined)['herdr.tab'], `${tag}-${joined.id}`);
+  assert.equal(f.labels(joined)['crew.space.version'], '1'); assert.equal(f.labels(joined)['crew.space.mode'], 'combined');
+  assert.equal(f.labels(joined)['crew.space.project'], 'demo'); assert.ok(!Object.hasOwn(f.labels(joined), 'crew.space.name'));
+  assert.deepEqual(readWorld().terminals[old.terminal], untouched, 'Joining never relabels the original worker');
+  // Truly old records and launch labels, not merely v1-combined, also qualify.
+  const { workerSpace, ...legacy } = old; f.save(legacy);
+  const labels = { ...f.labels(old) }; for (const key of Object.keys(labels)) if (key.startsWith('crew.space.')) delete labels[key];
+  setTerminal(old.terminal, { labels });
+  assert.equal(f.space(f.spawn('legacy-join')), combined);
+  // Another project cannot join P-only combined. Once combined is mixed, neither can reuse it.
+  const other = f.spawn('other', 'other'); assert.equal(f.space(other), `${combined}-project-other`);
+  f.mode('combined'); const mixed = f.spawn('mixed', 'other'); f.mode('per-project');
+  const canonical = f.spawn('canonical'); assert.equal(f.space(canonical), project);
+  assert.equal(f.space(f.spawn('canonical-again')), project);
+  assert.deepEqual(canonical.workerSpace, { version: 1, mode: 'per-project', id: project, project: 'demo', name: 'demo' });
+  // Once both spaces are eligible, prefer occupied canonical rather than proliferating identities.
+  f.save({ ...mixed, state: 'reported' });
+  assert.equal(f.space(f.spawn('prefer-canonical')), project);
+  const dot = f.spawn('dot', '.xrbuild'); assert.equal(f.space(dot), `${combined}-project-.xrbuild`);
+  assert.equal(f.labels(dot)['crew.space.name'], '.xrbuild');
+  // History and shells cannot make empty combined reusable, or pollute live P exclusivity.
+  for (const state of ['reported', 'closed', 'stopped', 'failed', 'ended', 'shell']) {
+    const g = joinSpaceFixture(`join-${state}`), t = g.spawn('former');
+    if (state === 'ended') setTerminal(t.terminal, { state: 'finished' });
+    else if (state === 'shell') setTerminal(t.terminal, { agent: null, status: null });
+    else g.save({ ...t, state });
+    g.mode('per-project'); const next = g.spawn('new');
+    assert.equal(next.workerSpace.mode, 'per-project', `${state} is not positive occupancy`);
+    assert.notEqual(next.workerSpace.id, t.workerSpace.id);
+  }
+  const g = joinSpaceFixture('join-finished-project'); g.add('other');
+  const p = g.spawn('live'), q = g.spawn('finished', 'other'); g.done(q); g.mode('per-project');
+  assert.equal(g.space(g.spawn('next')), p.workerSpace.id, 'Finished Q does not make live P occupancy mixed');
+  // Dotted combined joins preserve project spelling but omit the name label.
+  const d = joinSpaceFixture('join-dot'); d.add('.xrbuild'); const before = d.spawn('first', '.xrbuild'); d.mode('per-project');
+  assert.deepEqual(d.spawn('second', '.xrbuild').workerSpace, before.workerSpace);
+  // Foreign tabs, names, other homes and remote addresses are never positive evidence.
+  const e = joinSpaceFixture('join-foreign'), w = readWorld();
+  w.terminals.personal = { address: 'personal', state: 'live', agent: 'pi', labels: { 'herdr.space': 'personal', 'crew.space.name': 'demo' } };
+  w.terminals['remote/worker'] = { address: 'remote/worker', state: 'live', agent: 'pi', labels: { 'crew.home': 'not-this-home' } };
+  fs.writeFileSync(world, JSON.stringify(w)); e.mode('per-project');
+  assert.equal(e.spawn('new').workerSpace.mode, 'per-project');
+}
+function joinProjectSpaceRepairTest() {
+  fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [], workerAgents: true }));
+  const f = repairFixture('join-alias');
+  assert.equal(f.call(['project', 'add', 'crew', f.repo]).code, 0);
+  let r = f.call(['spawn', 'source', '--project', 'crew', '--agent', 'pi', 'Count.']); assert.equal(r.code, 0, r.out);
+  const source = f.task('source'), original = structuredClone(readWorld().terminals[source.terminal]);
+  assert.equal(f.call(['config', 'worker-space', 'per-project']).code, 0);
+  r = f.call(['fix', '--agent', 'pi', 'Repair.']); assert.equal(r.code, 0, r.out);
+  const fix = f.task('fix-1'), labels = readWorld().terminals[fix.terminal].labels;
+  assert.equal(fix.project, 'crew:self'); assert.deepEqual(fix.workerSpace, source.workerSpace);
+  assert.equal(fix.workerSpace.project, 'crew'); assert.equal(labels['crew.space.mode'], 'combined');
+  assert.ok(!Object.hasOwn(labels, 'crew.space.name'));
+  assert.deepEqual(readWorld().terminals[source.terminal], original);
+}
+function joinProjectSpaceRefusalTests() {
+  for (const fault of ['silent', 'silentLs', 'unknown-task', 'wrong-home', 'wrong-task', 'wrong-space', 'wrong-mode', 'name', 'record', 'metadata', 'unrecorded']) {
+    const f = joinSpaceFixture(`join-bad-${fault}`), t = f.spawn('old'); f.mode('per-project');
+    const w = readWorld(), terminal = w.terminals[t.terminal];
+    if (['silent', 'silentLs'].includes(fault)) w[fault] = true;
+    if (fault === 'unknown-task') terminal.labels['crew.task'] = 'unknown';
+    if (fault === 'wrong-home') terminal.labels['crew.home'] = 'another';
+    if (fault === 'wrong-task') { const other = f.spawn('other'); terminal.labels['crew.task'] = other.id; }
+    if (fault === 'wrong-space') terminal.labels['herdr.space'] = 'personal';
+    if (fault === 'wrong-mode') terminal.labels['crew.space.mode'] = 'per-project';
+    if (fault === 'name') terminal.labels['crew.space.name'] = 'demo';
+    if (fault === 'record') fs.writeFileSync(path.join(f.home, 'tasks', t.id, 'task.json'), '{broken');
+    if (fault === 'metadata') f.save({ ...t, workerSpace: { ...t.workerSpace, id: 'personal' } });
+    if (fault === 'unrecorded') w.terminals.impostor = { ...structuredClone(terminal), address: 'impostor' };
+    fs.writeFileSync(world, JSON.stringify(w));
+    const n = w.log.length, r = f.call(['spawn', 'refused', '--project', 'demo', '--agent', 'pi', 'Count.']);
+    assert.notEqual(r.code, 0, `${fault}: ${r.out}`); assert.match(r.out, /worker-space-unavailable|invalid workerSpace/);
+    assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'refused')), fault);
+    assert.ok(!readWorld().log.slice(n).some(c => ['run', 'kill', 'rm', 'label'].includes(c[0])), fault);
+    const clean = readWorld(); delete clean.silent; delete clean.silentLs; delete clean.terminals.impostor;
+    // Keep malformed fixtures from interfering with subsequent homes' read-only probes.
+    for (const value of Object.values(clean.terminals)) if (value.labels?.['crew.home'] === terminal.labels['crew.home']) value.state = 'finished';
+    fs.writeFileSync(world, JSON.stringify(clean));
+  }
+}
+gapTests['join-project-space'] = () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try { joinProjectSpaceTests(); joinProjectSpaceRefusalTests(); joinProjectSpaceRepairTest(); }
+  finally { fs.writeFileSync(world, before); }
+};
 gapTests['worker-spaces'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
   try {

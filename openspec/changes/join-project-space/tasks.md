@@ -2,9 +2,9 @@
 
 ## 1. Exclusive live-project occupancy selects existing spaces
 
-- [ ] 1.1 Add bounded read-only local worker inspection and occupancy classification for independent per-project admissions; focused fake-Core cases cover exclusive legacy/v1 combined, ordinary project spaces, dotted projects, mixed projects, finished/ended/shell-only evidence and empty spaces.
-- [ ] 1.2 Preserve exact v1 tuples when joining combined or project identities, including verified repair aliases and deterministic preference for an occupied canonical space in an already split home; assert complete task records and launch labels in the focused cases.
-- [ ] 1.3 Refuse ambiguous/unavailable same-home evidence without task/copy/launch side effects, and exclude remote identities, other homes and personal headings; add isolated negative cases and document classification/naming limits in README.md and docs/worker-spaces.md.
+- [x] 1.1 Add bounded read-only local worker inspection and occupancy classification for independent per-project admissions; focused fake-Core cases cover exclusive legacy/v1 combined, ordinary project spaces, dotted projects, mixed projects, finished/ended/shell-only evidence and empty spaces.
+- [x] 1.2 Preserve exact v1 tuples when joining combined or project identities, including verified repair aliases and deterministic preference for an occupied canonical space in an already split home; assert complete task records and launch labels in the focused cases.
+- [x] 1.3 Refuse ambiguous/unavailable same-home evidence without task/copy/launch side effects, and exclude remote identities, other homes and personal headings; add isolated negative cases and document classification/naming limits in README.md and docs/worker-spaces.md.
 
 ## 2. Concurrent admissions preserve one ordered placement decision
 

@@ -173,8 +173,15 @@ and must keep unsupported, offline and refused homes distinct from successful on
 
 A change applies to **new independent task admissions** only. Existing workers never move,
 relabel or reshuffle; reviews, relaunches and automatic hand-overs inherit their task's
-space, even after a mode switch. In per-project mode a new task uses its project's space
-even when older workers for that project remain combined. Switching back sends new tasks
+space, even after a mode switch. In per-project mode a new task first joins an occupied
+Crew space whose live unfinished workers all belong to that project, including the old
+combined space when it is project-exclusive. Mixed-project and empty spaces are not reused;
+reported/closed/stopped/failed tasks and kept shells do not establish occupancy. If the home
+already has both eligible spaces, its occupied canonical project space wins. With no eligible
+space, the task requests its canonical project identity. Inspection uses task-owned local
+terminals and validated labels, not headings; ambiguous or unavailable evidence refuses before
+creating the task or copy. A combined join keeps combined placement labels and directory-derived
+headings, even though the home's admission policy is per-project. Switching back sends new tasks
 into combined even if their project already has its own space. During a spawn, placement
 is frozen when its task is reserved: an already-admitted launch can start after a switch
 using its saved mode.
