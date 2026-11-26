@@ -34,6 +34,23 @@ A P worker joining legacy combined saves exactly `{version: 1, mode: 'combined',
 
 Herdr keeps its existing directory-derived combined heading (observed as xrbuild here); it does not receive a forced project title. Canonical project joins keep mode per-project and exact project/name. Crew cannot guarantee the combined app heading after directory/user rename changes, and will not rename it.
 
+Exact joining-worker labels (H is the unchanged home tag, P the exact placement project, T the **new worker's own task ID**):
+
+| Label | Join legacy combined | Join registered project space |
+| --- | --- | --- |
+| crew.home | H | H |
+| crew.task | T | T |
+| crew.kind | Worker's own role | Worker's own role |
+| herdr.space | fm-crew-H | fm-crew-H-project-P |
+| herdr.tab | H-T | H-T |
+| herdr.right-click | menu | menu |
+| crew.space.version | 1 | 1 |
+| crew.space.mode | combined | per-project |
+| crew.space.project | P | P |
+| crew.space.name | Omitted, not null/empty text | P |
+
+This matches **herdr-app `src/plugins/crew/fleet.js` on main**, inspected read-only: `placement` accepts unlabeled legacy combined workers or version-one combined with no name and a matching task project; per-project requires version 1, matching task project and exact name to construct the canonical project ID (with the existing crew:self/crew alias allowance). `bindFleet` additionally requires the exact current live task terminal, matching crew.task and home tag, one native pane/tab membership on the same machine, and equality between both herdr.space and the native space's local ID suffix and the identity returned by `placement`. A title or similar project heading grants no binding. Combined children normalize project/name to null internally, so different task projects can coexist without conflicting child records. New joins use v1 combined labels rather than omitting them; they never copy another worker's task/tab labels or advertise a project-space identity inside combined. Internal repair fallback retains the existing fm-crew-H-self contract.
+
 ### 3. Order selection with reservation, not an unprotected preflight
 
 Keep slow Core/Git/copy calls outside `projects.lock`. Collect an admission-relevant registry/task fingerprint before the Core snapshot; in `withRegistry`, reread current config, registration and relevant task placements/terminal references. If these changed, release and refresh with a bounded retry; never publish a stale selection. Save selected workerSpace in the same reservation as today.
