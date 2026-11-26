@@ -2514,13 +2514,16 @@ else if(method==='DELETE') { if(s.removeDenied) fail('removal denied'); const na
 else if(method==='POST') { if(s.addDenied) fail('addition denied'); if(input.labels.some(n=>!s.defined.includes(n))) fail('must never create a label'); s.labels=[...new Set([...s.labels,...input.labels])]; fs.writeFileSync(file,JSON.stringify(s)); console.log('[]'); }
 else fail('unexpected fake request');`);
   const control = patch => { const s = JSON.parse(fs.readFileSync(state, 'utf8')); if (patch) fs.writeFileSync(state, JSON.stringify({ ...s, ...patch })); return patch ? control() : s; };
-  const calls = () => JSON.parse(fs.readFileSync(log, 'utf8'));
+  // Review start reads the PR head before the reviewer exists; label hooks come after it.
+  const allCalls = () => JSON.parse(fs.readFileSync(log, 'utf8')), starts = [];
+  const headRead = (c, i) => c.saved === undefined && starts.some(([from, to]) => i >= from && i < to);
+  const calls = () => allCalls().filter((c, i) => !headRead(c, i)), headReads = () => allCalls().filter(headRead);
   const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim() }); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
-  const start = (id = 'ship', suffix = '') => { const review = `${id}-review${suffix}`; control({ watch: review }); const r = f.call(['review', id, '--agent', 'pi']); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
+  const start = (id = 'ship', suffix = '') => { const review = `${id}-review${suffix}`; control({ watch: review }); const from = allCalls().length, r = f.call(['review', id, '--agent', 'pi']); starts.push([from, allCalls().length]); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
   const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
   const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
   const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
-  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, parent, start, done, writes, warnings, quotaReads, finishResult };
+  return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, headReads, parent, start, done, writes, warnings, quotaReads, finishResult };
 }
 gapTests['review-label-abandon'] = () => {
   const f = reviewLabelsFixture('abandon');
@@ -2841,6 +2844,46 @@ gapTests['review-label-plain-land-head'] = () => {
   assert.equal(f.task('ship').prFacts.url, 'https://github.com/acme/demo/pull/42');
   assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
   assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Land marks a stale approval as Rework');
+};
+gapTests['review-pull-request-head'] = () => {
+  // A delivery bot pushes a finalization commit after the worker, so the pull request
+  // head is one commit ahead of the ship copy's branch when the review starts.
+  const f = reviewLabelsFixture('pull-request-head'), remote = path.join(f.dir, 'origin.git'), bot = path.join(f.dir, 'bot');
+  git('init', '--bare', '-q', remote); git('-C', f.repo, 'remote', 'add', 'origin', remote); git('-C', f.repo, 'push', '-q', 'origin', 'HEAD');
+  const botPush = (ship, files) => {
+    const branch = git('-C', ship.worktree, 'rev-parse', '--abbrev-ref', 'HEAD').trim();
+    git('-C', ship.worktree, 'push', '-q', 'origin', `HEAD:refs/heads/${branch}`);
+    fs.rmSync(bot, { recursive: true, force: true }); git('clone', '-q', '--branch', branch, remote, bot);
+    const head = commit(bot, files, 'chore(openspec): finalize');
+    git('-C', bot, 'push', '-q', 'origin', `HEAD:refs/heads/${branch}`, '+HEAD:refs/pull/42/head');
+    return head;
+  };
+  const ship = f.parent('ship'); commit(ship.worktree, { 'change.txt': 'worker\n' }, 'worker change');
+  const pushed = botPush(ship, { 'openspec.txt': 'finalized\n' }); f.control({ head: pushed });
+  const reads = f.headReads().length, { task, result } = f.start();
+  assert.equal(f.headReads().length, reads + 1, 'Review start reads the pull request head once');
+  assert.equal(task.reviewHead, pushed, 'The review is fixed at the pull request head, not the local branch');
+  assert.equal(git('-C', ship.worktree, 'rev-parse', 'HEAD').trim(), pushed, 'The ship copy is fast-forwarded to it');
+  assert.match(result.out, /fast-forwarded/);
+  assert.ok(fs.readFileSync(task.brief, 'utf8').includes(`git diff HEAD...${pushed}`));
+  const r = f.done(task, 'APPROVE'); assert.equal(r.code, 0, r.out);
+  assert.doesNotMatch(r.out, /approval is for an older head/);
+  assert.equal(f.task('ship').reviewVerdict.stale, false);
+  assert.deepEqual(f.control().labels, ['unrelated', f.approved], 'An approval of the pushed head is Approved');
+
+  const diverged = f.parent('diverged'); commit(diverged.worktree, { 'change.txt': 'worker\n' }, 'worker change');
+  f.control({ head: botPush(diverged, { 'openspec.txt': 'finalized\n' }) });
+  const local = commit(diverged.worktree, { 'change.txt': 'unpushed\n' }, 'local change');
+  let refused = f.call(['review', 'diverged', '--agent', 'pi']);
+  assert.equal(refused.code, 2, refused.out); assert.match(refused.out, /diverged from the pull request/);
+  assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'diverged-review')), 'A refused review launches nothing');
+  assert.equal(git('-C', diverged.worktree, 'rev-parse', 'HEAD').trim(), local, 'A diverged copy is left alone');
+
+  const ahead = f.parent('ahead'); commit(ahead.worktree, { 'change.txt': 'worker\n' }, 'worker change');
+  const before = botPush(ahead, { 'openspec.txt': 'finalized\n' }); git('-C', ahead.worktree, 'fetch', '-q', 'origin', 'refs/pull/42/head'); git('-C', ahead.worktree, 'merge', '--ff-only', '-q', before);
+  commit(ahead.worktree, { 'change.txt': 'unpushed\n' }, 'local change'); f.control({ head: before });
+  refused = f.call(['review', 'ahead', '--agent', 'pi']);
+  assert.equal(refused.code, 2, refused.out); assert.match(refused.out, /ahead of the pull request: push it first/);
 };
 gapTests['plain-land-lifecycle-facts'] = () => {
   const f = reviewLabelsFixture('plain-land-facts');
