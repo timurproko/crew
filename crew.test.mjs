@@ -7,7 +7,7 @@ import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, autoModeGuard, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, autoModeGuard, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity, approvalCovers } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -31,14 +31,14 @@ assert.equal(bashPath('D:\\Git\\x y'), '/d/Git/x y'); assert.equal(bashPath('/ho
 assert.deepEqual(Object.keys(AGENTS), ['a1', 'pi', 'claude']);
 const brief = briefText({ id: 't1', kind: 'scout', task: 'Count lines.', worktree: 'W', project: 'p', report: 'R' });
 assert.match(brief, /read-only investigation/); assert.match(brief, /crew done t1/); assert.match(brief, /`R`/);
-assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' }), /commit them/);
+assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' }), /commit and push them/);
 // Delivery instructions stay distinct; all briefs share external scratch and instance hygiene.
 // A scout's brief does not change for a workflow project; the gate wins over it.
 {
   const ship = { id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' };
-  const ends = '- When you are finished, write your result to `R` in Markdown, with the answer in the first lines.\n- Then run `crew done t1` and stop. Do not start any other work.\n- If you cannot finish, write what blocked you to the same file and still run the command.\n';
+  const ends = '- Run only targeted tests for what you touched, where useful, and list commands/results in your report. Do not run the full local test suite. Push through the project publication path, then report at once; do not wait for CI or the delivery bot. CI and review run in parallel, and the coordinator will combine failures and BLOCKING findings into one fix round.\n- When you are finished, write your result to `R` in Markdown, with the answer in the first lines.\n- Then run `crew done t1` and stop. Do not start any other work.\n- If you cannot finish, write what blocked you to the same file and still run the command.\n';
   const start = '# Task t1 (ship)\n\nx\n\n## Rules\n- Work only inside `W`. It is your own copy of the project `p`; nobody else uses it.\n- Output exception: keep proof pictures and scratch outside the working copy, in your crew task folder `.`. This folder is allowed for reports and disposable output, not project edits.\n- Stop every disposable app instance or server you started before writing your report and running `crew done`.\n';
-  assert.equal(briefText(ship), `${start}- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.\n${ends}`);
+  assert.equal(briefText(ship), `${start}- Make your changes on the branch already checked out here, commit and push them. Do not open or merge a pull request yourself; crew land handles its publication.\n${ends}`);
   const gated = `${start}- Make your changes on the branch already checked out here and commit them.\n- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file I --skip ci\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. A wait that runs out is not a failure: run the same command again to go on. Do not push or open a pull request any other way.\n- The gate ends when the pull request is open. Its checks are not watched here: the person reads them on the pull request.\n- Put the pull request link the gate gives you in the first lines of your report. If the gate stops on something only a person can decide, say exactly what in the report.\n${ends}`;
   assert.equal(briefText({ ...ship, gate: 'I', gateSkip: ['ci'] }), gated);
   assert.equal(briefText({ ...ship, gate: 'I', gateSkip: ['ci'], workflow: true, branch: 'fix/t1' }), gated);
@@ -1665,7 +1665,7 @@ gapTests['merged-land-summary'] = () => {
   assert.match(r.out, /kept for now.*discarded none/); assert.ok(fs.existsSync(path.join(held.worktree, '.artifacts', 'KEEP')));
   f.leave(); r = f.call(['land', held.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /discarded ignored scratch/);
   const open = f.spawn('open'); f.pr({ state: 'OPEN' });
-  r = f.call(['land', open.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /already has a pull request/);
+  r = f.call(['land', open.id]); assert.equal(r.code, 6, r.out); assert.match(r.out, /identity is unproven/);
   assert.equal(readWorld().terminals[open.terminal].state, 'live'); assert.ok(fs.existsSync(path.join(open.worktree, '.artifacts', 'KEEP')));
   const empty = f.spawn('empty'); fs.rmSync(path.join(empty.worktree, '.artifacts'), { recursive: true });
   r = f.call(['finish', empty.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /discarded none/);
@@ -3146,11 +3146,18 @@ else if(endpoint.endsWith('/contents/labels/base.json')) {
   if(s.manifestDelay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,s.manifestDelay);
   console.log(s.manifestRaw ?? JSON.stringify(s.manifest));
 }
+else if(method==='GET' && endpoint.includes('/check-runs?')) {
+  if(s.checksDenied) fail('checks unavailable');
+  console.log(JSON.stringify({check_runs:(s.checks ?? [{id:1,name:'Readiness',status:'completed',conclusion:'success'}]).map(c=>({head_sha:s.head,html_url:'https://checks.test/'+c.id,...c}))}));
+}
+else if(method==='GET' && endpoint.includes('/statuses?')) console.log(JSON.stringify(s.statuses ?? []));
+else if(method==='GET' && endpoint.includes('/commits/')) console.log(JSON.stringify(s.commits?.[endpoint.split('/').at(-1)] ?? {}));
 else if(method==='GET' && endpoint.includes('/pulls/')) {
+  if(s.remote) { const head=spawnSync('git',['--git-dir',s.remote,'rev-parse',s.branch ?? 'feature/ship'],{encoding:'utf8'}); if(head.status===0)s.head=head.stdout.trim(); }
   if(s.prDenied) fail('PR state unavailable');
   if(s.prDelay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,s.prDelay);
   const recorded = ${JSON.stringify(recordedRestPr(42, 'feature/ship', 'pull-get-open.json'))};
-  console.log(JSON.stringify(s.prResponse ?? {...recorded,state:s.prState ?? 'open',merged_at:s.mergedAt ?? null,head:{...recorded.head,sha:s.head}}));
+  console.log(JSON.stringify(s.prResponse ?? {...recorded,state:s.prState ?? 'open',draft:s.draft ?? recorded.draft,merged_at:s.mergedAt ?? null,body:s.body ?? '## Implementation\\n- [x] The behavior is delivered and covered.\\n',head:{...recorded.head,sha:s.head,ref:s.branch ?? 'feature/ship'}}));
 }
 else if(method==='GET' && endpoint.includes('/issues/')) console.log(JSON.stringify([s.labels.map(name=>({name}))]));
 else if(method==='GET') { const name=decodeURIComponent(endpoint.split('/').at(-1)); if(!s.defined.includes(name)) fail('shared label not defined'); console.log(JSON.stringify({name})); }
@@ -3162,13 +3169,188 @@ else fail('unexpected fake request');`);
   const allCalls = () => JSON.parse(fs.readFileSync(log, 'utf8')), starts = [];
   const headRead = (c, i) => c.saved === undefined && starts.some(([from, to]) => i >= from && i < to);
   const calls = () => allCalls().filter((c, i) => !headRead(c, i)), headReads = () => allCalls().filter(headRead);
-  const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim() }); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
+  const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim(), branch: t.branch }); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
   const start = (id = 'ship', suffix = '', script) => { const review = `${id}-review${suffix}`; control({ watch: review }); const from = allCalls().length, r = f.call(['review', id, '--agent', 'pi'], {}, script); starts.push([from, allCalls().length]); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
   const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
   const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
   const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
   return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, headReads, parent, start, done, writes, warnings, quotaReads, finishResult, cancelStart };
 }
+function reviewRemote(f, task) {
+  const remote = path.join(f.dir, 'remote.git');
+  if (!fs.existsSync(remote)) { git('clone', '--bare', '-q', f.repo, remote); git('-C', f.repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git'); }
+  git('-C', f.repo, 'config', `url.${slash(remote)}.insteadOf`, 'https://github.com/acme/demo.git');
+  git('-C', task.worktree, 'push', '-q', 'origin', `HEAD:refs/heads/${task.branch}`);
+  return remote;
+}
+gapTests['coordinator-parallel-loop'] = () => {
+  const f=gapFixture('parallel-coordinator'), file=path.join(f.home,'coordinator','AGENTS.md');
+  const expected=fs.readFileSync(file,'utf8'), text=expected.replace(/\s+/g,' ');
+  for(const part of ['start review at once','CI and review run together','wait for neither CI nor the delivery bot','send them together','Only BLOCKING findings','crew backlog add','covers only the fix','After two rounds that still fail','required checks are green','Do not add scope to an open pull request; start a new task','not a full local suite']) assert.ok(text.includes(part),part);
+  fs.writeFileSync(file,'old coordinator instructions');
+  const r=f.call(['start']); assert.equal(r.code,0,r.out); assert.match(r.out,/coordinator rules changed/);
+  assert.equal(fs.readFileSync(file,'utf8'),expected,'Existing homes receive the new baseline at crew start');
+};
+gapTests['review-fix-only'] = () => {
+  const f=reviewLabelsFixture('fix-only'), task=f.parent(), head=f.control().head;
+  const first=f.start().task; assert.equal(f.done(first,'CHANGES NEEDED\n\n## What I checked\nBLOCKING README.md: claimed behavior missing.').code,0);
+  assert.equal(f.task('ship').approvedHead,undefined);
+  const fix=commit(task.worktree,{'fix.js':'export const works=true;'},'fix blocker'); f.control({head:fix});
+  const next=f.start('ship','-2').task;
+  assert.equal(next.reviewMode,'delta'); assert.equal(next.reviewBase,head); assert.deepEqual(next.reviewCommits,[fix]);
+  assert.ok(fs.readFileSync(next.brief,'utf8').includes(slash(first.report)),'Fix-only review can recheck the previous blocker report');
+  assert.equal(f.done(next,'APPROVE\n\n## What I checked\nTargeted fix inspected.\nFOLLOW-UP README.md: wording can be polished.').code,0);
+  assert.equal(f.task('ship').approvedHead,fix); assert.deepEqual(f.control().labels,['unrelated',f.approved],'Follow-ups do not manufacture a negative verdict');
+};
+gapTests['reported-review-no-ci-gate'] = () => {
+  const f=reviewLabelsFixture('reported-review'), task=f.parent('ship',{workflow:'delivery',stage:'implementation'});
+  const call=()=>f.call(['review','ship','--agent','pi']);
+  f.save({...task,state:'working'}); assert.equal(call().code,2); f.save(task);
+  for(const draft of [true,false]) for(const conclusion of ['success','failure','cancelled','skipped',null]) {
+    f.control({draft,body:'## Implementation\n- [ ] Unfinished outcome text.\n',checksDenied:true,checks:[{id:1,name:'Name guard',status:conclusion?'completed':'queued',conclusion}]});
+    const r=call(); assert.equal(r.code,0,`${draft}/${conclusion}: ${r.out}`);
+  }
+  assert.ok(!f.calls().some(c=>/check-runs|\/statuses\?|actions\/runs/.test(c.endpoint??'')),'Review never reads checks');
+};
+gapTests['reported-wait-no-ci'] = () => {
+  const f=reviewLabelsFixture('reported-wait'), task=f.parent('ship',{workflow:'delivery',stage:'implementation',checkRepair:{pending:true}});
+  const before=f.calls().length, core=readWorld().log.length, record=JSON.stringify(f.task('ship'));
+  f.control({network:true});
+  for(const flags of [[],['--no-fallback']]) {
+    const r=f.call(['wait','ship','--timeout','0.01',...flags]); assert.equal(r.code,0,r.out); assert.match(r.out,/ship: reported/);
+  }
+  assert.equal(f.calls().length,before,'Reported wait makes no GitHub requests even with a legacy repair record');
+  assert.equal(JSON.stringify(f.task('ship')),record,'Reported wait never reopens or rewrites the task');
+  assert.ok(!readWorld().log.slice(core).some(a=>['send','run','kill','rm','label'].includes(a[0])));
+};
+gapTests['review-role-coverage'] = () => {
+  const f=reviewLabelsFixture('role-coverage',{CREW_DELIVERY_APP_SLUG:'delivery'}), ship=f.parent('ship',{workflow:'delivery',stage:'implementation'});
+  commit(ship.worktree,{'openspec/changes/example/specs/thing/spec.md':'# change\n'},'scope'); const a=git('-C',ship.worktree,'rev-parse','HEAD').trim();
+  const manifest=structuredClone(f.manifest); manifest.labels['review-changes-needed']={name:'Build',previousNames:[f.changes,f.oldChanges]};
+  f.control({head:a,manifest,defined:[f.under,f.approved,'Build']});
+  const reviewer=f.start().task; assert.deepEqual(f.control().labels,['unrelated',f.under]);
+  commit(ship.worktree,{'openspec/specs/thing/spec.md':'# synced\n'},'docs(openspec): finalize example'); const final=git('-C',ship.worktree,'rev-parse','HEAD').trim();
+  f.control({head:final,body:'## Implementation\n- [x] Delivered behavior here.\n\n```openspec-implementation\n{"change":"example","archive":"openspec/changes/archive/2026-11-26-example/"}\n```',commits:{[final]:{sha:final,author:{login:'delivery[bot]'},committer:{login:'delivery[bot]'}}},checks:[{id:2,name:'Heavy suite',status:'in_progress',conclusion:null}]});
+  let r=f.done(reviewer,'APPROVE\n\n## What I checked\nCommands and results.'); assert.equal(r.code,0,r.out); assert.equal(f.task('ship').reviewVerdict.stale,false);
+  assert.deepEqual(f.control().labels,['unrelated',f.approved],'Covered approval is immediate even while full CI is pending');
+  reviewRemote(f,ship); const wait=()=>f.call(['wait','ship','--timeout','1'],{CREW_RECOVERY_SECONDS:'0.01'});
+  assert.equal(wait().code,0); assert.deepEqual(f.control().labels,['unrelated',f.approved]);
+  commit(ship.worktree,{'new.js':'unreviewed behavior'},'fix code'); const human=git('-C',ship.worktree,'rev-parse','HEAD').trim(); git('-C',ship.worktree,'push','-q','origin',ship.branch);
+  f.control({head:human,checks:[{id:3,name:'Readiness',status:'completed',conclusion:'success'},{id:4,name:'OpenSpec',status:'completed',conclusion:'success'},{id:5,name:'Heavy suite',status:'in_progress',conclusion:null}]});
+  r=wait(); assert.equal(r.code,0,r.out); assert.match(r.out,/ship: reported/); assert.deepEqual(f.control().labels,['unrelated',f.approved],'Wait does not observe commits or change labels');
+  assert.equal(f.task('ship').reviewVerdict.verdict,'APPROVE'); assert.equal(f.task('ship').approvedHead,a);
+  const delta=f.start('ship','-2').task; assert.deepEqual(delta.reviewCommits,[human]); assert.equal(f.done(delta,'CHANGES NEEDED\nBLOCKING new.js: fix the behavior.').code,0);
+  assert.deepEqual(f.control().labels,['unrelated','Build']); assert.equal(f.task('ship').approvedHead,a);
+  r=f.call(['tell','ship','fix findings']); assert.equal(r.code,0,r.out); assert.deepEqual(f.control().labels,['unrelated','Build']);
+  const fix=commit(ship.worktree,{'new.js':'fixed behavior'},'fix findings'); f.control({head:fix}); f.save({...f.task('ship'),state:'reported'});
+  const second=f.start('ship','-3').task;
+  assert.equal(second.reviewBase,human,'A second review covers only the fix after the last negative verdict');
+  assert.deepEqual(second.reviewCommits,[fix]); assert.equal(f.task('ship').approvedHead,a);
+};
+
+gapTests['plain-land-repairs'] = () => {
+  const f=reviewLabelsFixture('land-repairs'), task=f.parent('ship',{pr:'https://github.com/acme/demo/pull/42'}), remote=reviewRemote(f,task);
+  const a=git('-C',task.worktree,'rev-parse','HEAD').trim(); f.save({...f.task('ship'),approvedHead:a,reviewVerdict:{verdict:'APPROVE',head:a,currentHead:a,stale:false,needsReview:false}});
+  f.control({remote,labels:['unrelated',f.approved]});
+  commit(task.worktree,{'repair.js':'export const fixed=true;'},'repair'); const head=git('-C',task.worktree,'rev-parse','HEAD').trim();
+  let r=f.call(['land','ship']); assert.equal(r.code,0,r.out); assert.match(r.out,/published repair commits/);
+  assert.equal(git('--git-dir',remote,'rev-parse',task.branch).trim(),head); assert.equal(f.task('ship').approvedHead,a); assert.equal(f.task('ship').reviewVerdict.needsReview,true);
+  assert.deepEqual(f.control().labels,['unrelated',f.changes]); assert.ok(!f.calls().some(c=>c.a[0]==='pr'&&c.a[1]==='create'));
+  r=f.call(['land','ship']); assert.equal(r.code,0,r.out); assert.match(r.out,/no new commits/);
+  fs.writeFileSync(path.join(task.worktree,'dirty.txt'),'dirty'); assert.equal(f.call(['land','ship']).code,6); fs.unlinkSync(path.join(task.worktree,'dirty.txt'));
+  f.control({prState:'closed'}); assert.equal(f.call(['land','ship']).code,6); f.control({prState:'open'});
+  const hook=path.join(remote,'hooks','pre-receive'); fs.writeFileSync(hook,'#!/bin/sh\nexit 1\n',{mode:0o755});
+  commit(task.worktree,{'retry.js':'retry'},'retry repair'); const beforeRefused=git('--git-dir',remote,'rev-parse',task.branch).trim();
+  r=f.call(['land','ship']); assert.equal(r.code,4,r.out); assert.equal(git('--git-dir',remote,'rev-parse',task.branch).trim(),beforeRefused);
+  fs.unlinkSync(hook); assert.equal(f.call(['land','ship']).code,0);
+  const bot=path.join(f.dir,'outside'); git('clone','-q','--branch',task.branch,remote,bot); commit(bot,{'remote.js':'remote change'},'remote repair'); git('-C',bot,'push','-q');
+  commit(task.worktree,{'local.js':'local change'},'local repair'); r=f.call(['land','ship']); assert.equal(r.code,6,r.out); assert.match(r.out,/ahead or diverged/);
+  const remoteHead=git('--git-dir',remote,'rev-parse',task.branch).trim(); assert.notEqual(remoteHead,git('-C',task.worktree,'rev-parse','HEAD').trim());
+  f.control({prResponse:{state:'open',number:42,html_url:'https://github.com/acme/demo/pull/42',head:{sha:head,ref:'wrong',repo:{full_name:'acme/demo'}}}});
+  assert.equal(f.call(['land','ship']).code,6); assert.equal(git('--git-dir',remote,'rev-parse',task.branch).trim(),remoteHead);
+};
+
+gapTests['review-delta-brief'] = () => {
+  const f=reviewLabelsFixture('delta-brief',{CREW_DELIVERY_APP_SLUG:'delivery'}), ship=f.parent();
+  assert.equal(f.call(['config','worker-space','per-project']).code,0);
+  commit(ship.worktree,{'openspec/changes/example/specs/thing/spec.md':'# change\n'},'scope');
+  const a=git('-C',ship.worktree,'rev-parse','HEAD').trim(); f.control({head:a});
+  const first=f.start().task; assert.equal(first.reviewMode,'full'); assert.equal(f.done(first,'APPROVE').code,0);
+  commit(ship.worktree,{'openspec/specs/thing/spec.md':'# finalized\n'},'docs(openspec): finalize example');
+  const bot=git('-C',ship.worktree,'rev-parse','HEAD').trim();
+  commit(ship.worktree,{'openspec/specs/thing/spec.md':'# human new behavior\n'},'spec fix');
+  const human=git('-C',ship.worktree,'rev-parse','HEAD').trim();
+  f.control({head:human,body:'```openspec-implementation\n{"change":"example","archive":"openspec/changes/archive/2026-11-26-example/"}\n```',commits:{[bot]:{sha:bot,author:{login:'delivery[bot]'},committer:{login:'delivery[bot]'}}}});
+  const next=f.start('ship','-2').task;
+  assert.equal(next.reviewMode,'delta'); assert.equal(next.reviewBase,a); assert.deepEqual(next.reviewCommits,[human]); assert.deepEqual(next.reviewExcluded,[bot]);
+  assert.deepEqual(next.workerSpace,ship.workerSpace,'Delta reviewer inherits the ship placement after the home mode changes');
+  const brief=fs.readFileSync(next.brief,'utf8');
+  for(const text of ['DELTA review',`${a}..${human}`,'git checkout --detach','targeted tests where useful','Do not run the full local test suite','What I checked','even on APPROVE','EVERY finding','BLOCKING','FOLLOW-UP','only if at least one finding is BLOCKING','do not hold the merge']) assert.ok(brief.includes(text),text);
+  assert.equal(f.done(next,'APPROVE\n\n## What I checked\nSpec-only delta; no test run required.').code,0); assert.equal(f.task('ship').approvedHead,human);
+  assert.equal(f.task('ship').reviewVerdict.needsReview,false);
+  git('-C',ship.worktree,'reset','--hard',a); f.control({head:a});
+  const replaced=f.start('ship','-3').task; assert.equal(replaced.reviewMode,'full'); assert.equal(replaced.reviewBase,null);
+};
+
+gapTests['approval-coverage'] = () => {
+  const f = reviewLabelsFixture('coverage'), task = f.parent();
+  const base = git('-C', task.worktree, 'rev-parse', 'HEAD').trim();
+  commit(task.worktree, { 'openspec/changes/example/specs/thing/spec.md': '# delta\n' }, 'change scope');
+  const approved = git('-C', task.worktree, 'rev-parse', 'HEAD').trim(), commits = {};
+  const pr = { body: '```openspec-implementation\n{"change":"example","archive":"openspec/changes/archive/2026-11-26-example/"}\n```', base: { sha: base } };
+  const api = { get: endpoint => commits[endpoint.split('/').at(-1)] ?? {} };
+  const proof = head => approvalCovers(task, approved, head, { pr, api });
+  const add = (files, subject, author = 'delivery[bot]', committer = author) => {
+    commit(task.worktree, files, subject); const sha = git('-C', task.worktree, 'rev-parse', 'HEAD').trim();
+    commits[sha] = { sha, author: { login: author }, committer: { login: committer } }; return sha;
+  };
+  const old = process.env.CREW_DELIVERY_APP_SLUG; process.env.CREW_DELIVERY_APP_SLUG = 'delivery';
+  try {
+    assert.equal(proof(approved).covered, true);
+    const finalized = add({ 'openspec/specs/thing/spec.md': '# synced\n' }, 'docs(openspec): finalize example');
+    assert.equal(proof(finalized).covered, true);
+    const refinalized = add({ 'openspec/changes/archive/2026-11-26-example/acceptance.md': 'accepted\n' }, 'docs(openspec): refinalize example');
+    assert.equal(proof(refinalized).covered, true);
+    const human = add({ 'openspec/specs/thing/spec.md': '# human spec change\n' }, 'docs(openspec): refinalize example', 'person');
+    assert.deepEqual(proof(human).commits, [human]); assert.equal(proof(human).mode, 'delta');
+    const wrong = add({ 'code.js': 'bad\n' }, 'docs(openspec): finalize example');
+    assert.ok(proof(wrong).commits.includes(wrong));
+    const spoof = add({ 'openspec/specs/thing/spec.md': '# spoof\n' }, 'docs(openspec): finalize example', 'delivery[bot]', 'person');
+    assert.ok(proof(spoof).commits.includes(spoof));
+    const other = add({ 'openspec/specs/unrelated/spec.md': '# other\n' }, 'docs(openspec): finalize example');
+    assert.ok(proof(other).commits.includes(other));
+    assert.equal(approvalCovers(task, human, finalized).mode, 'full');
+    assert.equal(proof('b'.repeat(40)).covered, false);
+    // A clean base merge imports ordinary human commits without requiring their re-review.
+    git('-C', f.repo, 'checkout', '-qb', 'base-new', base);
+    commit(f.repo, { 'base.txt': 'new base\n' }, 'base update');
+    pr.base.sha = git('-C', f.repo, 'rev-parse', 'HEAD').trim();
+    git('-C', task.worktree, 'reset', '--hard', refinalized);
+    git('-C', task.worktree, '-c', 'user.name=Maintainer', '-c', 'user.email=maintainer@example.test', 'merge', '--no-ff', '-m', 'base merge', pr.base.sha);
+    const merge = git('-C', task.worktree, 'rev-parse', 'HEAD').trim(); commits[merge] = { sha: merge, author: { login: 'delivery[bot]' }, committer: { login: 'delivery[bot]' } };
+    assert.equal(proof(merge).covered, true);
+    // A hand-edited merge tree is not exempt even with the correct App identity.
+    fs.writeFileSync(path.join(task.worktree, 'hand.txt'), 'hand edit'); git('-C', task.worktree, 'add', '.');
+    git('-C', task.worktree, '-c', 'user.name=Maintainer', '-c', 'user.email=maintainer@example.test', 'commit', '--amend', '--no-edit');
+    const edited = git('-C', task.worktree, 'rev-parse', 'HEAD').trim(); commits[edited] = { ...commits[merge], sha: edited };
+    assert.equal(proof(edited).covered, false);
+    commit(f.repo, { 'conflict.txt': 'base side\n' }, 'base conflict'); pr.base.sha=git('-C',f.repo,'rev-parse','HEAD').trim();
+    git('-C',task.worktree,'reset','--hard',refinalized); commit(task.worktree,{'conflict.txt':'task side\n'},'task conflict');
+    const conflicting=spawnSync('git',['-C',task.worktree,'-c','user.name=Maintainer','-c','user.email=maintainer@example.test','merge','--no-commit',pr.base.sha],{encoding:'utf8'});
+    assert.equal(conflicting.status,1); fs.writeFileSync(path.join(task.worktree,'conflict.txt'),'hand resolution\n'); git('-C',task.worktree,'add','.');
+    git('-C',task.worktree,'-c','user.name=Maintainer','-c','user.email=maintainer@example.test','commit','--no-edit');
+    const conflictMerge=git('-C',task.worktree,'rev-parse','HEAD').trim(); commits[conflictMerge]={...commits[merge],sha:conflictMerge};
+    assert.ok(!proof(conflictMerge).excluded.includes(conflictMerge),'A conflict resolution is never a clean base merge');
+    delete process.env.CREW_DELIVERY_APP_SLUG; assert.equal(proof(refinalized).covered, false);
+  } finally { if (old === undefined) delete process.env.CREW_DELIVERY_APP_SLUG; else process.env.CREW_DELIVERY_APP_SLUG = old; }
+  // Latest findings never destroy the last approved head.
+  f.control({ head: git('-C', task.worktree, 'rev-parse', 'HEAD').trim() });
+  const a = f.start().task; assert.equal(f.done(a, 'APPROVE').code, 0);
+  const at = f.task('ship').approvedHead; const b = f.start('ship', '-2').task;
+  assert.equal(f.done(b, 'CHANGES NEEDED').code, 0); assert.equal(f.task('ship').approvedHead, at);
+  assert.equal(f.call(['tell', 'ship', 'fix']).code, 0); assert.equal(f.task('ship').approvedHead, at);
+};
+
 gapTests['review-label-abandon'] = () => {
   const f = reviewLabelsFixture('abandon');
   for (const [id, prior, expected] of [['rework', f.changes, f.changes], ['approved', f.approved, f.approved], ['none', null, null], ['legacy', f.oldChanges, f.changes]]) {
@@ -3227,7 +3409,9 @@ gapTests['review-label-exclusive-actions'] = () => {
     const id = stale ? 'stale-land' : 'fresh-land', ship = f.parent(id, { pr: 'https://github.com/acme/demo/pull/42' });
     const head = f.control().head;
     f.save({ ...ship, reviewVerdict: { verdict: 'APPROVE', head, currentHead: head, stale: false, needsReview: false } });
-    f.control({ head: stale ? 'b'.repeat(40) : head, labels: ['unrelated', f.under, f.oldUnder, f.approved, f.changes] });
+    if (stale) commit(ship.worktree, { 'repair.txt': 'new work' }, 'repair');
+    reviewRemote(f, ship);
+    f.control({ head: git('-C', ship.worktree, 'rev-parse', 'HEAD').trim(), labels: ['unrelated', f.under, f.oldUnder, f.approved, f.changes] });
     r = f.call(['land', id]); assert.equal(r.code, 0, r.out);
     assert.deepEqual(f.control().labels, ['unrelated', stale ? f.changes : f.approved], 'Land normalizes conflicting assignments, even manually added labels');
   }
@@ -3411,21 +3595,22 @@ gapTests['review-label-current-head'] = () => {
   assert.equal(f.task('ship').reviewVerdict.needsReview, true);
   assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
 
-  f.parent('moved'); const moved = f.start('moved').task, reviewed = f.control().head;
-  f.control({ head: 'b'.repeat(40) }); at = f.calls().length;
+  const movedShip = f.parent('moved'); const moved = f.start('moved').task, reviewed = f.control().head;
+  const movedHead = commit(movedShip.worktree, { 'later.js': 'new code' }, 'later code');
+  f.control({ head: movedHead }); at = f.calls().length;
   r = f.done(moved, 'APPROVE'); assert.equal(r.code, 0, r.out);
   assert.deepEqual(f.control().labels, ['unrelated', f.changes]);
   assert.match(r.out, /approval is for an older head.*needs another review/i);
-  assert.deepEqual(Object.fromEntries(['head', 'currentHead', 'stale', 'needsReview'].map(key => [key, f.task('moved').reviewVerdict[key]])), { head: reviewed, currentHead: 'b'.repeat(40), stale: true, needsReview: true });
+  assert.deepEqual(Object.fromEntries(['head', 'currentHead', 'stale', 'needsReview'].map(key => [key, f.task('moved').reviewVerdict[key]])), { head: reviewed, currentHead: movedHead, stale: true, needsReview: true });
   assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
   const shown = JSON.parse(f.call(['status', '--json']).out).tasks.find(t => t.id === 'moved');
   assert.equal(shown.reviewVerdict.stale, true, 'Status exposes recorded review freshness without network reads');
+  reviewRemote(f, movedShip);
   f.save({ ...f.task('moved'), pr: 'https://github.com/acme/demo/pull/42' }); at = f.calls().length;
   r = f.call(['land', 'moved']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /approval is for an older head.*needs another review/i);
-  assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
+  assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 2);
 
-  git('-C', f.repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git');
   f.parent('discovered', {}, 'Done.'); f.control({ labels: ['unrelated', f.approved] });
   r = f.call(['tell', 'discovered', 'Continue.']); assert.equal(r.code, 0, r.out);
   assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'A plain PR can be discovered before land records its URL');
@@ -3466,7 +3651,7 @@ gapTests['review-label-current-head'] = () => {
   f.parent('missing-head'); const missing = f.start('missing-head').task;
   f.control({ prResponse: { state: 'open' } }); r = f.done(missing, 'APPROVE');
   assert.equal(r.code, 0, r.out); assert.match(r.out, /head could not be verified.*needs another review/);
-  assert.deepEqual(f.control().labels, ['unrelated', f.changes]);
+  assert.deepEqual(f.control().labels, ['unrelated', f.under], 'Unknown head is not a negative verdict and does not invent Build');
 };
 gapTests['review-label-plain-land-head'] = () => {
   const f = reviewLabelsFixture('plain-land-head'), remote = path.join(f.dir, 'origin.git');
@@ -3613,7 +3798,7 @@ gapTests['review-label-failures'] = () => {
 
 try {
   const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
-  for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { await test(); console.log(`PASS: gap ${name}`); }
+  for (const [name, test] of Object.entries(gapTests)) if ((!onlyGaps && !process.argv.includes('--main')) || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { await test(); console.log(`PASS: gap ${name}`); }
   if (!onlyGaps) {
   // The focused fixtures have their own homes and copies, but share the fake Core transport.
   fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
@@ -4088,7 +4273,12 @@ console.log('https://example.invalid/acme/demo/pull/7');
   const review = taskOf('s1-review');
   assert.ok(readWorld().log.filter(a => a[0] === 'run').at(-1).includes('crew.kind=review'), 'A reviewer is labelled as one');
   assert.deepEqual([review.kind, review.reviews, review.project], ['scout', 's1', 'demo']);
-  assert.ok(fs.readFileSync(review.brief, 'utf8').includes(`git diff HEAD...${review.reviewHead}`) && fs.readFileSync(review.brief, 'utf8').includes('`APPROVE` or `CHANGES NEEDED`'));
+  const reviewerInstructions = fs.readFileSync(review.brief, 'utf8');
+  assert.ok(reviewerInstructions.includes(`git diff HEAD...${review.reviewHead}`));
+  assert.match(reviewerInstructions, /Start your report with exactly `CHANGES NEEDED` only if at least one finding is BLOCKING; otherwise start with `APPROVE`/);
+  assert.match(reviewerInstructions, /short `## What I checked` section, even on APPROVE/);
+  assert.match(reviewerInstructions, /Mark EVERY finding `BLOCKING`.*or `FOLLOW-UP`/);
+  assert.match(reviewerInstructions, /FOLLOW-UP findings.*do not hold the merge/);
   assert.match(own(['review', 's1', '--agent', 'claude']).out, /spawned s1-review-2: claude scout/);
   // land: refused with unsaved work, without a place to push to, and honest when GitHub says no.
   fs.writeFileSync(path.join(s1copy, 'loose.txt'), 'x');
@@ -4112,7 +4302,10 @@ console.log('https://example.invalid/acme/demo/pull/7');
   assert.equal(JSON.parse(r.out).tasks.find(t => t.id === 's1').pr, 'https://example.invalid/acme/demo/pull/7');
   r = own(['status']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /^s1\t[^\r\n]*\thttps:\/\/example\.invalid\/acme\/demo\/pull\/7\r?$/m);
-  assert.match(own(['land', 's1', '--title', 'x']).out, /already has a pull request/);
+  const creationsBefore = JSON.parse(fs.readFileSync(ghLog, 'utf8')).filter(c => c.a[0] === 'pr' && c.a[1] === 'create').length;
+  const unprovenRepeat = own(['land', 's1', '--title', 'x']);
+  assert.equal(unprovenRepeat.code, 6, unprovenRepeat.out); assert.match(unprovenRepeat.out, /GitHub evidence unreadable/);
+  assert.equal(JSON.parse(fs.readFileSync(ghLog, 'utf8')).filter(c => c.a[0] === 'pr' && c.a[1] === 'create').length, creationsBefore, 'An unproven repeat never opens another PR');
   for (const id of ['s1-review', 's1-review-2', 's2', 's1']) assert.equal(own(['finish', id, '--force']).code, 0, id);
   assert.ok(git('-C', project, 'branch', '--list', 'feature/s1').includes('feature/s1'), 'A branch whose pull request is not merged stays');
   // A squash merge leaves no ancestry: GitHub's merged pull request with this exact head counts.
@@ -4272,7 +4465,10 @@ if (a[0] === 'start') {
   // The shared delivery workflow: a repository that carries its instructions is delivered its
   // own way. The worker plans in a draft pull request; crew never pushes or opens one for it.
   assert.equal(p1.workflow, undefined, 'A copy without the shared instructions is a plain one');
-  assert.ok(fs.readFileSync(p1.brief, 'utf8').includes('Do not push or open a pull request unless'));
+  const plainInstructions = fs.readFileSync(p1.brief, 'utf8');
+  assert.match(plainInstructions, /commit and push them/);
+  assert.match(plainInstructions, /Do not open or merge a pull request yourself; crew land handles its publication/);
+  assert.match(plainInstructions, /report at once; do not wait for CI or the delivery bot/);
   commit(project, { 'AGENTS.md': TEMPLATE }, 'Use the shared workflow');
   r = dl(['spawn', 'w1', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'Add a feature.']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /follows the repository's delivery workflow/);
@@ -4338,7 +4534,10 @@ if (a[0] === 'start') {
   r = dl(['project', 'add', 'pooled', project, '--workflow', 'plain']); assert.equal(r.code, 0, r.out); assert.match(r.out, /\(workflow: plain\)/);
   assert.match(dl(['project', 'list']).out, /^pooled\t[^\t\r\n]*\tworkflow plain\r?$/m);
   assert.equal(dl(['spawn', 'w5', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
-  assert.equal(taskOf('w5').workflow, undefined); assert.ok(fs.readFileSync(taskOf('w5').brief, 'utf8').includes('Do not push or open a pull request unless'));
+  assert.equal(taskOf('w5').workflow, undefined);
+  const explicitPlainInstructions = fs.readFileSync(taskOf('w5').brief, 'utf8');
+  assert.match(explicitPlainInstructions, /commit and push them/);
+  assert.match(explicitPlainInstructions, /Do not open or merge a pull request yourself; crew land handles its publication/);
   git('-C', project, 'rm', '-q', 'AGENTS.md'); git('-C', project, ...who, 'commit', '-q', '-m', 'Back to plain');
   dl(['project', 'add', 'pooled', project, '--workflow', 'delivery']);
   assert.equal(dl(['spawn', 'w6', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
@@ -4381,7 +4580,8 @@ if (a[0] === 'start') {
   r = tl(['project', 'add', 'demo', project, '--gate-skip', 'none']); assert.ok(r.out.includes('(gate skips: nothing)'));
   assert.equal(tl(['spawn', 'g4', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   const g4brief = fs.readFileSync(taskOf('g4').brief, 'utf8');
-  assert.ok(!g4brief.includes('--skip') && g4brief.includes('no-mistakes axi handoff') && g4brief.includes('ten minutes'), 'A watched gate is told how its watch ends');
+  assert.ok(!g4brief.includes('--skip'), 'An explicitly watched gate retains its selected steps');
+  assert.match(g4brief, /end any CI watch with `no-mistakes axi handoff` and report at once; do not wait for checks/);
   assert.equal(tl(['finish', 'g4', '--force']).code, 0);
   // The gate wins over the shared delivery workflow: a gated project keeps the gate's flow.
   r = tl(['project', 'add', 'demo', project, '--gate-skip', 'none', '--workflow', 'delivery']); assert.equal(r.code, 0, r.out);
