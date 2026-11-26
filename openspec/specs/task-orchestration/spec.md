@@ -215,12 +215,12 @@ For an unrecorded ship PR, Crew SHALL verify the task's recorded worktree, branc
 
 ### Requirement: Discovery is bounded and read-only for every caller
 
-Crew SHALL allow non-owner discovery without changing ownership, reports, delivery authority or Git state; only separate verified PR facts may be saved. Reads SHALL be serial, bounded in size, limited to two seconds each and ten seconds total, without retries. Failures SHALL return per-task unavailable reasons without failing valid status requests. Non-ships without recorded PRs SHALL return none without remote reads.
+Crew SHALL allow non-owner discovery without changing ownership, reports, delivery authority or Git state; only separate verified PR facts may be saved, with best-effort URL publication to the task's recorded terminal. GitHub reads SHALL be serial, bounded in size, limited to two seconds each and ten seconds total, without retries. Failures SHALL return per-task unavailable reasons without failing valid status requests. Non-ships without recorded PRs SHALL return none without remote reads.
 
 #### Scenario: Non-owner inspects an active home
 
 - **WHEN** a non-owner session requests discovery while the coordinator is live
-- **THEN** it receives results without claiming ownership, setting authoritative task.pr, changing stages, or landing tasks; only verified observation facts can be saved
+- **THEN** it receives results without claiming ownership, setting authoritative task.pr, changing stages, or landing tasks; only verified observation facts can be saved and their URL published as terminal metadata
 
 #### Scenario: GitHub is unavailable or unsupported
 
@@ -230,12 +230,12 @@ Crew SHALL allow non-owner discovery without changing ownership, reports, delive
 #### Scenario: Budget expires with tasks remaining
 
 - **WHEN** the shared discovery budget is exhausted
-- **THEN** unqueried eligible tasks return unavailable with reason budget-exhausted and no further subprocess starts
+- **THEN** unqueried eligible tasks return unavailable with reason budget-exhausted and no further GitHub subprocess starts
 
 #### Scenario: Local state remains authoritative
 
 - **WHEN** discovery returns a PR before a worker reports
-- **THEN** only separate observation facts may be saved and subsequent done and land commands retain their existing report, stage and delivery checks
+- **THEN** only separate observation facts and terminal PR metadata may be updated and subsequent done and land commands retain their existing report, stage and delivery checks
 
 ### Requirement: Saved review starts swap advisory activity labels
 
@@ -321,7 +321,7 @@ Crew SHALL use signed-in gh credentials and existing shared label definitions on
 
 ### Requirement: Minimal review labels have explicit lifecycle limitations
 
-Crew SHALL use only Build, Review and Approved roles, with names from the shared manifest, and no approval-waiting-for-CI state. Tell, relaunch, verdict processing and plain land SHALL update relevant open-PR roles best-effort; status and reported-task wait SHALL remain read-only. No background sweep, lease or pending-label protocol SHALL be added. Abandoned reviews SHALL retain existing last-local-reviewer restoration safeguards. Closed/merged PRs SHALL receive no new role assignments.
+Crew SHALL use only Build, Review and Approved roles, with names from the shared manifest, and no approval-waiting-for-CI state. Tell, relaunch, verdicts and plain land SHALL update relevant open-PR roles best-effort; status and reported-task wait SHALL remain read-only toward GitHub labels. No background sweep, lease or pending-label protocol SHALL be added. Abandoned reviews SHALL retain last-local-reviewer restoration safeguards. Closed/merged PRs SHALL receive no new role assignments.
 
 #### Scenario: Reviewer stops without a valid verdict
 
@@ -336,7 +336,7 @@ Crew SHALL use only Build, Review and Approved roles, with names from the shared
 #### Scenario: Status is inspected
 
 - **WHEN** ordinary or explicit PR-discovery status is read
-- **THEN** label signaling performs no requests or metadata writes and adds no pending-label display
+- **THEN** GitHub label signaling performs no requests or metadata writes and adds no pending-label display; only explicit discovery may publish verified PR terminal metadata
 
 #### Scenario: Worker is sent follow-up work
 
@@ -460,7 +460,7 @@ Fleet status SHALL select and project tasks using saved state without reading ta
 
 ### Requirement: Unsupported status views have detectable errors
 
-Crew SHALL reject unknown --view values with a nonzero usage exit and a stable `unsupported-status-view` diagnostic naming the value. Fleet SHALL require --json. Status without --view, including --all with or without discovery, SHALL retain its existing serialized field order and output bytes for unchanged input facts.
+Crew SHALL reject unknown --view values with a nonzero usage exit and a stable unsupported-status-view diagnostic naming the value. Fleet SHALL require --json. Status without --view, including --all with or without discovery, SHALL retain existing serialized fields and order except for additive reviewRound and lastFinding per task. These additions SHALL NOT alter the minimal fleet v1 shape.
 
 #### Scenario: New client probes unsupported view
 
@@ -475,7 +475,7 @@ Crew SHALL reject unknown --view values with a nonzero usage exit and a stable `
 #### Scenario: Legacy consumer still requests all history
 
 - **WHEN** a caller requests status --all --json without --view
-- **THEN** all historical rows and legacy fields remain present and cached lifecycle facts introduce no new output fields
+- **THEN** all historical rows and legacy fields remain present alongside reviewRound and lastFinding, and cached lifecycle facts introduce no other new output fields
 
 ### Requirement: Fleet recorded-PR verification is bounded
 
@@ -718,7 +718,7 @@ Crew SHALL remove only terminals it recorded starting, never close an entire spa
 
 ### Requirement: Legacy tasks and orchestration commands remain compatible
 
-Tasks without placement metadata SHALL retain old combined inheritance and remain reportable and finishable without bulk migration. Status, wait, tell, review, relaunch and finish SHALL retain existing contracts except the plain-status mode line. End SHALL release ownership without moving or removing work. Read-only status SHALL NOT reconcile spaces or change legacy full JSON. Minimal fleet adds only the separately specified authoritative project field.
+Tasks without placement metadata SHALL retain combined inheritance and remain reportable and finishable without bulk migration. Space contracts SHALL stay compatible across lifecycle commands; end SHALL release ownership without moving work. Status SHALL NOT reconcile spaces. Allowed additions are the plain-status mode line, ordinary JSON review context, minimal fleet task project, and verified PR terminal metadata during explicit discovery.
 
 #### Scenario: Updated tool loads an old running task
 
@@ -737,8 +737,8 @@ Tasks without placement metadata SHALL retain old combined inheritance and remai
 
 #### Scenario: An inspector reads fleet status
 
-- **WHEN** a non-owner requests legacy JSON or minimal fleet status for a mixed layout
-- **THEN** the existing output contract is preserved and no space or terminal mutation occurs
+- **WHEN** a non-owner requests ordinary JSON or minimal fleet status for a mixed layout
+- **THEN** the specified output contracts are preserved and no space mutation occurs; only explicit discovery may publish a verified PR URL to a task's recorded terminal
 
 ### Requirement: Approval coverage preserves reviewed work
 
@@ -1027,3 +1027,99 @@ Fleet tasks SHALL include project as the exact nonempty recorded string from ful
 
 - **WHEN** fleet reads a cold, warm, changed or rebuilt summary index
 - **THEN** every visible task project agrees with current authoritative task state without extra per-worker Core or network calls
+
+### Requirement: Task terminals advertise their pull request
+
+Crew SHALL publish a known full PR URL as `crew.pr` on a reviewer terminal at launch and on ship/fix terminals at launch or when report, land or verified status discovery learns the URL. Later knowledge SHALL update the recorded current terminal, not require a replacement launch. Discovered URLs SHALL NOT become authoritative task.pr merely to label a terminal.
+
+#### Scenario: Reviewer starts for a known PR
+
+- **WHEN** crew launches a reviewer for a task with a known implementation PR
+- **THEN** the reviewer terminal has crew.kind=review and crew.pr equal to that PR's full URL, independent of its checkout branch
+
+#### Scenario: Ship or fixer starts with a known PR
+
+- **WHEN** crew launches a ship/fix worker or its replacement with a known task PR
+- **THEN** that terminal receives the full URL as crew.pr
+
+#### Scenario: Report first identifies a PR
+
+- **WHEN** a worker's accepted report supplies its task PR
+- **THEN** crew updates crew.pr on that task's existing terminal without relaunching it
+
+#### Scenario: Land first identifies a PR
+
+- **WHEN** land records or opens the task's PR
+- **THEN** crew updates crew.pr on the ship/fix terminal
+
+#### Scenario: Discovery first identifies a PR
+
+- **WHEN** explicit status discovery saves an exact verified PR observation for a task with a recorded terminal
+- **THEN** crew best-effort publishes its URL there while leaving authoritative task.pr, stage and delivery state unchanged
+
+### Requirement: Ship review context survives terminal loss
+
+Crew SHALL persist reviewRound and lastFinding for ship work and publish them as crew.round and crew.finding on its current terminal. Round SHALL start at 1 and increase once per distinct review reporting CHANGES NEEDED. lastFinding SHALL contain the first line of the latest BLOCKING finding, sanitized to one line without control characters and at most 200 Unicode code points. APPROVE SHALL clear lastFinding and crew.finding without resetting the round.
+
+#### Scenario: First ship round
+
+- **WHEN** ship work starts before any changes-requesting review
+- **THEN** its round is 1 and no blocking finding is advertised
+
+#### Scenario: Changes are requested
+
+- **WHEN** a reviewer reports CHANGES NEEDED with classified findings
+- **THEN** the ship round increases by one and its finding becomes the first BLOCKING finding's first line, not a preceding FOLLOW-UP or heading
+
+#### Scenario: Verdict bookkeeping repeats
+
+- **WHEN** the same review verdict is processed twice, including local and PR-head bookkeeping in one command
+- **THEN** the round increases only once for that reviewer
+
+#### Scenario: Finding text is unsafe or long
+
+- **WHEN** a BLOCKING finding contains control characters or exceeds the length limit
+- **THEN** stored and published text contains no control characters and is truncated safely without splitting a Unicode code point
+
+#### Scenario: Approval clears the finding
+
+- **WHEN** the latest valid review verdict is APPROVE
+- **THEN** lastFinding becomes null and the ship terminal's crew.finding is removed or emptied, while the current round remains unchanged
+
+#### Scenario: No blocking line is available
+
+- **WHEN** a legacy CHANGES NEEDED report has no identifiable BLOCKING finding
+- **THEN** the round advances once and lastFinding is null rather than fabricated from unrelated prose
+
+### Requirement: Ordinary JSON status exposes review context
+
+Ordinary status --json SHALL add reviewRound and lastFinding per task using saved task metadata, even without a live terminal. Ship/fix tasks without saved review context SHALL default to 1 and null. Reviewer and other scout tasks SHALL return null for these fields. Status SHALL NOT read reports to derive them. The minimal fleet v1 shape SHALL remain unchanged.
+
+#### Scenario: Worker terminal has ended
+
+- **WHEN** ordinary JSON status includes a ship whose terminal ended after a changes-requesting review
+- **THEN** reviewRound and lastFinding retain the saved context without depending on terminal labels
+
+#### Scenario: Legacy task or unrelated scout
+
+- **WHEN** ordinary JSON status includes tasks lacking saved review context
+- **THEN** ships/fixers expose reviewRound=1 and lastFinding=null, and scouts/reviewers expose both fields as null
+
+#### Scenario: Fleet consumer keeps its contract
+
+- **WHEN** status --json --view fleet is requested
+- **THEN** no reviewRound or lastFinding fields are added to fleet v1 rows
+
+### Requirement: Terminal metadata is best effort
+
+Crew SHALL bound terminal-metadata writes and never fail an otherwise successful command because labeling fails. Failures SHALL emit one single-line warning per affected hook on stderr, preserve saved task/report/verdict outcomes and leave JSON stdout valid. Metadata hooks SHALL NOT add GitHub requests, retries, background sweeps or mutations of unrelated terminals or labels.
+
+#### Scenario: Terminal has ended or Core is unavailable
+
+- **WHEN** a metadata hook cannot label its task's recorded terminal
+- **THEN** the command continues with its normal exit result and saved facts, with one warning line and no retry
+
+#### Scenario: GitHub advisory labels are disabled
+
+- **WHEN** repository advisory-label writes are opted out or fail
+- **THEN** local terminal metadata and persisted review context still update independently

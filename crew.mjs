@@ -441,7 +441,7 @@ const launchedTerminals = (task, address, agent) => [...ownedTerminals(task).fil
 const saveTask = (h, task) => taskTransaction(h, task.id, current => {
   const prFacts = current?.prFacts;
   const terminals = [...new Map([...(current?.terminals ?? []), ...(task.terminals ?? [])].map(t => [t.address, t])).values()];
-  writeJson(taskFile(h, task.id), { ...task, ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), ...(current && Object.hasOwn(current, 'workerSpace') ? { workerSpace: current.workerSpace } : {}), updated: now() });
+  writeJson(taskFile(h, task.id), { ...task, ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), ...(current && Object.hasOwn(current, 'workerSpace') ? { workerSpace: current.workerSpace } : {}), ...(current && Object.hasOwn(current, 'reviewRound') ? { reviewRound: current.reviewRound, lastFinding: current.lastFinding, reviewChanges: current.reviewChanges } : {}), updated: now() });
 });
 
 const prTime = value => {
@@ -492,6 +492,7 @@ function readPrAtUrl(url, fields, options) {
 }
 export function rememberTaskPr(h, task, facts) {
   if (!facts || !validId(task.id)) return;
+  let saved;
   try {
     taskTransaction(h, task.id, current => {
       if (!current || ['branch', 'project', 'worktree'].some(key => current[key] !== task[key])) return;
@@ -507,8 +508,27 @@ export function rememberTaskPr(h, task, facts) {
       // A sharing error yields immediately to lifecycle work; a later poll can
       // save these facts. Only lifecycle writes use writeJson's replacement retries.
       writeJson(taskFile(h, task.id), { ...current, prFacts: facts }, { retrySharing: false });
+      saved = { ...current, prFacts: facts };
     }, { observation: true });
   } catch { /* A read-only caller may not be able to cache; the response still works. */ }
+  if (saved && saved.state !== 'closed' && facts.state !== 'NOT_FOUND') publishTaskTerminal(saved);
+}
+// Optional Core metadata must not use hc(): even a missing executable is advisory.
+function publishTaskTerminal(task, pr) {
+  if (!task.terminal) return;
+  const url = canonicalPrUrl(pr ?? task.pr ?? task.prFacts?.url ?? task.reviewVerdict?.pr);
+  const labels = url ? [`crew.pr=${url}`] : [];
+  if (task.kind === 'ship') {
+    const { reviewRound, lastFinding } = taskReviewContext(task);
+    labels.push(`crew.round=${reviewRound}`, `crew.finding=${lastFinding ?? ''}`);
+  }
+  if (!labels.length) return;
+  const args = ['label', task.terminal, ...labels];
+  const result = HC.endsWith('.mjs') ? run(process.execPath, [HC, ...args], { timeout: 2000 }) : run(HC, args, { timeout: 2000 });
+  if (result.code !== 0 || result.error) {
+    const why = (result.error?.message || result.stderr || result.stdout || 'Core did not set labels').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    console.error(`crew: terminal metadata: ${task.id}: ${why}`);
+  }
 }
 function allTasks(h) {
   if (!fs.existsSync(h.tasks)) return [];
@@ -1567,7 +1587,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     // Keep the original order, even for candidates that cannot work now: hand-over rereads
     // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
     launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks, dispatch: chosen.dispatch,
-    ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
+    ...(branch ? { branch, reviewRound: 1, lastFinding: null } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
   const repairPlacement = extra.selfFix ? repairWorkerProject(h, record) : null;
   withRegistry(h, () => {
     // The project may have been removed/replaced while selection was running.
@@ -1620,6 +1640,8 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // writing the record this command started with over a report or cancellation.
   const current = readJson(taskFile(h, id)) ?? record;
   saveTask(h, { ...current, state: current.state === 'preparing' ? 'working' : current.state, terminal: address, terminals: launchedTerminals(current, address, pick.harness), spawned: now() });
+  const launched = loadTask(h, id);
+  publishTaskTerminal(launched, reviewPrUrl(launched));
   const detail = pickLabel(pick) !== pick.harness || chosen.available ? `; ${pickLabel(pick)}${chosen.available ? `, ${chosen.available} more can take over` : ''}` : '';
   console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}${started.note}`);
   backlogMove(h, id, 'start');
@@ -1643,6 +1665,7 @@ function relaunch(h, task, reason, flags = null) {
     if (loadTask(h, task.id).state === 'failed') reviewLabels(h, task.id, 'abandon');
     throw error;
   }
+  if (moved.pick) publishTaskTerminal(loadTask(h, task.id), reviewPrUrl(task));
   if (!moved.pick && !moved.superseded) reviewLabels(h, task.id, 'abandon');
   if (moved.pick && task.reviews && task.reviewLabelEnded) {
     taskTransaction(h, task.id, latest => {
@@ -1808,7 +1831,10 @@ function cmdDone(args) {
     writeJson(taskFile(h, id), { ...task, state: 'reported', reported: now(), updated: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
     return task;
   }, { waitMs: 30000 }); // a new worker can finish before Core acknowledges its start
+  const reported = loadTask(h, id);
+  publishTaskTerminal(reported, reviewPrUrl(reported));
   if (task.reviews) {
+    recordReviewContext(h, reported);
     reviewLabels(h, id, 'verdict');
     if (loadTask(h, id).reviewVerdict?.stale) staleApproval(task.reviews);
   }
@@ -2560,7 +2586,8 @@ function cmdReview(args) {
   if (!AGENTS[legacy]) refuse(`Unknown agent: ${legacy}. Known: ${Object.keys(AGENTS).join(', ')}`);
   let n = 1, reviewId = `${id}-review`.slice(0, 40);
   while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
-  const reviewHead = pullRequestReviewHead(task), target = reviewHead ?? branchOf(task);
+  const known = {};
+  const reviewHead = pullRequestReviewHead(task, known), target = reviewHead ?? branchOf(task);
   if (!reviewSha(reviewHead)) refuse(`Task ${id} has no verifiable fixed head to review.`, 6);
   const approvedHead = approvedHeadOf(task), approval = approvalCovers(task, approvedHead, reviewHead);
   const reviewBase = task.reviewVerdict?.head ?? approvedHead;
@@ -2583,7 +2610,8 @@ function cmdReview(args) {
     '- Mark EVERY finding `BLOCKING` (the change does not do what it claims, can lose data, or can get stuck) or `FOLLOW-UP` (wording, edge cases, polish). Give file/line, impact and reproduction details.',
     '- Start your report with exactly `CHANGES NEEDED` only if at least one finding is BLOCKING; otherwise start with `APPROVE`. Then always include a short `## What I checked` section, even on APPROVE. FOLLOW-UP findings are for the coordinator to queue and do not hold the merge.',
   ].join('\n');
-  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead, workerSpace, reviewMode: delta ? 'delta' : 'full', reviewBase: delta ? reviewBase : null, reviewCommits: delta ? coverage.commits : null, reviewExcluded: delta ? coverage.excluded : [] } });
+  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, pr: known.pr ?? null, reviewHead, workerSpace, reviewMode: delta ? 'delta' : 'full', reviewBase: delta ? reviewBase : null, reviewCommits: delta ? coverage.commits : null, reviewExcluded: delta ? coverage.excluded : [] } });
+  publishTaskTerminal(loadTask(h, id), known.pr);
   reviewLabels(h, reviewId);
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }
@@ -2601,10 +2629,9 @@ function reviewHeadOf(task) {
 // pushes after the worker, so the local branch can be behind it. The ship copy is
 // fast-forwarded to that head; a copy that cannot be is refused. Without a readable open
 // pull request the local head is reviewed, and the staleness rule judges it later.
-function pullRequestReviewHead(task) {
+function pullRequestReviewHead(task, known) {
   const local = reviewHeadOf(task);
-  const first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
-  let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr;
+  let url = reviewPrUrl(task);
   if (!url) {
     const found = gh(['pr', 'view', branchOf(task), '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 2000 });
     if (found.code !== 0) return local;
@@ -2612,6 +2639,7 @@ function pullRequestReviewHead(task) {
   }
   const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pulls?\/(\d+)\/?$/.exec(url);
   if (!m) return local;
+  known.pr = canonicalPrUrl(url);
   const read = gh(['api', '--hostname', m[1], '--method', 'GET', `repos/${m[2]}/${m[3]}/pulls/${m[4]}`], { timeout: 2000 });
   let pr = null;
   try { if (read.code === 0) pr = JSON.parse(read.stdout); } catch { /* local review fallback */ }
@@ -2657,8 +2685,10 @@ function staleApproval(id) {
 const reviewSha = value => typeof value === 'string' && /^[a-f0-9]{40,64}$/.test(value);
 const approvedHeadOf = task => task.approvedHead ?? (task.reviewVerdict?.verdict === 'APPROVE' ? task.reviewVerdict.head : null);
 function reviewPrUrl(task) {
-  const first = fs.existsSync(task.report ?? '') ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
-  return (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr;
+  const text = fs.existsSync(task.report ?? '') ? fs.readFileSync(task.report, 'utf8') : '';
+  // Gate reports can put their URL after a summary; workflow reports reserve line one.
+  const report = task.gate ? text : text.trim().split(/\r?\n/)[0];
+  return PR_LINK.exec(report)?.[0] ?? task.pr ?? task.prFacts?.url ?? task.reviewVerdict?.pr;
 }
 function reviewApi(url) {
   const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(url ?? '');
@@ -2734,6 +2764,38 @@ export function approvalCovers(task, approvedHead, head, evidence = {}) {
   result.covered = result.commits.length === 0;
   result.reason = result.covered ? 'only verified delivery commits follow approval' : 'non-covered commits need delta review';
   return result;
+}
+function taskReviewContext(task) {
+  return task.kind === 'ship' ? { reviewRound: task.reviewRound ?? 1, lastFinding: task.lastFinding ?? null }
+    : { reviewRound: null, lastFinding: null };
+}
+function blockingFinding(report) {
+  const line = report.split(/[\r\n\u2028\u2029]/).find(line => {
+    const text = line.replace(/^\s*(?:[-*+]|\d+[.)]|#{1,6})\s*/, '').replace(/[*_`]/g, '').trim();
+    const classification = /\b(BLOCKING|FOLLOW-UP)\b/i.exec(text);
+    const prefix = classification ? text.slice(0, classification.index).trim() : null;
+    return classification?.[1].toUpperCase() === 'BLOCKING' && (prefix === '' || prefix.endsWith(':'))
+      && !/^BLOCKING(?:\s+findings?)?\s*[:—-]?\s*$/i.test(text);
+  });
+  return line ? Array.from(line.replace(/\s+/g, ' ').replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).slice(0, 200).join('') || null : null;
+}
+// Once per accepted report, before optional GitHub access. Head freshness bookkeeping
+// may record the same verdict twice; it must never advance the work round twice.
+function recordReviewContext(h, reviewer) {
+  const report = fs.readFileSync(reviewer.report, 'utf8'), verdict = report.split(/\r?\n/)[0].trim();
+  if (!['APPROVE', 'CHANGES NEEDED'].includes(verdict)) return;
+  const parent = loadTask(h, reviewer.reviews);
+  if (parent.kind !== 'ship' || parent.selfFix || parent.stage === 'plan' || /^Plan:/i.test(fs.existsSync(parent.report) ? fs.readFileSync(parent.report, 'utf8').trim() : '')) return;
+  const saved = taskTransaction(h, parent.id, current => {
+    const changes = current.reviewChanges ?? [];
+    const advances = verdict === 'CHANGES NEEDED' && !changes.includes(reviewer.id);
+    const next = { ...current, reviewRound: taskReviewContext(current).reviewRound + (advances ? 1 : 0),
+      lastFinding: verdict === 'APPROVE' ? null : blockingFinding(report),
+      reviewChanges: advances ? [...changes, reviewer.id] : changes, updated: now() };
+    writeJson(taskFile(h, parent.id), next);
+    return next;
+  });
+  publishTaskTerminal(saved);
 }
 function recordReviewVerdict(h, task, reviewer, verdict, currentHead, pr) {
   const head = reviewer.reviewHead ?? null;
@@ -2924,6 +2986,7 @@ function cmdLand(args) {
   if (task.kind !== 'ship') refuse(`Task ${id} is a scout; it has a report, not a branch.`);
   // A workflow task's link is recorded already when its worker reports; it lands only once.
   if (task.pr && (task.landed || !task.workflow)) {
+    publishTaskTerminal(task);
     if (finishMergedTask(h, task)) return;
     if (task.workflow || task.gate || task.state === 'closed') {
       if (!task.workflow && !task.gate) reviewLabels(h, id, 'check');
@@ -2963,6 +3026,7 @@ function cmdLand(args) {
     const found = pullRequestOf(task, git('rev-parse', '--abbrev-ref', 'HEAD').stdout.trim());
     if (!found) no(`the no-mistakes gate has not opened a pull request for it yet. Ask the worker where the gate stands: crew tell ${id} "run no-mistakes axi status and finish the gate"`);
     saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
+    publishTaskTerminal(loadTask(h, id));
     console.log(`delivered ${id} through no-mistakes: ${found}. Merging it is the person's decision.`);
     backlogMove(h, id, 'done', ['--pr', found]);
     finishMergedTask(h, loadTask(h, id));
@@ -2983,6 +3047,7 @@ function cmdLand(args) {
       if (proof?.state !== 'MERGED' || proof.why) no(`its branch ${branchOf(task)} is not pushed. Tell the worker: crew tell ${id} "push your branch and open the draft pull request as the change-delivery skill says"`);
     }
     saveTask(h, { ...loadTask(h, id), pr: found, landed: now() });
+    publishTaskTerminal(loadTask(h, id));
     const shown = pullRequestState(h, task, found);
     console.log(`delivered ${id}: ${found}${shown ? ` (${shown})` : ''}. It follows the repository's delivery workflow: its bot marks it ready; merging is the person's decision.`);
     backlogMove(h, id, 'done', ['--pr', found]);
@@ -3011,6 +3076,7 @@ function cmdLand(args) {
   const url = /https?:\/\/\S+/.exec(made.stdout)?.[0];
   if (made.error || made.code !== 0 || !url) no(`its branch ${branchOf(task)} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew land ${id}\` again, or open it by hand.`, 4);
   saveTask(h, { ...loadTask(h, id), pr: url, landed: now() });
+  publishTaskTerminal(loadTask(h, id));
   reviewLabels(h, id, 'check');
   console.log(`delivered ${id}: ${url} (against ${base}, ${subjects.length} commit${subjects.length === 1 ? '' : 's'}). Merging it is the person's decision.`);
   backlogMove(h, id, 'done', ['--pr', url]);
@@ -3141,7 +3207,7 @@ function cmdSelfmerge(args) {
   requireOwner(h);
   const id = args[0], task = loadTask(h, id);
   if (!task.selfFix) refuse(`Task ${id} is not a repair of crew; \`crew selfrepair\` delivers only those.`);
-  if (task.pr) { console.log(`${id} already has a pull request: ${task.pr}. After the person merges it, run \`crew update\` or use the next \`crew start\`.`); return; }
+  if (task.pr) { publishTaskTerminal(task); console.log(`${id} already has a pull request: ${task.pr}. After the person merges it, run \`crew update\` or use the next \`crew start\`.`); return; }
   if (task.merged) { console.log(`${id} is already published as ${short(task.merged)}`); return; }
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; a repair is published only after its worker reported.`);
   const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
@@ -3191,6 +3257,7 @@ function cmdSelfmerge(args) {
   const url = /https?:\/\/\S+/.exec(made.stdout)?.[0];
   if (made.error || made.code !== 0 || !url) no(`its branch ${branch} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew selfrepair ${id}\` again.`, 4);
   saveTask(h, { ...loadTask(h, id), pr: url, landed: now() });
+  publishTaskTerminal(loadTask(h, id));
   console.log(`delivered repair ${id}: ${url}; tests passed. Merging it is the person's decision.`);
   console.log('This machine was not updated. After the person merges it, run `crew update` or use the next `crew start`, then retry what failed.');
 }
@@ -3461,7 +3528,7 @@ function cmdStatus(args) {
       deliveryKind: t.kind === 'ship' ? t.gate ? 'gate' : t.workflow ? 'workflow' : 'plain' : null,
       ...(t.workflow ? { workflow: t.workflow, stage: t.stage ?? null } : {}),
       ...(t.reviewVerdict ? { reviewVerdict: t.reviewVerdict } : {}),
-      ...(t.copyToReturn ? { copyToReturn: copyWaiting(t) } : {}) };
+      ...(t.copyToReturn ? { copyToReturn: copyWaiting(t) } : {}), ...taskReviewContext(t) };
   });
   // A closed task whose copy still waits to be returned is not hidden: --all lists it with its
   // holders, and plain status (which is about unfinished work) says how many there are.

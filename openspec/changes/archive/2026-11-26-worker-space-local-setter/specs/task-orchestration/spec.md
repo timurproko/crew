@@ -55,7 +55,7 @@ Crew SHALL provide `crew config worker-space` to show and `crew config worker-sp
 
 ### Requirement: Legacy tasks and orchestration commands remain compatible
 
-Tasks without placement metadata SHALL retain old combined inheritance and remain reportable and finishable without bulk migration. Status, wait, tell, review, relaunch and finish SHALL retain existing contracts except the plain-status mode line. End SHALL release ownership without moving or removing work. Read-only status SHALL NOT reconcile spaces or change legacy full JSON. Minimal fleet adds only the separately specified authoritative project field.
+Tasks without placement metadata SHALL retain combined inheritance and remain reportable and finishable without bulk migration. Space contracts SHALL stay compatible across lifecycle commands; end SHALL release ownership without moving work. Status SHALL NOT reconcile spaces. Allowed additions are the plain-status mode line, ordinary JSON review context, minimal fleet task project, and verified PR terminal metadata during explicit discovery.
 
 #### Scenario: Updated tool loads an old running task
 
@@ -74,8 +74,8 @@ Tasks without placement metadata SHALL retain old combined inheritance and remai
 
 #### Scenario: An inspector reads fleet status
 
-- **WHEN** a non-owner requests legacy JSON or minimal fleet status for a mixed layout
-- **THEN** the existing output contract is preserved and no space or terminal mutation occurs
+- **WHEN** a non-owner requests ordinary JSON or minimal fleet status for a mixed layout
+- **THEN** the specified output contracts are preserved and no space mutation occurs; only explicit discovery may publish a verified PR URL to a task's recorded terminal
 
 ### Requirement: Fleet status has a minimal versioned shape
 

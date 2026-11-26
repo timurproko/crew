@@ -2,13 +2,15 @@
 
 `crew status --json --discover-prs` adds an opt-in discovery overlay. `--all` includes
 closed tasks just as in ordinary status. Without `--json`, the discovery flag is a usage
-error. Ordinary `crew status` and `crew status --json` keep their existing output and
-perform no GitHub or remote Git reads.
+error. Ordinary status performs no GitHub or remote Git reads and no terminal-label
+writes. Full JSON task rows additionally expose saved `reviewRound` and `lastFinding`:
+ships/fixers default to 1/null, scouts/reviewers to null/null. These fields survive
+terminal loss and are not derived from reports during status. Fleet v1 is unchanged.
 
 ## Version 1 JSON contract
 
 The existing status object gains `prDiscovery: {"version": 1}`. Every returned task gains
-`prDiscovery` with all four fields shown below. No other existing fields change;
+`prDiscovery` with all four fields shown below. Existing field values stay unchanged;
 `tasks[].pr` is still the value recorded by done/land, not a discovered link.
 
 ```json
@@ -75,8 +77,13 @@ Discovery is read-only toward GitHub for owners and non-owners. It does not set 
 authoritative task `pr`, stages, report completion or landing, claim ownership, trigger
 recovery, or write Git state. It may save verified observations separately in `task.json`
 as `prFacts`: version 1, canonical `url`, `state` (`OPEN`, `MERGED`, `CLOSED`, `NOT_FOUND` or null),
-`mergedAt`, `closedAt`, and `observedAt`. The terminal `NOT_FOUND` state records only proven absence, not a generic 404. These facts are not delivery authority. In
-particular, discovering a draft does not let plain land bypass its reported-worker and
+`mergedAt`, `closedAt`, and `observedAt`. The terminal `NOT_FOUND` state records only proven absence, not a generic 404. These facts are not delivery authority. As a narrow local side effect, saving a verified
+observation for a non-closed task may publish `crew.pr` and saved ship review context to
+its recorded current terminal. Each Core label call is bounded to two seconds, outside
+the task-state transaction, without retries. An ended terminal or unavailable Core emits
+one warning line on stderr but does not fail status or contaminate JSON stdout. No
+terminal is inferred from a branch, working copy or matching labels, and GitHub labels
+are never changed. In particular, discovering a draft does not let plain land bypass its reported-worker and
 clean-copy checks or turn a workflow plan into implementation. `crew done` and `crew
 land` retain their existing authority.
 
