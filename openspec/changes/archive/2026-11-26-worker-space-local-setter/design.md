@@ -125,3 +125,11 @@ Add a focused `--gaps=worker-space-local-setter` group in `crew.test.mjs`, reusi
 No schema migration: keep registry version 1 and combined default. Publish docs/help and the tested v1 contract together; after implementation comment that exact contract and Crew PR link on herdr-app PR 88. At plan handoff the interface is proposed, not shipped; do not tell the app to enable production writes yet.
 
 Deploy by the person's normal Crew update on each machine after merge. Unsupported machines retain the read-only fallback. For preference rollback use combined through an authorized path; never move existing project-bound tasks. Binary downgrade has the already documented inherited-placement limits and is not a migration performed by this feature.
+
+## Approved follow-up and single-change delivery repair
+
+The approved fleet extension's full design is retained in `follow-ups/fleet-task-project-identity/design.md`. Its task project is the exact recorded string or null, not a placement-derived alias; internal repairs remain crew:self. The combined delta and completed third task group now live in this original change's primary artifacts.
+
+The follow-up originally used a second active association while this archive's canonical changes were still unmerged. The bot correctly refused `draft-delivery-specs-diverged`. Restoring the original real archive and acceptanceManifest association invokes the existing re-finalization path, which rebuilds canonical specs against current main from the combined approved delta and regenerates acceptance data. This repair changes planning/association records only; the agent does not reset canonical specs, write acceptance claims, fabricate an archive, relax checks or manually mark ready.
+
+The nested follow-up preserves its original planning history; this consolidation supersedes its earlier promise to keep the first archive's source artifacts untouched. Product scope, interface, tests and approval remain unchanged. The latest standing delivery instruction also supersedes the earlier wait/full-suite handoff: targeted checks, push, trigger final-head CI, and report without polling; the coordinator checks the result.

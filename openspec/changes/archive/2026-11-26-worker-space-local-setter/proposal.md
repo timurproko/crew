@@ -29,3 +29,9 @@ None; this extends the existing orchestration setting and ownership contract.
 - `docs/worker-spaces.md` and the README command/worker-space overview: Supported integration, refusal and compatibility contract.
 - Herdr integration is separate: the app executes locally on each authoritative machine/home using its existing transport; Crew gains no global preference store, remote execution or fleet control API.
 - No new dependency, registry version, schema migration, owner takeover or worker movement.
+
+## Approved fleet follow-up and delivery reconciliation
+
+The coordinator approved `fleet-task-project-identity` in this same unmerged PR: add exact recorded `tasks[].project` (or null) to fleet v1, preserve dotted names and `crew:self` task identity independently of its `crew` placement alias, retain other fields/budgets/authority, and publish the contract on herdr-app PR 92. Its complete approved planning record is preserved under `follow-ups/fleet-task-project-identity/`.
+
+Delivery refused a second association with `draft-delivery-specs-diverged`, because the first bot-finalized canonical specs are not yet on the target branch. Both approved deltas are therefore consolidated in this original unmerged change's source artifacts and the PR restores its genuine archive/acceptance association. Canonical specs and acceptance data are left to the bot's existing re-finalization path; no finalization commit is reverted and no policy/check is bypassed.

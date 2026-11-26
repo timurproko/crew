@@ -16,3 +16,15 @@
 - [x] 2.3 Cover concurrent project registration and stale pre-lock setting snapshots; verify successful changes preserve all project/unknown metadata and bounded lock/refusal behavior with the focused registry regressions.
 - [x] 2.4 Complete docs/worker-spaces.md with observation, ordering, per-machine/home application and old-Crew fallback; verify the documented contract against focused CLI output and post the final implemented command contract on herdr-app PR 88.
 - [x] 2.5 Validate the change artifacts and final delivery body, record targeted results and known limits, and verify no disposable process or real-home mutation was introduced before implementation handoff.
+
+## 3. Authoritative task project in the minimal fleet view
+
+- [x] 3.1 Add project to every minimal fleet task using exact recorded task identity or null for absent/unusable evidence; verify fleet-view exact key assertions and agreement with full status.
+- [x] 3.2 Cover combined/per-project workers, dotted registrations, retained closed tasks, inherited workers and both internal repair placement aliases; verify project remains crew:self while placement labels retain their alias semantics.
+- [x] 3.3 Cover cold/warm/changed/rebuilt fleet summaries and missing evidence without inference; verify fleet-scale payload/read guards and unchanged retention/discovery behavior.
+- [x] 3.4 Document the additive field in README and both relevant docs, and publish its contract on herdr-app PR 92; verify examples against CLI assertions and record the comment URL.
+- [x] 3.5 Reconcile the approved follow-up into this original unmerged change record without replacing canonical specs or acceptance data; verify targeted schema/body/runtime checks and trigger final-head CI.
+
+## Workflow follow-up
+
+- Per the person's latest standing instruction, run targeted local checks only, push, ensure CI is triggered on the final head (dispatch for a draft), then report at once. The coordinator checks hosted results; do not wait or poll. Earlier full-suite results remain historical evidence, not an ongoing local-run requirement.

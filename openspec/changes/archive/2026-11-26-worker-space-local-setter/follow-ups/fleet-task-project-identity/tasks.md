@@ -18,4 +18,4 @@
 
 ## Workflow follow-up
 
-- After bot finalization, require successful Windows and Ubuntu suites and CI required on the exact final PR head; record their run/job links and complete the report before crew done. This remains required work, not a waiver or a local-only completion claim.
+- Superseded by the person's latest standing instruction: run targeted local checks, push, ensure final-head CI is triggered (dispatch for a draft), and report at once. The coordinator checks hosted results; do not run another full local suite or wait/poll for CI.
