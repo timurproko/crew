@@ -302,7 +302,8 @@ Claude profile.
   Status does not reread quota; an old task can only reconsider the chain it saved.
   `crew status` shows who works on each task, its current Core error state, and how many continuation messages that worker received.
   `crew status --json` also includes `nudges` history, the worker's `continuations` count, and its active `recovery` record.
-  Both status forms only read; they never send recovery messages.
+  Neither status form sends recovery messages. Only explicit PR discovery may publish
+  the verified PR URL as terminal metadata (see below).
 
 ### Coordinator-specific worker lists
 
@@ -478,6 +479,28 @@ These rules are in the coordinator template installed into a Crew home. `crew up
 installs the new tool; the next `crew start` automatically rewrites the home's coordinator
 instructions when the template differs, with no manual editing of existing homes.
 
+### Terminal PR navigation
+
+Crew publishes `crew.pr` (the full PR URL) on reviewer terminals when they launch and
+on ship/fix terminals when a report, land or verified PR discovery learns the URL.
+Replacement workers inherit known PR metadata; existing terminals are updated without
+relaunching. Herdr can match a reviewer by `crew.kind=review` plus `crew.pr`, even though
+its checkout branch does not identify the PR.
+
+Ship/fix terminals also advertise `crew.round`, starting at 1. Each distinct review
+reporting `CHANGES NEEDED` advances the ship's round once. `crew.finding` previews the first
+line of that report's first classified BLOCKING finding, with whitespace collapsed,
+control characters removed and a limit of 200 Unicode code points. No classified finding
+means no preview. `APPROVE` clears the finding without resetting the round.
+
+Ordinary `crew status --json` adds `reviewRound` and `lastFinding` per task from saved
+state, even after a terminal ends. Ships/fixers without saved context default to 1/null;
+scouts and reviewers use null/null. Fleet v1 keeps its exact minimal fields unchanged.
+Optional terminal writes have a two-second timeout, no retries, and warn in one stderr
+line on failure without failing the command or corrupting JSON stdout. They do not
+change GitHub labels or delivery authority. Ordinary status never writes labels; explicit
+PR discovery may publish verified PR metadata to the task's recorded current terminal.
+
 ### Advisory review labels
 
 After saving a launched reviewer, `crew review` best-effort adds the current activity label
@@ -492,7 +515,7 @@ Review start skips merged/closed PRs and prints that state. All hooks leave labe
 merged/closed PRs untouched, including late verdicts and abandoned reviews.
 Workflow, gate and plain projects use the same hooks; Plan reports skip label operations.
 Plain branches without a PR at review time still record review evidence, but skip labels.
-Status remains read-only.
+Status never changes GitHub labels; explicit PR discovery may publish local terminal metadata.
 
 Reviewers are given a fixed branch-head SHA, recorded as `reviewHead`. When the task has an
 open PR, that SHA is the PR's head, not the local branch: a delivery bot may push a
@@ -630,7 +653,7 @@ closedAt**, not after task completion. A proven `NOT_FOUND` PR is excluded immed
 without a 24-hour window; the recorded URL is never rewritten or deleted. A generic 404,
 authentication, permission, network or rate-limit failure is not proof and stays included.
 Missing/invalid merge/close event times stay included. Closed scouts/reviews without PRs are omitted. `--all` does not override fleet retention; omit
-`--view` to get the unchanged legacy full history and fields.
+`--view` to get the full history and fields, including reviewRound and lastFinding.
 
 Without `--discover-prs`, only saved facts are used: recorded/saved discovered URLs are
 known, unlinked non-ships are none, and unobserved ships are unavailable/not-requested.

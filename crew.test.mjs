@@ -112,6 +112,13 @@ else if (a[0] === 'rm') { if (!w.failRm) { forget(a.at(-1)); delete w.terminals[
 else if (a[0] === 'ls' && w.silentLs) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'ls') { save(); console.log(JSON.stringify({ terminals: Object.values(w.terminals).map(t => ({ address: t.address, agent: t.agent ?? null, cwd: t.cwd, state: t.state })) })); }
 else if (a[0] === 'read') { save(); process.stdout.write(w.terminals[a[1]]?.screen ?? ''); }
+else if (a[0] === 'label') {
+  const t = w.terminals[a[1]];
+  if (w.labelError || !t || t.state !== 'live') { save(); console.error('terminal label unavailable\\nsecond diagnostic'); process.exit(1); }
+  t.labels ??= {};
+  for (const label of a.slice(2)) { const [key, ...value] = label.split('='); if (value.join('=')) t.labels[key] = value.join('='); else delete t.labels[key]; }
+  save();
+}
 else if (a[0] === 'send') {
   const t = w.terminals[a[1]];
   if (t?.sendError) { save(); console.error('send transport unavailable'); process.exit(1); }
@@ -526,6 +533,7 @@ gapTests.selfrepair = () => {
   r = f.call(['selfrepair', t.id], { CREW_TOOL_DELIVERY: f.delivery }); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /https:\/\/github.com\/acme\/crew\/pull\/1/); assert.match(r.out, /not updated/);
   assert.equal(f.task(t.id).pr, 'https://github.com/acme/crew/pull/1');
+  assert.equal(readWorld().terminals[t.terminal].labels['crew.pr'], f.task(t.id).pr, 'Selfrepair publishes its newly known PR on the live fixer');
   assert.equal(git('-C', f.origin, 'rev-parse', 'main').trim(), first);
   assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), first);
   const tip = git('-C', t.worktree, 'rev-parse', 'HEAD').trim();
@@ -2412,7 +2420,7 @@ const {main} = await import(${JSON.stringify(new URL('./crew.mjs', import.meta.u
   assert.deepEqual(original.owner, { terminal: owner, live: true, mine: false });
   assert.deepEqual(original.tasks.map(t => t.id), ['draft', 'scout']);
   assert.deepEqual(Object.keys(original.tasks[0]), ['id', 'state', 'kind', 'agent', 'launch', 'standby', 'standbyStatus', 'fallbacks', 'project', 'terminal',
-    'core', 'nudges', 'continuations', 'recovery', 'report', 'pr', 'error', 'elapsedSeconds', 'deliveryKind']);
+    'core', 'nudges', 'continuations', 'recovery', 'report', 'pr', 'error', 'elapsedSeconds', 'deliveryKind', 'reviewRound', 'lastFinding']);
   assert.equal(original.tasks[0].pr, null);
   r = legacy(['status', '--all', '--json']); assert.equal(r.code, 0, r.out);
   assert.deepEqual(JSON.parse(r.out).tasks.map(t => t.id), ['closed', 'draft', 'scout']);
@@ -2822,6 +2830,120 @@ function reviewRemote(f, task) {
   git('-C', task.worktree, 'push', '-q', 'origin', `HEAD:refs/heads/${task.branch}`);
   return remote;
 }
+gapTests['terminal-pr-hooks'] = () => {
+  const f = reviewLabelsFixture('terminal-pr'), url = 'https://github.com/acme/demo/pull/42';
+  const labels = t => readWorld().terminals[f.task(t.id).terminal].labels;
+  const ship = f.parent('ship', { workflow: 'delivery' });
+  assert.equal(f.done(ship, `Implementation: ${url}`).code, 0);
+  assert.equal(labels(ship)['crew.pr'], url, 'Report updates the already-live ship terminal');
+  const reviewer = f.start().task;
+  assert.equal(labels(reviewer)['crew.kind'], 'review'); assert.equal(labels(reviewer)['crew.pr'], url);
+  let r = f.call(['relaunch', reviewer.id, '--agent', 'a1']); assert.equal(r.code, 0, r.out);
+  assert.equal(labels(reviewer)['crew.pr'], url, 'Reviewer replacement inherits its PR');
+  f.parent('discovered', { prFacts: { version: 1, url, state: 'OPEN' } }, 'Done.');
+  f.control({ noPr: true });
+  const discovered = f.start('discovered').task;
+  assert.equal(labels(discovered)['crew.pr'], url, 'Saved discovery supplies the reviewer PR even when branch lookup is unavailable');
+  f.control({ noPr: false });
+  const current = f.task(ship.id);
+  f.save({ ...current, selfFix: true, state: 'working' });
+  r = f.call(['relaunch', ship.id, '--agent', 'a1']); assert.equal(r.code, 0, r.out);
+  assert.equal(labels(ship)['crew.kind'], 'fix'); assert.equal(labels(ship)['crew.pr'], url, 'Known PR is published on fixer replacement');
+  setTerminal(f.task(ship.id).terminal, { state: 'finished' });
+  r = f.done(f.task(ship.id), `Implementation: ${url}`); assert.equal(r.code, 0, r.out);
+  assert.equal(r.out.split(/\r?\n/).filter(l => l.startsWith('crew: terminal metadata:')).length, 1);
+  assert.equal(f.task(ship.id).state, 'reported');
+  r = f.call(['done', ship.id], { CREW_TERMINAL: f.task(ship.id).terminal, CREW_HC: path.join(f.dir, 'missing-hc') });
+  assert.equal(r.code, 0, r.out); assert.match(r.out, /crew: terminal metadata:/, 'Missing hc is advisory, not a refusal');
+  const land = f.parent('land', {}, 'Done.'); reviewRemote(f, land);
+  commit(land.worktree, { 'change.js': 'export const works = true;\n' }, 'implement behavior');
+  f.control({ head: git('-C', land.worktree, 'rev-parse', 'HEAD').trim() });
+  r = f.call(['land', land.id]); assert.equal(r.code, 0, r.out);
+  assert.equal(labels(land)['crew.pr'], url, 'Land publishes a newly opened PR on its existing terminal');
+  for (const kind of ['workflow', 'gate']) {
+    const t = f.parent(`land-${kind}`, kind === 'workflow' ? { workflow: 'delivery', stage: 'implementation' } : { gate: 'no-mistakes' });
+    commit(t.worktree, { 'change.js': kind }, 'implement behavior');
+    git('-C', t.worktree, 'push', '-q', 'origin', t.branch);
+    f.control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim() });
+    r = f.call(['land', t.id]); assert.equal(r.code, 0, r.out);
+    assert.equal(labels(t)['crew.pr'], url, `${kind} land publishes the existing PR without relaunching`);
+  }
+  const w = readWorld(); w.labelError = true; fs.writeFileSync(world, JSON.stringify(w));
+  r = f.call(['spawn', 'label-fails', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Work.']);
+  assert.equal(r.code, 0, r.out); assert.equal(f.task('label-fails').state, 'working');
+  assert.equal(r.out.split(/\r?\n/).filter(l => l.startsWith('crew: terminal metadata:')).length, 1);
+  const reset = readWorld(); delete reset.labelError; fs.writeFileSync(world, JSON.stringify(reset));
+};
+gapTests['terminal-review-context'] = () => {
+  const f = reviewLabelsFixture('terminal-context'), ship = f.parent();
+  const labels = () => readWorld().terminals[f.task(ship.id).terminal].labels;
+  assert.equal(labels()['crew.round'], '1'); assert.equal(labels()['crew.finding'], undefined);
+  const first = f.start().task;
+  const finding = `- **BLOCKING** change.js: unsafe\u0000\t${'😀'.repeat(220)}`;
+  const expected = Array.from(finding.replace(/\u0000/g, '').replace(/\s+/g, ' ').trim()).slice(0, 200).join('');
+  const report = `CHANGES NEEDED\n\nFOLLOW-UP README.md: polish wording.\n${finding}\ncontinued detail\nBLOCKING second.js: another issue.`;
+  let r = f.done(first, report); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(ship.id).reviewRound, 2); assert.equal(f.task(ship.id).lastFinding, expected);
+  assert.equal(labels()['crew.round'], '2'); assert.equal(labels()['crew.finding'], expected);
+  assert.equal(Array.from(expected).length, 200); assert.doesNotMatch(expected, /[\p{Cc}\p{Cf}]/u);
+  r = f.done(first, report); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(ship.id).reviewRound, 2, 'Repeated done and PR-head bookkeeping do not double count the same review');
+  const next = f.start(ship.id, '-2').task;
+  f.control({ enabled: 'false' });
+  r = f.done(next, 'CHANGES NEEDED\nBLOCKING change.js: still broken.'); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(ship.id).reviewRound, 3); assert.equal(labels()['crew.finding'], 'BLOCKING change.js: still broken.', 'Core metadata is independent of GitHub opt-out');
+  r = f.call(['tell', ship.id, 'Fix the blocker']); assert.equal(r.code, 0, r.out);
+  r = f.call(['relaunch', ship.id, '--agent', 'a1']); assert.equal(r.code, 0, r.out);
+  assert.equal(labels()['crew.round'], '3'); assert.equal(labels()['crew.finding'], 'BLOCKING change.js: still broken.');
+  r = f.done(next, 'APPROVE\n## What I checked\nThe fix.'); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(ship.id).lastFinding, null); assert.equal(f.task(ship.id).reviewRound, 3);
+  assert.equal(labels()['crew.finding'], undefined, 'Approval removes the finding instead of advertising null');
+  assert.equal(labels()['crew.round'], '3');
+  f.save({ ...f.task(ship.id), state: 'reported' });
+  const legacy = f.start(ship.id, '-3').task;
+  setTerminal(f.task(ship.id).terminal, { state: 'finished' });
+  r = f.done(legacy, 'CHANGES NEEDED\nLegacy prose without a classified finding.'); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(ship.id).reviewRound, 4); assert.equal(f.task(ship.id).lastFinding, null);
+  assert.equal(r.out.split(/\r?\n/).filter(l => l.startsWith('crew: terminal metadata:')).length, 1);
+  const before = f.task(ship.id);
+  r = f.done(legacy, 'Not a valid verdict\nBLOCKING ignored.js: ignored.'); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(ship.id).reviewRound, before.reviewRound); assert.equal(f.task(ship.id).lastFinding, before.lastFinding);
+};
+gapTests['terminal-review-status'] = () => {
+  const f = reviewLabelsFixture('terminal-status'), ship = f.parent(), reviewer = f.start().task;
+  assert.equal(f.done(reviewer, 'CHANGES NEEDED\nBLOCKING status.js: preserve this finding.').code, 0);
+  setTerminal(ship.terminal, { state: 'finished' });
+  const legacy = f.spawn('legacy', ['--kind', 'ship', '--agent', 'pi']), scout = f.spawn('scout', ['--agent', 'pi']);
+  const { reviewRound, lastFinding, ...old } = legacy; f.save(old);
+  const before = readWorld().log.length;
+  const r = f.call(['status', '--json']); assert.equal(r.code, 0, r.out);
+  const rows = JSON.parse(r.out).tasks, row = id => rows.find(t => t.id === id);
+  assert.equal(row(ship.id).reviewRound, 2); assert.equal(row(ship.id).lastFinding, 'BLOCKING status.js: preserve this finding.');
+  assert.equal(row(legacy.id).reviewRound, 1); assert.equal(row(legacy.id).lastFinding, null);
+  for (const id of [reviewer.id, scout.id]) { assert.equal(row(id).reviewRound, null); assert.equal(row(id).lastFinding, null); }
+  assert.ok(!readWorld().log.slice(before).some(a => a[0] === 'label'));
+  const fleet = f.call(['status', '--json', '--view', 'fleet']); assert.equal(fleet.code, 0, fleet.out);
+  for (const t of JSON.parse(fleet.out).tasks) assert.deepEqual(Object.keys(t), ['id', 'state', 'terminal', 'pr', 'prDiscovery']);
+};
+gapTests['terminal-pr-discovery'] = () => {
+  for (const fleet of [false, true]) {
+    const f = prDiscoveryFixture(`terminal-${fleet}`), address = `discovery-${fleet}`;
+    const w = readWorld(); w.terminals[address] = { address, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+    f.save({ ...f.task, terminal: address });
+    const args = ['status', '--json', ...(fleet ? ['--view', 'fleet'] : [])];
+    const before = readWorld().log.length;
+    let r = f.call(args); assert.equal(r.code, 0, r.out);
+    assert.ok(!readWorld().log.slice(before).some(a => a[0] === 'label'), 'Ordinary status does not publish metadata');
+    r = f.call([...args, '--discover-prs']); assert.equal(r.code, 0, r.out);
+    const shown = JSON.parse(r.out).tasks[0]; assert.equal(shown.pr, null);
+    assert.equal(readWorld().terminals[address].labels['crew.pr'], 'https://github.com/acme/demo/pull/12');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'tasks', 'draft', 'task.json'))).pr, undefined);
+    setTerminal(address, { state: 'finished' });
+    r = f.call([...args, '--discover-prs']); assert.equal(r.code, 0, r.out);
+    assert.doesNotThrow(() => JSON.parse(r.out.split(/\r?\n/)[0]), 'Warning never contaminates JSON stdout');
+    assert.equal(r.out.split(/\r?\n/).filter(l => l.startsWith('crew: terminal metadata:')).length, 1);
+  }
+};
 gapTests['coordinator-parallel-loop'] = () => {
   const f=gapFixture('parallel-coordinator'), file=path.join(f.home,'coordinator','AGENTS.md');
   const expected=fs.readFileSync(file,'utf8'), text=expected.replace(/\s+/g,' ');
