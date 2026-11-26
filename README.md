@@ -168,6 +168,12 @@ nesting under the coordinator and exact project names require the compatible Her
 update (herdr-app PR 88). Until installed, project spaces may not appear connected under the
 coordinator, and headings may still come from working-copy directories. Combined remains
 the default. The setting does not change Herdr's separate connection preference.
+Crew never deletes a space itself. Finish removes only recorded task-owned terminals;
+Herdr removes an automatic space when its last tab disappears. Another worker or a foreign
+terminal/tab keeps it alive, including under force. End only releases the home, leaving
+occupied spaces and task placement untouched. Same-named personal spaces and spaces on
+other machines are not cleanup targets.
+
 See [worker-space identity, inheritance and companion requirements](docs/worker-spaces.md).
 
 ## Agents

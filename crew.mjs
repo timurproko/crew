@@ -1407,15 +1407,21 @@ function repositoryIdentity(folder) {
   const r = run('git', ['-C', folder, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { timeout: 2000 });
   try { return r.code === 0 && r.stdout.trim() ? comparablePath(fs.realpathSync(r.stdout.trim())) : null; } catch { return null; }
 }
-function admittedWorkerSpace(h, task) {
+function repairWorkerProject(h, task) {
+  const registered = registeredProject(h, 'crew');
+  const identity = registered ? repositoryIdentity(task.projectPath) : null;
+  return { path: registered?.path ?? null, project: identity && repositoryIdentity(registered.path) === identity ? 'crew' : SELF_PROJECT };
+}
+function admittedWorkerSpace(h, task, repair) {
   if (Object.hasOwn(task, 'workerSpace')) return resolveWorkerSpace(h, task);
   const mode = h.config.workerSpaceMode ?? 'combined';
-  let project = task.project;
   if (task.selfFix && mode === 'per-project') {
-    const registered = registeredProject(h, 'crew'), identity = repositoryIdentity(task.projectPath);
-    if (registered && identity && repositoryIdentity(registered.path) === identity) project = 'crew';
+    // Identity probes stay outside the registry lock. A changed registration is
+    // not permission to reuse the old proof or to guess a new project's space.
+    if ((registeredProject(h, 'crew')?.path ?? null) !== repair.path) refuse('The crew registration changed during repair admission; retry. No task or terminal was created.');
+    return makeWorkerSpace(h, mode, repair.project);
   }
-  return makeWorkerSpace(h, mode, project);
+  return makeWorkerSpace(h, mode, task.project);
 }
 function makeWorkerSpace(h, mode, project) {
   const base = `fm-crew-${h.config.tag}`;
@@ -1441,11 +1447,12 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
     launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks, dispatch: chosen.dispatch,
     ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
+  const repairPlacement = extra.selfFix ? repairWorkerProject(h, record) : null;
   withRegistry(h, () => {
     // The project may have been removed/replaced while selection was running.
     if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
     if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
-    record.workerSpace = admittedWorkerSpace(h, record);
+    record.workerSpace = admittedWorkerSpace(h, record, repairPlacement);
     fs.mkdirSync(dir, { recursive: true });
     saveTask(h, record); // reservation freezes placement and prevents removal/replacement before external work
   });

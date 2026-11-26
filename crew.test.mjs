@@ -89,13 +89,26 @@ import fs from 'node:fs';
 const file = ${JSON.stringify(world)}, w = JSON.parse(fs.readFileSync(file, 'utf8')), a = process.argv.slice(2);
 // Polling tests read concurrently: publish complete fake-Core worlds atomically.
 w.log.push(a); const save = () => { const temp = file + '.' + process.pid; fs.writeFileSync(temp, JSON.stringify(w)); fs.renameSync(temp, file); };
+// Optional adoption model for placement tests only; it is not native Herdr evidence.
+const adopt = (address, labels) => {
+  if (!w.spaces) return;
+  const id = labels['herdr.space']; if (!id) return;
+  w.spaces[id] ??= { id, name: labels['crew.space.name'] ?? '', automatic: /^fm-[A-Za-z0-9._-]+$/.test(id), members: [] };
+  w.spaces[id].members.push(address); w.terminals[address].space = id;
+};
+const forget = address => {
+  const id = w.terminals[address]?.space, space = w.spaces?.[id];
+  if (!space) return;
+  space.members = space.members.filter(m => m !== address);
+  if (!space.members.length && space.automatic) delete w.spaces[id];
+};
 if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forEach((v, i) => { if (v === '--label') { const [k, ...r] = a[i + 1].split('='); labels[k] = r.join('='); } });
-  w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; save(); console.log(JSON.stringify({ address })); }
+  w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; adopt(address, labels); save(); console.log(JSON.stringify({ address })); }
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'kill' && w.unkillable) { save(); }
 else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; if (t?.steps?.length) Object.assign(t, t.steps.shift()); save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
 else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; if (w.writeOnKill) fs.writeFileSync(w.writeOnKill, 'written while stopping'); if (w.silentAfterKill) w.silent = true; save(); }
-else if (a[0] === 'rm') { if (!w.failRm) delete w.terminals[a.at(-1)]; if (w.silentLsAfterRm) w.silentLs = true; if (w.silentAfterRm) w.silent = true; save(); }
+else if (a[0] === 'rm') { if (!w.failRm) { forget(a.at(-1)); delete w.terminals[a.at(-1)]; } if (w.silentLsAfterRm) w.silentLs = true; if (w.silentAfterRm) w.silent = true; save(); }
 else if (a[0] === 'ls' && w.silentLs) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'ls') { save(); console.log(JSON.stringify({ terminals: Object.values(w.terminals).map(t => ({ address: t.address, agent: t.agent ?? null, cwd: t.cwd, state: t.state })) })); }
 else if (a[0] === 'read') { save(); process.stdout.write(w.terminals[a[1]]?.screen ?? ''); }
@@ -808,8 +821,109 @@ function workerSpaceFixTests() {
     }
   }
 }
+async function workerSpaceRepairAdmissionTest() {
+  const f = repairFixture('spaces-admission-race');
+  assert.equal(f.call(['project', 'add', 'crew', f.repo]).code, 0);
+  assert.equal(f.call(['config', 'worker-space', 'per-project']).code, 0);
+  const gate = projectBarrier(f, 'before', 'repair-registration');
+  const pending = projectProcess(f, ['fix', '--agent', 'pi', 'Repair.'], { script: gate.script, terminal: f.owner, env: { ...f.env, CREW_TOOL_ROOT: f.repo } });
+  try {
+    await until(() => fs.existsSync(gate.ready));
+    assert.equal(f.call(['project', 'remove', 'crew']).code, 0);
+    fs.writeFileSync(gate.release, 'go'); const r = await pending.result;
+    assert.equal(r.code, 2, r.out); assert.match(r.out, /registration changed during repair admission/);
+    assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'fix-1')), 'Stale repository proof cannot reserve a task or launch a terminal');
+  } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+}
+function workerSpaceLifecycleTests() {
+  const f = workerSpaceFixture('lifecycle'), w = readWorld(); w.spaces = {}; fs.writeFileSync(world, JSON.stringify(w));
+  f.add('other');
+  const legacy = f.spawn('legacy'), shared = f.space(legacy), { workerSpace, ...old } = legacy; f.save(old);
+  f.mode('per-project');
+  const first = f.spawn('first'), last = f.spawn('last'), other = f.spawn('other', 'other');
+  const project = f.space(first), otherSpace = f.space(other);
+  const finish = (t, flags = []) => { const r = f.call(['finish', t.id, ...flags]); assert.equal(r.code, 0, r.out); return r; };
+  f.done(first); assert.ok(readWorld().spaces[project], 'Reporting alone keeps the worker tab');
+  const n = readWorld().log.length; finish(first);
+  assert.deepEqual(readWorld().spaces[project].members, [last.terminal]);
+  finish(last); assert.equal(readWorld().spaces[project], undefined, 'Last finish makes only that automatic space empty');
+  assert.ok(readWorld().spaces[shared]); assert.ok(readWorld().spaces[otherSpace]);
+  const inject = (id, name, members, automatic = false) => {
+    const w = readWorld(); w.spaces[id] = { id, name, automatic, members: [...members] };
+    for (const address of members.filter(m => !m.startsWith('mod-'))) w.terminals[address] = { address, space: id, state: 'live', labels: {}, cwd: f.dir };
+    fs.writeFileSync(world, JSON.stringify(w));
+  };
+  inject('personal', 'demo', ['personal-guest']);
+  inject(`pc2/${shared}`, 'remote same suffix', ['pc2/guest'], true);
+  const foreign = readWorld(); foreign.terminals.foreign = { address: 'foreign', space: otherSpace, state: 'live', labels: {}, cwd: f.dir };
+  foreign.spaces[otherSpace].members.push('foreign'); fs.writeFileSync(world, JSON.stringify(foreign));
+  const protectedTerminals = Object.fromEntries(['personal-guest', 'pc2/guest', 'foreign'].map(a => [a, structuredClone(readWorld().terminals[a])]));
+  finish(other, ['--force']); assert.deepEqual(readWorld().spaces[otherSpace].members, ['foreign']);
+  finish(legacy); assert.equal(readWorld().spaces[shared], undefined, 'Legacy combined task still finishes after opt-in');
+  assert.ok(readWorld().spaces[`pc2/${shared}`], 'Remote matching suffix is untouched');
+  // A foreign mod tab also prevents modeled zero-tab removal.
+  const mod = f.spawn('with-mod'), modSpace = f.space(mod), mods = readWorld();
+  mods.spaces[modSpace].members.push('mod-personal'); fs.writeFileSync(world, JSON.stringify(mods));
+  finish(mod); assert.deepEqual(readWorld().spaces[modSpace].members, ['mod-personal']);
+  // Manually moved worker: finish follows terminal ownership, not its old space label.
+  const moved = f.spawn('moved'), moving = readWorld(), source = f.space(moved);
+  moving.spaces[source].members = moving.spaces[source].members.filter(a => a !== moved.terminal);
+  if (!moving.spaces[source].members.length) delete moving.spaces[source];
+  moving.spaces.personal.members.push(moved.terminal); moving.terminals[moved.terminal].space = 'personal';
+  fs.writeFileSync(world, JSON.stringify(moving)); finish(moved);
+  assert.deepEqual(readWorld().spaces.personal.members, ['personal-guest']);
+  // Unconfirmed terminal removal cannot empty a space or return a copy early.
+  const pending = f.spawn('pending', 'other'), pendingSpace = f.space(pending), failed = readWorld(); failed.failRm = true;
+  fs.writeFileSync(world, JSON.stringify(failed));
+  finish(pending); assert.ok(f.task('pending').copyToReturn); assert.ok(readWorld().spaces[pendingSpace].members.includes(pending.terminal));
+  const retry = readWorld(); delete retry.failRm; fs.writeFileSync(world, JSON.stringify(retry));
+  finish(pending); assert.ok(!f.task('pending').copyToReturn); assert.deepEqual(readWorld().spaces[pendingSpace].members, ['foreign']);
+  for (const [address, expected] of Object.entries(protectedTerminals)) assert.deepEqual(readWorld().terminals[address], expected);
+  const calls = readWorld().log.slice(n);
+  assert.ok(!calls.some(c => /space|move|label|doc/.test(c[0])), 'Crew never closes/deletes/renames a space or edits layout');
+  assert.ok(!calls.some(c => ['kill', 'rm'].includes(c[0]) && Object.hasOwn(protectedTerminals, c.at(-1))), 'Even force never closes foreign terminals');
+}
+function workerSpaceSessionTests() {
+  const f = workerSpaceFixture('sessions');
+  const legacy = f.spawn('legacy-ship', 'demo', ['--kind', 'ship']);
+  const { workerSpace: oldSpace, ...old } = legacy; f.save(old);
+  f.mode('per-project'); const project = f.spawn('project-ship', 'demo', ['--kind', 'ship']);
+  const before = fs.readFileSync(path.join(f.home, 'tasks', legacy.id, 'task.json'), 'utf8');
+  const n = readWorld().log.length;
+  const status = JSON.parse(f.call(['status', '--all', '--json']).out);
+  assert.ok(status.tasks.some(t => t.id === legacy.id)); assert.ok(status.tasks.every(t => !Object.hasOwn(t, 'workerSpace')));
+  const fleet = JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out);
+  assert.deepEqual(Object.keys(fleet).sort(), ['home', 'owner', 'prDiscovery', 'tasks', 'view']);
+  for (const t of fleet.tasks) assert.deepEqual(Object.keys(t).sort(), ['id', 'pr', 'prDiscovery', 'state', 'terminal']);
+  let r = f.call(['wait', legacy.id, '--timeout', '0.02', '--no-fallback']); assert.equal(r.code, 124, r.out);
+  assert.equal(fs.readFileSync(path.join(f.home, 'tasks', legacy.id, 'task.json'), 'utf8'), before, 'Reading old tasks does not migrate them');
+  const terminals = structuredClone(readWorld().terminals);
+  r = f.call(['end']); assert.equal(r.code, 0, r.out); assert.deepEqual(readWorld().terminals, terminals);
+  assert.ok(readWorld().log.slice(n).every(c => ['get', 'ls'].includes(c[0])), 'Status/wait/end do not mutate Core');
+  const next = 'owner-spaces-next-session', w = readWorld(); w.terminals[next] = { address: next, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+  const call = args => crew(args, { cwd: f.home, terminal: next, env: f.env });
+  r = call(['start']); assert.equal(r.code, 0, r.out);
+  assert.match(call(['config', 'worker-space']).out, /per-project/, 'End/start retains the mode');
+  r = call(['config', 'worker-space', 'combined']); assert.equal(r.code, 0, r.out);
+  for (const t of [legacy, project]) assert.deepEqual(readWorld().terminals[t.terminal], terminals[t.terminal], 'New coordinator/mode never reshuffles earlier-session workers');
+  r = call(['spawn', 'new-session', '--project', 'demo', '--agent', 'pi', 'Count.']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(f.task('new-session')), oldSpace.id);
+  f.done(project); r = call(['review', project.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(f.task(`${project.id}-review`)), project.workerSpace.id, 'Earlier-session review keeps project placement');
+  f.done(legacy); r = call(['wait', legacy.id, '--timeout', '0.02']); assert.equal(r.code, 0, r.out);
+  r = call(['tell', legacy.id, 'Continue.']); assert.equal(r.code, 0, r.out);
+  r = call(['relaunch', legacy.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(legacy), oldSpace.id);
+  for (const id of [legacy.id, project.id, `${project.id}-review`, 'new-session']) {
+    r = call(['finish', id]); assert.equal(r.code, 0, r.out); assert.equal(f.task(id).state, 'closed');
+  }
+}
 gapTests['worker-spaces'] = async () => {
-  await workerSpaceConfigTests(); workerSpacePlacementTests(); workerSpaceInheritanceTests(); workerSpaceFixTests();
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    await workerSpaceConfigTests(); workerSpacePlacementTests(); workerSpaceInheritanceTests(); workerSpaceFixTests();
+    await workerSpaceRepairAdmissionTest(); workerSpaceLifecycleTests(); workerSpaceSessionTests();
+  } finally { fs.writeFileSync(world, before); }
 };
 
 gapTests['registry-sharing'] = async () => {

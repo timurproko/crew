@@ -49,6 +49,10 @@ New launches additionally carry:
 | `crew.space.project` | Placement project key: exact registered name, or `crew:self` for internal repair fallback. |
 | `crew.space.name` | Per-project only: exact registered name, or `crew` for internal repair fallback. Omitted in combined mode to preserve directory-derived headings. |
 
+In combined mode `crew.space.project` remains the individual task's project, so different
+values legitimately coexist under the same combined ID; it is not a home/space grouping
+key in that mode. Bind by the validated mode/ID and unchanged `crew.home`, not by headings.
+
 Space IDs are local to the machine running Crew:
 
 - Combined: `fm-crew-<home tag>` (unchanged legacy identity).
@@ -75,6 +79,9 @@ qualify, unrelated clones/registrations do not). Otherwise they use the internal
 named `crew`. Task/dispatch project stays `crew:self`; `crew.space.project` can therefore
 be `crew` for a verified shared binding. That binding protects the registration from
 removal/repointing while the fixer is unfinished or its copy still waits to return.
+Repository identity is checked outside the registry lock; admission rechecks the registered
+path. If that path changed meanwhile, the repair refuses before creating a task and asks
+for a retry instead of using stale proof or holding a registry lock across Git probes.
 
 ## Required Herdr companion support
 
@@ -90,6 +97,43 @@ be supported. It must consume per-project name metadata for registered project h
 rather than pool folder names, preserving explicit user rename precedence. The old
 single-child `fm-crew-<home tag>` matcher is insufficient. These are companion changes,
 not a new Core API or changes to Herdr in this repository.
+
+## Cleanup and compatibility
+
+Crew **never deletes a space itself**, even with force. Finish stops/removes only terminals
+recorded as started for that task, including replacement history. It does not infer terminal
+ownership from a space ID, displayed name, cwd or matching labels. A foreign terminal at
+another cwd in the same project space survives; a personal same-named space and a remote
+space with the same local suffix survive as well. Existing busy-worker, stop confirmation,
+copy protection and postponed-return rules remain unchanged.
+
+Herdr's automatic `fm-` space lifecycle removes a space when its final tab disappears,
+without a keeper shell or retention Start page. Finishing one task leaves other workers;
+a report without finish leaves its worker available for tell. Each shared/project space
+empties independently. Foreign terminals or mod tabs keep a space nonempty. A copy may
+still wait to return after its former space has emptied; a person can also remove the
+last tab before task closure. Crew does not override either case or issue whole-space
+cleanup. Repeated finish remains idempotent and retries only its guarded task cleanup.
+
+Status, wait, tell, review, relaunch, finish and end retain their existing interfaces in
+mixed layouts and for pre-change tasks without placement metadata. Read-only status does
+not reconcile spaces or add placement fields to legacy/minimal fleet responses. End releases
+ownership only; start can adopt earlier tasks without changing their saved placement.
+
+## Regression scope
+
+`node crew.test.mjs --gaps=worker-spaces` uses isolated homes/repositories, fake Core and
+sandboxed tool/account paths. It covers both modes, both switches while tasks run, all
+inherited launch paths, stale configuration/admission barriers, legacy tasks, self-repair
+registration identity, foreign terminals, same-named personal spaces, remote identities,
+unconfirmed cleanup and end/start with a different coordinator and mode.
+
+The opt-in fake adoption model groups exact launch labels into spaces and removes only
+modeled zero-tab automatic spaces. These tests prove Crew's requests, ownership boundary
+and lack of space/document mutations; they are **not** native rendering, connected-child
+or actual native zero-tab deletion evidence. Those require compatible companion support
+and separately authorized native validation; this task does not touch the running app,
+coordinator or their spaces/tasks.
 
 ## Named limits
 
