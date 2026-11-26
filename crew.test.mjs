@@ -36,7 +36,7 @@ assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', proje
 // A scout's brief does not change for a workflow project; the gate wins over it.
 {
   const ship = { id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' };
-  const ends = '- When you are finished, write your result to `R` in Markdown, with the answer in the first lines.\n- Then run `crew done t1` and stop. Do not start any other work.\n- If you cannot finish, write what blocked you to the same file and still run the command.\n';
+  const ends = '- For a hand-off that changes code or tests, run the project build and full local test suite once on the head you hand off, following README/docs. List the exact build and test commands and results in your report, including failures or unavailable commands. A hand-off that changes only documents or planning artifacts (including a plan commit or spec text) needs no test run; state that exemption in the report.\n- When you are finished, write your result to `R` in Markdown, with the answer in the first lines.\n- Then run `crew done t1` and stop. Do not start any other work.\n- If you cannot finish, write what blocked you to the same file and still run the command.\n';
   const start = '# Task t1 (ship)\n\nx\n\n## Rules\n- Work only inside `W`. It is your own copy of the project `p`; nobody else uses it.\n- Output exception: keep proof pictures and scratch outside the working copy, in your crew task folder `.`. This folder is allowed for reports and disposable output, not project edits.\n- Stop every disposable app instance or server you started before writing your report and running `crew done`.\n';
   assert.equal(briefText(ship), `${start}- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.\n${ends}`);
   const gated = `${start}- Make your changes on the branch already checked out here and commit them.\n- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file I --skip ci\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. A wait that runs out is not a failure: run the same command again to go on. Do not push or open a pull request any other way.\n- The gate ends when the pull request is open. Its checks are not watched here: the person reads them on the pull request.\n- Put the pull request link the gate gives you in the first lines of your report. If the gate stops on something only a person can decide, say exactly what in the report.\n${ends}`;
@@ -2592,6 +2592,24 @@ gapTests['ship-check-wait'] = () => {
   f.save({...f.task('ship'),checkRepair:undefined}); r=wait(); assert.equal(r.code,124,r.out);
   assert.equal(f.task('ship').state,'reported','fast report is not overwritten by automatic tell');
   assert.equal(f.task('ship').checkRepair.pending,false);
+};
+
+gapTests['review-delta-brief'] = () => {
+  const f=reviewLabelsFixture('delta-brief',{CREW_DELIVERY_APP_SLUG:'delivery'}), ship=f.parent();
+  commit(ship.worktree,{'openspec/changes/example/specs/thing/spec.md':'# change\n'},'scope');
+  const a=git('-C',ship.worktree,'rev-parse','HEAD').trim(); f.control({head:a});
+  const first=f.start().task; assert.equal(first.reviewMode,'full'); assert.equal(f.done(first,'APPROVE').code,0);
+  commit(ship.worktree,{'openspec/specs/thing/spec.md':'# finalized\n'},'docs(openspec): finalize example');
+  const bot=git('-C',ship.worktree,'rev-parse','HEAD').trim();
+  commit(ship.worktree,{'openspec/specs/thing/spec.md':'# human new behavior\n'},'spec fix');
+  const human=git('-C',ship.worktree,'rev-parse','HEAD').trim();
+  f.control({head:human,body:'```openspec-implementation\n{"change":"example","archive":"openspec/changes/archive/2026-11-26-example/"}\n```',commits:{[bot]:{sha:bot,author:{login:'delivery[bot]'},committer:{login:'delivery[bot]'}}}});
+  const next=f.start('ship','-2').task;
+  assert.equal(next.reviewMode,'delta'); assert.equal(next.reviewBase,a); assert.deepEqual(next.reviewCommits,[human]); assert.deepEqual(next.reviewExcluded,[bot]);
+  const brief=fs.readFileSync(next.brief,'utf8');
+  for(const text of ['DELTA review',`${a}..${human}`,'git checkout --detach','full local test suite once','What I checked','even on APPROVE','needs no test run','plan commit or spec text','test the entire current head']) assert.ok(brief.includes(text),text);
+  assert.equal(f.done(next,'APPROVE\n\n## What I checked\nSpec-only delta; no test run required.').code,0); assert.equal(f.task('ship').approvedHead,human);
+  assert.equal(f.task('ship').reviewVerdict.needsReview,false);
 };
 
 gapTests['approval-coverage'] = () => {

@@ -126,7 +126,7 @@ For handoffs changing code or tests, ship and reviewer briefs SHALL require buil
 #### Scenario: Worker receives implementation instructions
 
 - **WHEN** crew prepares a ship brief
-- **THEN** the brief requests which build and full local test commands passed on the handed-off head and disclosure of unavailable commands or failures
+- **THEN** the brief requests build and full local test commands/results for code/test changes, or an explicit no-test-run exemption for documents/planning-only work, and disclosure of unavailable commands or failures
 
 #### Scenario: Documents or planning only
 
@@ -141,7 +141,7 @@ For handoffs changing code or tests, ship and reviewer briefs SHALL require buil
 #### Scenario: Delta review excludes only proven delivery work
 
 - **WHEN** the current head descends from a retained approved head and new unapproved work exists
-- **THEN** the brief identifies the approved-to-current range and unapproved commits, excludes only verified permitted delivery commits and requires testing the entire current head
+- **THEN** the brief identifies the approved-to-current range and unapproved commits, excludes only verified permitted delivery commits and requires testing the entire current head when code or tests changed
 
 #### Scenario: Unapproved spec changes remain visible
 

@@ -1314,12 +1314,15 @@ export function briefText({ id, kind, task, worktree, project, report, tools = [
         : '- The gate ends when the pull request is open. Its checks are not watched here: the person reads them on the pull request.',
       '- Put the pull request link the gate gives you in the first lines of your report. If the gate stops on something only a person can decide, say exactly what in the report.',
     ] : []),
+    ...(kind === 'ship' ? [LOCAL_HANDOFF] : []),
     `- When you are finished, write your result to \`${report}\` in Markdown, with the answer in the first lines.`,
     `- Then run \`crew done ${id}\` and stop. Do not start any other work.`,
     '- If you cannot finish, write what blocked you to the same file and still run the command.', '',
     ...(hints.length ? ['## Tools on this machine', ...hints, ''] : []),
   ].join('\n');
 }
+
+const LOCAL_HANDOFF = '- For a hand-off that changes code or tests, run the project build and full local test suite once on the head you hand off, following README/docs. List the exact build and test commands and results in your report, including failures or unavailable commands. A hand-off that changes only documents or planning artifacts (including a plan commit or spec text) needs no test run; state that exemption in the report.';
 
 // A ship task works on a branch named the way the shared delivery workflow names them:
 // <type>/<task id>. Tasks from before 0.7 are on crew/<id>.
@@ -2406,14 +2409,24 @@ function cmdReview(args) {
   let n = 1, reviewId = `${id}-review`.slice(0, 40);
   while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
   const reviewHead = ready.head ?? pullRequestReviewHead(task), target = reviewHead ?? branchOf(task);
+  const approvedHead = approvedHeadOf(task), coverage = approvalCovers(task, approvedHead, reviewHead);
+  const delta = !!approvedHead && coverage.mode === 'delta';
   const text = [
     `Review the work of task ${id}. It is the branch \`${branchOf(task)}\` of this repository; you are on the commit it started from.`,
     '', `- Review the fixed head \`${target}\` with \`git log HEAD..${target}\` and \`git diff HEAD...${target}\`. Read the changed files whole where the diff is not enough.`,
+    ...(delta ? [
+      `- This is a DELTA review of \`${approvedHead}..${target}\`, not a re-review of approved work. Inspect \`git log ${approvedHead}..${target}\`.`,
+      `- Unapproved task commits (review each with \`git show --format=fuller --first-parent <sha>\`): ${coverage.commits.join(', ') || 'none; approval still covers this head'}.`,
+      `- Excluded verified delivery commits: ${coverage.excluded.join(', ') || 'none'}. Do not exclude other spec changes or rely on a blanket path filter.`,
+    ] : ['- This is a FULL review; no ancestral approval supplies a safe delta basis.']),
     `- What it was asked to do is in \`${task.brief}\`; what its author says it did is in \`${task.report}\`.`,
-    '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
-    '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
+    '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Ignore style.',
+    `- Check out the fixed head with \`git checkout --detach ${target}\` in your isolated copy before building or testing. Do not change the ship copy.`,
+    LOCAL_HANDOFF,
+    '- Even for a delta review, test the entire current head when the hand-off changes code or tests, not just changed files. Documents-only or planning-only hand-offs need no test run.',
+    '- Start your report with exactly one line: `APPROVE` or `CHANGES NEEDED`. Put findings after it: file and line, what goes wrong, and how to reproduce. Always include a short `## What I checked` section with the head, inspected scope, commands/results or the documents/planning-only test exemption, even on APPROVE with no defects.',
   ].join('\n');
-  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead } });
+  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead, reviewMode: delta ? 'delta' : 'full', reviewBase: delta ? approvedHead : null, reviewCommits: delta ? coverage.commits : null, reviewExcluded: delta ? coverage.excluded : [] } });
   reviewLabels(h, reviewId);
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }

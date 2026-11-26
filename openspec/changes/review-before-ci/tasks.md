@@ -17,9 +17,9 @@
 
 ## 3. Delta reviewer briefs require full-head local build and test evidence
 
-- [ ] 3.1 Save automatic delta/full mode, approved base, fixed head and explicit unapproved commit list in reviewer evidence; fixtures must show human/spec changes remain visible while only individually verified permitted delivery commits are excluded.
-- [ ] 3.2 Replace optional-test and verdict-only reviewer instructions with fixed-head checkout, build/full-suite once for code/test changes, exact first-line verdict, findings and What I checked; generated-brief fixtures must assert commands/results even on APPROVE and an explicit no-test-run exemption for documents/planning-only handoffs.
-- [ ] 3.3 Add ship-brief build/full-suite command/results for code/test changes and an explicit documents/planning-only no-test-run exemption; document full versus delta review in README; fixtures must retain scratch/shutdown instructions and show delta APPROVE advances the approved head.
+- [x] 3.1 Save automatic delta/full mode, approved base, fixed head and explicit unapproved commit list in reviewer evidence; fixtures must show human/spec changes remain visible while only individually verified permitted delivery commits are excluded.
+- [x] 3.2 Replace optional-test and verdict-only reviewer instructions with fixed-head checkout, build/full-suite once for code/test changes, exact first-line verdict, findings and What I checked; generated-brief fixtures must assert commands/results even on APPROVE and an explicit no-test-run exemption for documents/planning-only handoffs.
+- [x] 3.3 Add ship-brief build/full-suite command/results for code/test changes and an explicit documents/planning-only no-test-run exemption; document full versus delta review in README; fixtures must retain scratch/shutdown instructions and show delta APPROVE advances the approved head.
 
 ## 4. Plain land publishes follow-up commits to the existing open pull request
 

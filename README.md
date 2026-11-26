@@ -471,7 +471,15 @@ and affected spec folders, or App-owned clean base merges whose tree matches `gi
 Without configured identity or verifiable proof, no bot exemption is granted. Other descendant
 commits need delta review; a force-push away needs full review. Neither invents a negative verdict.
 An unverifiable head warns instead of selecting Approved or fabricating CHANGES NEEDED.
-Before a plain branch has a PR, the local branch head supplies the comparison. Plain
+Before a plain branch has a PR, the local branch head supplies the comparison. Reviewers check out the fixed head and report a first-line verdict followed by findings
+and a short **What I checked** section even on APPROVE. For handoffs changing code or tests,
+workers and reviewers run the project's build and full local test suite once on the handed-off
+head and list commands/results. Documents-only and planning-only handoffs (including plan
+commits and spec text) need no test run; the report states that exemption. Delta review uses
+the retained approved-to-current range and an explicit list of unapproved commits, excluding
+only individually verified permitted delivery commits, not all spec paths. Code/test deltas
+still test the entire current head; replaced history gets full review.
+Plain
 `crew land`, including a repeated land, checks the PR head against the last verdict,
 updates recorded freshness and normalizes open-PR labels to Approved or Rework. A stale
 approval warns and selects Rework. Status JSON exposes the saved
