@@ -65,6 +65,16 @@ Crew SHALL refuse a premature review with exit 6 and a specific reason unless ex
 - **WHEN** multiple check runs have the same name on the target head
 - **THEN** crew uses the latest non-cancelled run per check name and does not let cancelled duplicates supersede useful results
 
+#### Scenario: Cancelled-only applicable light check
+
+- **WHEN** Readiness succeeds but the only current-head Name guard attempt is cancelled
+- **THEN** crew retains Name guard as applicable, refuses review until a non-cancelled successful attempt exists, and does not let a longer wait manufacture success
+
+#### Scenario: Skipped applicable light check
+
+- **WHEN** an applicable light check is skipped in either draft or ready state
+- **THEN** crew requires actual light-check success regardless of whether the skip came from draft guards or path selection
+
 #### Scenario: Coordinator explicitly forces a review
 
 - **WHEN** the owner requests review with --force despite an unmet readiness condition
@@ -77,12 +87,27 @@ Crew SHALL refuse a premature review with exit 6 and a specific reason unless ex
 
 ### Requirement: Ship waits settle on checks with one repair follow-up
 
-For a reported workflow implementation ship, crew wait SHALL await passing current-head light checks and settle as ready for review. It SHALL observe full checks for an already approved or landed PR without delaying Approved. On a failed check, only the owner SHALL send one automatic follow-up naming the check and URL. Another failed repair handoff SHALL settle as needs-a-person with exit 7. Timeout SHALL remain exit 124.
+For a reported workflow implementation, crew wait SHALL settle as ready for review after current-head light checks pass. Full-CI completion SHALL require a ready PR and a successful current-head CI required gate, without delaying Approved. Only the owner SHALL send one failed-check repair follow-up naming the check and URL. Another failed repair handoff SHALL settle as needs-a-person with exit 7; timeout SHALL remain 124.
 
 #### Scenario: Light checks finish after report
 
 - **WHEN** a reported implementation ship has pending light checks which later pass on its current head
 - **THEN** wait remains active until it prints ready for review without launching a reviewer
+
+#### Scenario: Published PR is safely ahead of the ship copy
+
+- **WHEN** the reported implementation's copy is clean and strictly behind its exact published PR head, and that head's light checks pass
+- **THEN** wait settles as ready for review without moving the checkout, and the subsequent review performs the guarded fast-forward
+
+#### Scenario: Approved draft has skipped heavy suites
+
+- **WHEN** an approved draft has passing light checks but draft guards skipped its heavy suites and required CI gate
+- **THEN** wait remains pending for promotion and real required-gate success without delaying or demoting Approved
+
+#### Scenario: Ready PR has an optional path-selected suite skip
+
+- **WHEN** a ready PR's non-required suite is skipped, all applicable light checks pass and the current-head CI required gate succeeds
+- **THEN** wait may report full CI passed, but a skipped or absent required gate never supplies that proof
 
 #### Scenario: First failed check reopens work
 

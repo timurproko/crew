@@ -2797,7 +2797,7 @@ else if(method==='GET' && endpoint.includes('/pulls/')) {
   if(s.prDenied) fail('PR state unavailable');
   if(s.prDelay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,s.prDelay);
   const recorded = ${JSON.stringify(recordedRestPr(42, 'feature/ship', 'pull-get-open.json'))};
-  console.log(JSON.stringify(s.prResponse ?? {...recorded,state:s.prState ?? 'open',merged_at:s.mergedAt ?? null,body:s.body ?? '## Implementation\\n- [x] The behavior is delivered and covered.\\n',head:{...recorded.head,sha:s.head,ref:s.branch ?? 'feature/ship'}}));
+  console.log(JSON.stringify(s.prResponse ?? {...recorded,state:s.prState ?? 'open',draft:s.draft ?? recorded.draft,merged_at:s.mergedAt ?? null,body:s.body ?? '## Implementation\\n- [x] The behavior is delivered and covered.\\n',head:{...recorded.head,sha:s.head,ref:s.branch ?? 'feature/ship'}}));
 }
 else if(method==='GET' && endpoint.includes('/issues/')) console.log(JSON.stringify([s.labels.map(name=>({name}))]));
 else if(method==='GET') { const name=decodeURIComponent(endpoint.split('/').at(-1)); if(!s.defined.includes(name)) fail('shared label not defined'); console.log(JSON.stringify({name})); }
@@ -2857,6 +2857,80 @@ gapTests['review-readiness'] = () => {
   assert.equal(reduceReviewChecks([{...run(1,'Readiness'),started_at:'2026-11-26T10:00:00Z'},run(2,'Readiness',null,'queued')]).status,'pending','A newly queued run cannot be hidden by an older successful run');
   assert.throws(()=>reduceReviewChecks([{...run(1,'Readiness','failure'),html_url:null}]),/URL unavailable/);
 };
+gapTests['wait-safe-fast-forward'] = () => {
+  const f=reviewLabelsFixture('wait-fast-forward'), task=f.parent('ship',{workflow:'delivery',stage:'implementation'});
+  const remote=reviewRemote(f,task), base=git('-C',task.worktree,'rev-parse','HEAD').trim();
+  const bot=path.join(f.dir,'bot'); git('clone','-q','--branch',task.branch,remote,bot);
+  const head=commit(bot,{'spec.txt':'bot finalization'},'docs: bot head');
+  git('-C',bot,'push','-q','origin',`HEAD:refs/heads/${task.branch}`,'HEAD:refs/pull/42/head');
+  f.control({head,draft:true});
+  const wait=()=>f.call(['wait','ship','--timeout','0.01','--no-fallback']);
+  let r=wait(); assert.equal(r.code,0,r.out); assert.match(r.out,/ready for review/);
+  assert.equal(git('-C',task.worktree,'rev-parse','HEAD').trim(),base,'Waiting only assesses safe fast-forward, never moves the ship checkout');
+  const coreBefore=readWorld().log.length;
+  r=f.call(['wait','ship','--timeout','0.01','--no-fallback'],{CREW_TERMINAL:'read-only-inspector'}); assert.equal(r.code,0,r.out);
+  assert.ok(!readWorld().log.slice(coreBefore).some(a=>['run','kill','rm','send','label'].includes(a[0])),'Non-owner wait sends no messages and changes no terminal');
+  assert.equal(git('-C',task.worktree,'rev-parse','HEAD').trim(),base);
+  const before=f.calls().length;
+  r=f.call(['review','ship','--agent','pi']); assert.equal(r.code,0,r.out); assert.match(r.out,/fast-forwarded/);
+  assert.equal(f.task('ship-review').reviewHead,head); assert.equal(git('-C',task.worktree,'rev-parse','HEAD').trim(),head);
+  assert.equal(f.calls().slice(before).filter(c=>c.endpoint==='repos/acme/demo/pulls/42').length,2,'One gate snapshot and one advisory label snapshot');
+  git('-C',task.worktree,'reset','--hard',base); fs.writeFileSync(path.join(task.worktree,'dirty.txt'),'not disposable');
+  r=wait(); assert.equal(r.code,124,r.out); assert.match(r.out,/uncommitted/); fs.unlinkSync(path.join(task.worktree,'dirty.txt'));
+  commit(task.worktree,{'local.txt':'unpublished'},'unpublished work');
+  const local=git('-C',task.worktree,'rev-parse','HEAD').trim(); r=wait(); assert.equal(r.code,124,r.out); assert.match(r.out,/cannot be safely fast-forwarded/);
+  assert.equal(git('-C',task.worktree,'rev-parse','HEAD').trim(),local,'Diverged work stays untouched');
+};
+gapTests['review-check-truth-table'] = () => {
+  const f=reviewLabelsFixture('check-truth-table'), task=f.parent('ship',{workflow:'delivery',stage:'implementation'}); reviewRemote(f,task);
+  const head=git('-C',task.worktree,'rev-parse','HEAD').trim();
+  const run=(id,name,conclusion='success',status='completed')=>({id,name,conclusion,status,head_sha:head,html_url:`https://checks.test/${id}`});
+  const baseline=()=>[run(1,'Readiness'),run(2,'OpenSpec'),run(3,'Name guard'),run(4,'Crew tests (linux)'),run(5,'CI required')];
+  const replace=(name,...attempts)=>[...baseline().filter(c=>c.name!==name),...attempts];
+  // Every row runs through the real GitHub collection, gate and both wait modes,
+  // in draft and ready PR states. Failure waits disable automatic tells for exit 7;
+  // ship-check-wait independently covers the one-tell/second-failure lifecycle.
+  const cases=[
+    {name:'success',checks:baseline(),gate:0,light:0,full:0},
+    {name:'failure',checks:replace('Name guard',run(10,'Name guard','failure')),gate:6,light:7,full:7},
+    {name:'cancelled-only',checks:replace('Name guard',run(10,'Name guard','cancelled')),gate:6,light:124,full:124},
+    {name:'cancelled then success',checks:replace('Name guard',run(10,'Name guard','cancelled'),run(11,'Name guard')),gate:0,light:0,full:0},
+    {name:'success then cancelled',checks:replace('Name guard',run(10,'Name guard'),run(11,'Name guard','cancelled')),gate:0,light:0,full:0},
+    {name:'failure then cancelled',checks:replace('Name guard',run(10,'Name guard','failure'),run(11,'Name guard','cancelled')),gate:6,light:7,full:7},
+    {name:'skipped by draft guard',checks:baseline().map(c=>/Crew tests|CI required/.test(c.name)?{...c,conclusion:'skipped'}:c),gate:0,light:0,full:124},
+    {name:'skipped by path selection',checks:replace('Crew tests (linux)',run(10,'Crew tests (linux)','skipped')),gate:0,light:0,full:0},
+    {name:'pending',checks:replace('Name guard',run(10,'Name guard',null,'queued')),gate:6,light:124,full:124},
+    {name:'absent required light',checks:baseline().filter(c=>c.name!=='OpenSpec'),gate:6,light:124,full:124},
+    {name:'absent full-CI gate',checks:baseline().filter(c=>c.name!=='CI required'),gate:0,light:0,full:124},
+    {name:'cancelled-only full-CI gate',checks:replace('CI required',run(10,'CI required','cancelled')),gate:0,light:0,full:124},
+    {name:'skipped light path selection',checks:replace('Name guard',run(10,'Name guard','skipped')),gate:6,light:124,full:124},
+    {name:'absent optional light',checks:baseline().filter(c=>c.name!=='Name guard'),gate:0,light:0,full:0},
+    {name:'no checks',checks:[],gate:6,light:124,full:124},
+    {name:'heavy suite failure',checks:replace('Crew tests (linux)',run(10,'Crew tests (linux)','failure')),gate:0,light:0,full:7},
+    {name:'legacy status pending',checks:baseline(),statuses:[{id:100,context:'CI required',state:'pending',created_at:'2026-11-26T10:00:00Z',target_url:'https://checks.test/status'}],gate:0,light:0,full:124},
+    {name:'legacy status failure',checks:baseline(),statuses:[{id:100,context:'Name guard',state:'error',created_at:'2026-11-26T10:00:00Z',target_url:'https://checks.test/status'}],gate:6,light:7,full:7},
+  ];
+  const body='## Implementation\n- [x] Delivered behavior and tests.\n\n```openspec-implementation\n{"version":3,"change":"example"}\n```';
+  for(const draft of [true,false]) for(const row of cases) {
+    f.control({draft,body,checks:row.checks,statuses:row.statuses??[],labels:['unrelated']}); f.save({...task,approvedHead:undefined,reviewVerdict:undefined});
+    const label=`${draft?'draft':'ready'} / ${row.name}`;
+    let r=f.call(['review','ship','--agent','pi']); assert.equal(r.code,row.gate,`${label} gate: ${r.out}`);
+    r=f.call(['wait','ship','--timeout','0.01','--no-fallback']); assert.equal(r.code,row.light,`${label} light wait: ${r.out}`);
+    if(row.light===0) assert.match(r.out,/ready for review/);
+    f.save({...task,approvedHead:head,reviewVerdict:{verdict:'APPROVE',head,currentHead:head,stale:false,needsReview:false}});
+    f.control({labels:['unrelated',f.approved]});
+    r=f.call(['wait','ship','--timeout','0.01','--no-fallback']);
+    const expected=draft&&row.full===0?124:row.full;
+    assert.equal(r.code,expected,`${label} full wait: ${r.out}`);
+    if(expected===0) assert.match(r.out,/checks passed/);
+    if(draft&&expected===124) assert.match(r.out,/draft.*promotion/);
+    assert.deepEqual(f.control().labels,['unrelated',f.approved],`${label}: CI never postpones or demotes approval by itself`);
+    assert.equal(f.task('ship').checkRepair,undefined,'No-fallback never sends a repair');
+  }
+  // Required CI success, not the check-run skipped conclusion, proves path skips.
+  for(const name of ['CI required','Name guard']) assert.equal(reduceReviewChecks([run(20,name,'cancelled')],{light:name==='Name guard',required:[name]}).status,'pending');
+};
+
 gapTests['ship-check-wait'] = () => {
   const f = reviewLabelsFixture('check-wait'), task = f.parent('ship', {workflow:'delivery',stage:'implementation'}); reviewRemote(f,task);
   const wait = extra => f.call(['wait','ship','--timeout','1'],{CREW_RECOVERY_SECONDS:'0.01',...extra});

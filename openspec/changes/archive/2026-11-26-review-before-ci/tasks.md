@@ -15,6 +15,8 @@
 - [x] 2.4 Preserve owner/no-fallback/send-failure/same-worker race protections and existing scout/Plan/reviewer/gate/plain-no-CI settlement; fixtures must assert no unauthorized messages and unchanged timeout/recovery behavior.
 - [x] 2.5 Update README help examples and readiness/wait exit-code descriptions; verify help and fixture output agree and status/fleet remain read-only.
 
+- [x] 2.6 Repair wait assessment for safely behind copies, require promotion and actual full-CI gate success, and preserve cancelled-only applicable names; verify wait-safe-fast-forward and review-check-truth-table cover all requested states in draft/ready gate and light/full wait paths.
+
 ## 3. Delta reviewer briefs require full-head local build and test evidence
 
 - [x] 3.1 Save automatic delta/full mode, approved base, fixed head and explicit unapproved commit list in reviewer evidence; fixtures must show human/spec changes remain visible while only individually verified permitted delivery commits are excluded.

@@ -461,12 +461,21 @@ and Name guard where applicable). The safe PR-head fetch/fast-forward remains; a
 diverged work is never overwritten. `--force` explicitly bypasses readiness, not ownership
 or destructive Git safeguards. Plain reported branches without a PR keep local review.
 Ready PR repairs can be reviewed while heavy CI is pending or failed: only light checks gate review.
-The latest non-cancelled attempt per check name on that exact head counts; missing or unreadable
-checks never prove readiness.
+The latest non-cancelled attempt per check name on that exact head counts. A cancelled-only
+applicable check (including Name guard) remains missing, not silently optional. Every applicable
+light check needs actual success; skipped, neutral, pending, missing or unreadable results do
+not prove readiness. An optional light name never observed is not invented as a requirement.
 
 `crew wait <ship id>` now holds a reported workflow implementation for those checks and prints
-`ready for review` when green. For an approved or landed PR it observes full CI instead,
-without delaying the approval label. The owner sends **one** automatic repair follow-up
+`ready for review` when green. A clean copy safely behind the PR is assessed against that
+published head without moving the checkout; review then performs the guarded fast-forward.
+Ahead, diverged and dirty copies remain blocked. For a covered approval or landed PR, wait
+observes full CI without delaying the approval label. Workflow full-CI completion requires
+promotion out of draft and a successful current-head **CI required** gate plus passing
+applicable light checks. Draft-guard suite/gate skips never prove full CI. A ready PR's
+non-required suite may skip by path selection only while that required gate actually succeeds;
+a skipped or absent required gate stays pending. Check runs do not expose the skip predicate,
+so Crew uses this gate evidence rather than guessing why a job skipped. The owner sends **one** automatic repair follow-up
 naming a failed check and its link; another failed repair attempt returns `needs a person`
 (exit **7**). The allowance and failed-attempt identity survive new wait processes; the same
 failure is not repeatedly sent or counted twice. A non-owner or `--no-fallback` never sends it.

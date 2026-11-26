@@ -1736,7 +1736,7 @@ function cmdWait(args) {
           const approved = approvedHeadOf(task);
           const covered = approved && context ? approvalCovers(task, approved, context.pr.head.sha, { api: context, pr: context.pr }).covered : false;
           const full = approved ? covered && !task.reviewVerdict?.needsReview : !!task.landed;
-          result = full && context ? { ...reviewChecks(context, { light: false, workflow: !!task.workflow }), head: context.pr.head.sha, context } : reviewReadiness(task, { sync: false });
+          result = full && context ? { ...reviewChecks(context, { light: false, workflow: !!task.workflow }), head: context.pr.head.sha, context } : reviewReadiness(task, { sync: false, context });
           const latest = loadTask(h, id);
           if (!sameWorker(latest, task) || latest.state !== 'reported' || latest.reported !== task.reported || latest.told !== task.told) continue;
           if (approvedHeadOf(task) && result.context && task.reviewVerdict?.currentHead !== result.head) reviewLabels(h, id, 'check');
@@ -2567,25 +2567,32 @@ function reviewPrEvidence(task) {
   return { ...api, url, pr };
 }
 const lightCheck = name => /(?:^|\/\s*)(?:Readiness|OpenSpec|Name guard)$/i.test(name);
-export function reduceReviewChecks(runs, { light = true, required = [] } = {}) {
+export function reduceReviewChecks(runs, { light = true, required = [], draft = false } = {}) {
   if (!Array.isArray(runs)) throw Error('checks unreadable');
-  const latest = new Map();
+  const latest = new Map(), applicable = new Set(required);
   for (const r of runs) {
     if (!r || typeof r.name !== 'string' || !r.name || !Number.isSafeInteger(r.id) || r.id < 0 || !['queued', 'in_progress', 'completed', 'waiting', 'pending', 'requested'].includes(r.status) || r.conclusion != null && !['success', 'failure', 'neutral', 'skipped', 'cancelled', 'timed_out', 'action_required', 'stale', 'startup_failure'].includes(r.conclusion)) throw Error('check run unreadable');
-    if (r.conclusion === 'cancelled' || light && !lightCheck(r.name)) continue;
+    if (light && !lightCheck(r.name)) continue;
+    // Cancellation discards an attempt, not the duty to observe this check name.
+    applicable.add(r.name);
+    if (r.conclusion === 'cancelled') continue;
     const previous = latest.get(r.name);
     const order = Date.parse(r.started_at ?? r.created_at) || 0, before = Date.parse(previous?.started_at ?? previous?.created_at) || 0;
     if (!previous || ((!order || !before) ? r.id > previous.id : order > before || order === before && r.id > previous.id)) latest.set(r.name, r);
   }
   const checks = [...latest.values()];
-  const missing = required.filter(name => !checks.some(c => c.name === name || c.name.endsWith(`/ ${name}`)));
+  const matches = (actual, name) => actual === name || actual.split('/').at(-1).trim() === name;
+  const missing = [...applicable].filter(name => !checks.some(c => matches(c.name, name)));
   const failed = checks.find(c => c.status === 'completed' && !['success', 'neutral', 'skipped', null].includes(c.conclusion));
   if (failed) {
     if (typeof failed.html_url !== 'string' || !/^https?:\/\//.test(failed.html_url)) throw Error(`failed check ${failed.name} URL unavailable`);
     return { status: 'failed', check: failed, reason: `${failed.name} failed: ${failed.html_url}` };
   }
+  if (!light && draft) return { status: 'pending', reason: 'PR is draft; waiting for promotion and actual full-CI results' };
   if (missing.length || !checks.length) return { status: 'pending', reason: `missing checks: ${missing.join(', ') || (light ? 'light draft checks' : 'CI')}` };
-  const pending = checks.find(c => c.status !== 'completed' || !c.conclusion || light && c.conclusion !== 'success');
+  // Light jobs and required gates must actually succeed. Other ready-PR jobs may
+  // skip by path selection, but a skipped required gate never proves full CI.
+  const pending = checks.find(c => c.status !== 'completed' || !c.conclusion || (light || lightCheck(c.name) || required.some(name => matches(c.name, name))) && c.conclusion !== 'success');
   return pending ? { status: 'pending', reason: `${pending.name} has not passed` } : { status: 'ready', reason: 'checks passed' };
 }
 function reviewChecks(context, { light = true, workflow = false } = {}) {
@@ -2607,29 +2614,40 @@ function reviewChecks(context, { light = true, workflow = false } = {}) {
     if (typeof s.context !== 'string' || !['pending', 'success', 'failure', 'error'].includes(s.state)) throw Error('commit status unreadable');
     checks.push({ id: s.id, name: s.context, status: s.state === 'pending' ? 'pending' : 'completed', conclusion: s.state === 'success' ? 'success' : s.state === 'pending' ? null : 'failure', started_at: s.created_at, html_url: s.target_url });
   }
-  const required = light && workflow ? ['Readiness', ...(/```openspec-implementation/.test(pr.body ?? '') ? ['OpenSpec'] : [])] : [];
-  const result = reduceReviewChecks(checks, { light, required });
+  if (!light && typeof pr.draft !== 'boolean') throw Error('PR draft state unreadable');
+  const required = workflow ? ['Readiness', ...(/```openspec-implementation/.test(pr.body ?? '') ? ['OpenSpec'] : []), ...(!light ? ['CI required'] : [])] : [];
+  const result = reduceReviewChecks(checks, { light, required, draft: pr.draft });
   if (!workflow && light && checks.length && !checks.some(c => lightCheck(c.name))) return { status: 'ready', reason: 'no light draft checks; full CI does not gate review' };
   if (!workflow && !checks.length) return { status: 'ready', noCi: true, reason: 'reviewed locally; no CI' };
   return result;
 }
-export function reviewReadiness(task, { force = false, sync = true } = {}) {
+export function reviewReadiness(task, { force = false, sync = true, context: observed } = {}) {
   if (force) return { status: 'ready', head: pullRequestReviewHead(task), reason: 'forced' };
   if (task.state !== 'reported') return { status: 'pending', reason: `worker is ${task.state}; review after it reported` };
   try {
-    const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 2000 });
+    const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 2000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
     const dirty = git('status', '--porcelain');
     if (dirty.code !== 0 || dirty.stdout.trim()) throw Error('copy has uncommitted files or cannot be inspected');
-    const context = reviewPrEvidence(task);
+    const context = observed ?? reviewPrEvidence(task);
     if (!context) {
       if (task.workflow) throw Error('implementation PR unavailable');
       return { status: 'ready', head: reviewHeadOf(task), reason: 'local branch; no PR' };
     }
     const { pr } = context;
     if (pr.state !== 'open' || pr.merged_at) throw Error('implementation PR is closed or merged');
-    // Wait only observes; the explicit review command owns the safe fast-forward.
-    const head = sync ? pullRequestReviewHead({ ...task, pr: context.url }, context) : reviewHeadOf(task);
-    if (head !== pr.head.sha || git('rev-parse', 'HEAD').stdout.trim() !== head) throw Error('local head differs from PR head; push or fast-forward the copy first');
+    // Wait assesses the same guarded fast-forward without moving the ship branch.
+    // Review itself performs it after rechecking the copy and current PR snapshot.
+    const local = reviewHeadOf(task);
+    if (!reviewSha(local)) throw Error('local branch head is unreadable');
+    if (git('rev-parse', 'HEAD').stdout.trim() !== local) throw Error('copy is not checked out at its recorded branch head');
+    let head = sync ? pullRequestReviewHead({ ...task, pr: context.url }, context) : local;
+    const fastForward = !sync && local !== pr.head.sha;
+    if (fastForward) {
+      if (git('cat-file', '-e', `${pr.head.sha}^{commit}`).code !== 0) git('fetch', '--quiet', 'origin', `refs/pull/${context.number}/head`);
+      if (git('merge-base', '--is-ancestor', local, pr.head.sha).code !== 0) throw Error('local head differs from PR head and cannot be safely fast-forwarded; push or reconcile the copy first');
+      head = pr.head.sha;
+    }
+    if (head !== pr.head.sha) throw Error('local head differs from PR head; push or reconcile the copy first');
     const published = git('ls-remote', '--exit-code', '--heads', 'origin', branchOf(task));
     if (published.code !== 0 || published.stdout.trim().split(/\s+/)[0] !== head) throw Error('branch publication could not be verified; push local commits first');
     if (task.workflow) {
@@ -2637,7 +2655,7 @@ export function reviewReadiness(task, { force = false, sync = true } = {}) {
       const outcomes = /^## Implementation\s*$([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(pr.body ?? '')?.[1] ?? '';
       if (!/^\s*- \[[xX]\]/m.test(outcomes) || /^\s*- \[ \]/m.test(outcomes)) throw Error('implementation outcomes are missing or unticked');
     }
-    return { ...reviewChecks(context, { workflow: !!task.workflow }), head, context };
+    return { ...reviewChecks(context, { workflow: !!task.workflow }), head, fastForward, context };
   } catch (error) { return { status: 'unavailable', reason: error.message }; }
 }
 function staleApproval(id) {
