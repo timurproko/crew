@@ -3266,6 +3266,7 @@ function cmdFleetStatus(h, discover) {
     });
   }
   const tasks = records.filter(t => fleetTaskVisible(t, currentTime)).map(t => ({ id: t.id, state: t.state,
+    project: typeof t.project === 'string' && t.project ? t.project : null,
     terminal: t.terminal ?? null, pr: t.pr ?? null, prDiscovery: results.get(t.id) }));
   console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live } : null,
     tasks, prDiscovery: { version: 1 }, view: { name: 'fleet', version: 1 } }));

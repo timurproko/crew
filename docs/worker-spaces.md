@@ -133,8 +133,9 @@ worker-space: per-project (new task admissions only; existing workers keep their
 ```
 
 This appears even with no tasks. No terminal input, asynchronous notification, restart or
-watcher is sent. Legacy full JSON and minimal fleet JSON retain their existing shape and
-serialized fields; the mode is not injected into polling responses. New admissions already
+watcher is sent. Neither setter injects the mode into full or minimal fleet JSON; changing
+the preference leaves those response shapes alone. The independent additive fleet project
+field is described in the companion contract below. New admissions already
 read the updated setting without requiring a status command.
 
 The local setter uses the same ordering point as the owner setter: a reserved spawn keeps
@@ -195,7 +196,14 @@ terminal, and concurrent task saves preserve it. Missing metadata means legacy c
 placement, irrespective of today's setting. No bulk migration or forced move occurs.
 Invalid present metadata refuses inherited launches before stopping the current worker.
 Placement labels/metadata do **not** prove Crew owns a terminal; only recorded launched
-terminal identities do. Ordinary status and minimal fleet JSON contracts are unchanged.
+terminal identities do. Full status already exposes recorded task project; minimal fleet
+version 1 now includes additive `tasks[].project` with the same task identity, or null when
+missing/unusable. It is not derived from labels or the current registry. Dotted names keep
+their spelling; closed retained tasks keep their historical project. Internal repairs still
+report `crew:self` even when their verified placement label is `crew`, as described below.
+Other fleet fields/markers and discovery/retention semantics are unchanged. Older Crew can
+omit the field; identity-sensitive clients must check actual project evidence, not merely
+the unchanged view version. No worker-space setting change rewrites task project.
 
 For `crew fix`, combined behaves as before. Per-project fixes share the registration named
 `crew` only if its Git common directory matches the tool's repository (linked worktrees
@@ -271,6 +279,15 @@ supplies its own agent-availability marker, so it runs without Pi installed; a m
 relaunch must still refuse without stopping the current worker or changing its placement.
 Windows file-symlink coverage is skipped only if OS privileges deny creation; hard-link and
 junction coverage still runs. These are CLI/ordering proofs, not native Herdr rendering or fleet transport evidence.
+
+`--gaps=fleet-project` pins the additive fleet project field against full-status identity,
+including dotted names, retained history, absent/unusable evidence and cold/warm/changed/
+rebuilt summaries without extra Core or GitHub calls. The existing worker-space tests also
+compare actual repair launch aliases and inherited worker projects with the fleet field;
+exact fleet key and scale guards remain in place. `--gaps=home-discovery-sandbox` checks
+that subprocess fixtures cannot discover a host registry above their temporary root, even
+when temporary output is placed under a real Crew task folder; fixture-local registry
+checks and default-home tests still use the real command implementation.
 
 ## Named limits
 

@@ -166,7 +166,8 @@ query, start/end or takeover is needed or permitted by this interface. Registry 
 and all other ownership guards remain intact; missing/invalid homes refuse without creation.
 See the [JSON, exit-code and home-validation contract](docs/worker-spaces.md#desktoplocal-setter-contract-version-1).
 Plain `crew status` shows the effective mode for new admissions without sending a terminal
-message or restarting the coordinator; legacy full and minimal fleet JSON stay unchanged.
+message or restarting the coordinator; changing the setting does not alter full or fleet JSON.
+The fleet view independently adds the recorded task project described below.
 Each local call confirms one home only; Herdr owns cross-machine preference application
 and must keep unsupported, offline and refused homes distinct from successful ones.
 
@@ -581,13 +582,21 @@ For a polling fleet reader use `crew status --json --view fleet`, optionally wit
   "home": "C:/Users/me/.crew",
   "owner": { "terminal": "t1", "live": true },
   "tasks": [{
-    "id": "ship", "state": "working", "terminal": "t2", "pr": null,
+    "id": "ship", "state": "working", "project": "demo", "terminal": "t2", "pr": null,
     "prDiscovery": { "status": "unavailable", "url": null, "source": null, "reason": "not-requested" }
   }],
   "prDiscovery": { "version": 1 },
   "view": { "name": "fleet", "version": 1 }
 }
 ```
+
+`tasks[].project` is an additive version-1 field: the exact recorded task project, as in
+full status, or null if absent/unusable. Dotted names keep their spelling. Internal repairs
+remain `crew:self`, even when their verified placement label uses the registered `crew`
+alias. Historical task identity does not depend on the registration still existing. No
+project is inferred from labels, cwd or headings. Older Crew may omit the field; clients
+requiring project evidence must check its value, not assume view version 1 guarantees it.
+Existing consumers may ignore this addition; all other fleet fields and behavior stay intact.
 
 Every non-closed task is included. A closed task is included only with a recorded or
 verified discovered PR. Open and unknown-state PRs stay visible however old the task is;
