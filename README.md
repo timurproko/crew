@@ -184,7 +184,9 @@ creating the task or copy. A combined join keeps combined placement labels and d
 headings, even though the home's admission policy is per-project. Switching back sends new tasks
 into combined even if their project already has its own space. During a spawn, placement
 is frozen when its task is reserved: an already-admitted launch can start after a switch
-using its saved mode.
+using its saved placement. Per-project occupancy is rechecked against task reservations after
+Core inspection; unpublished launches cause a bounded wait or retry refusal, not another space
+request. Core/copy operations never hold the registry lock.
 
 **Herdr dependency:** per-project grouping requests separate automatic spaces, but connected
 nesting under the coordinator and exact project names require the compatible Herdr companion

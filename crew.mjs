@@ -1568,8 +1568,17 @@ function workerSpaceTasks(h) {
   } catch (error) { refuse(`worker-space-unavailable: cannot read task occupancy (${error.message}); retry. Nothing was launched.`, 4); }
 }
 const unfinishedSpaceWorker = task => ['preparing', 'working'].includes(task.state);
-function workerSpaceOccupancy(h, tasks) {
-  const deadline = Date.now() + 10000;
+function workerSpaceSnapshot(h) {
+  const tasks = workerSpaceTasks(h);
+  // Exclude prose, PR facts and timestamps; only admission-relevant mutations
+  // invalidate an observation. Lifecycle locks also fence unpublished replacements.
+  const footprint = JSON.stringify([h.config, tasks.map(t => [t.id, t.project, t.state, t.terminal,
+    t.terminals, t.workerSpace, t.selfFix, fs.existsSync(`${taskFile(h, t.id)}.lifecycle.lock`)])]);
+  const pending = tasks.some(t => unfinishedSpaceWorker(t) &&
+    ((t.state === 'preparing' && !t.terminal) || fs.existsSync(`${taskFile(h, t.id)}.lifecycle.lock`)));
+  return { tasks, footprint, pending };
+}
+function workerSpaceOccupancy(h, tasks, deadline) {
   const options = () => {
     const left = deadline - Date.now();
     if (left <= 0) refuse('worker-space-unavailable: occupancy read budget expired; retry. Nothing was launched.', 4);
@@ -1579,10 +1588,14 @@ function workerSpaceOccupancy(h, tasks) {
   const listed = hcJson(['ls', '--json'], options());
   if (listed.code !== 0 || !Array.isArray(listed.value?.terminals)) fail('Core did not provide terminal occupancy');
   const records = new Map(tasks.map(t => [t.id, t])), projects = new Map();
-  const owned = new Map(tasks.filter(unfinishedSpaceWorker).flatMap(t => ownedTerminals(t).map(record => [record.address, t])));
+  const owned = new Map();
+  for (const task of tasks.filter(unfinishedSpaceWorker)) for (const record of ownedTerminals(task)) {
+    if (owned.has(record.address)) fail(`terminal ${record.address} is recorded by multiple tasks`);
+    owned.set(record.address, task);
+  }
   const seen = new Set();
   for (const entry of listed.value.terminals) {
-    if (typeof entry?.address !== 'string' || seen.has(entry.address)) fail('Core returned ambiguous terminal identities');
+    if (typeof entry?.address !== 'string' || seen.has(entry.address) || !['live', 'finished'].includes(entry.state)) fail('Core returned ambiguous terminal identities');
     seen.add(entry.address);
     if (entry.state !== 'live' || entry.address.includes('/') || entry.address === me()) continue;
     const observed = probe(entry.address, options());
@@ -1653,16 +1666,34 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks, dispatch: chosen.dispatch,
     ...(branch ? { branch, reviewRound: 1, lastFinding: null } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
   const repairPlacement = extra.selfFix ? repairWorkerProject(h, record) : null;
-  const occupancy = !Object.hasOwn(record, 'workerSpace') && h.config.workerSpaceMode === 'per-project'
-    ? workerSpaceOccupancy(h, workerSpaceTasks(h)) : null;
-  withRegistry(h, () => {
-    // The project may have been removed/replaced while selection was running.
-    if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
-    if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
-    record.workerSpace = admittedWorkerSpace(h, record, repairPlacement, occupancy);
-    fs.mkdirSync(dir, { recursive: true });
-    saveTask(h, record); // reservation freezes placement and prevents removal/replacement before external work
-  });
+  const deadline = Date.now() + 10000, pendingDeadline = Date.now() + 2000;
+  for (;;) {
+    h.config = readRegistry(h.dir);
+    const independent = !Object.hasOwn(record, 'workerSpace');
+    const snapshot = independent && h.config.workerSpaceMode === 'per-project' ? workerSpaceSnapshot(h) : null;
+    let reserved = false;
+    if (!snapshot?.pending) {
+      const occupancy = snapshot ? workerSpaceOccupancy(h, snapshot.tasks, deadline) : null;
+      reserved = withRegistry(h, () => {
+        // The project may have been removed/replaced while selection was running.
+        if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
+        if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
+        // No Core/Git operations under this lock. New reservations or lifecycle
+        // changes invalidate the preflight; a combined switch needs no occupancy.
+        if (independent && h.config.workerSpaceMode === 'per-project'
+            && (!snapshot || workerSpaceSnapshot(h).footprint !== snapshot.footprint)) return false;
+        record.workerSpace = admittedWorkerSpace(h, record, repairPlacement, occupancy);
+        fs.mkdirSync(dir, { recursive: true });
+        saveTask(h, record); // reservation freezes placement before external work
+        return true;
+      });
+    }
+    if (reserved) break;
+    if (Date.now() >= deadline || (snapshot?.pending && Date.now() >= pendingDeadline)) {
+      refuse('worker-space-busy: occupancy changed or a worker is still being published; retry. Nothing was launched.', 4);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
   fs.mkdirSync(h.worktrees, { recursive: true });
   // Slow tools run outside the transaction; this preparing task now protects the path.
   const gated = opts.kind === 'ship' && !extra.selfFix && toolPath('no-mistakes') && run('git', ['-C', project.path, 'remote', 'get-url', 'no-mistakes']).code === 0;

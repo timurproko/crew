@@ -23,7 +23,17 @@ No restart is needed. The change affects **new independent tasks**, not existing
 The ordering point is the registry-locked **task reservation**, before worktree allocation
 and Core launch. A setting change before reservation affects that task; a setting change
 after reservation does not, even if its terminal starts physically after the setting
-command returns. Slow external operations do not hold the registry lock. Switching never
+command returns. Independent per-project admission fingerprints the registry and task placement/
+terminal references before bounded read-only Core inspection, then rechecks that footprint under
+the registry lock. A concurrent reservation, completion or replacement refreshes the observation;
+no stale preflight can reserve a different identity. Unpublished preparing workers and active
+lifecycle writers constrain selection but never count as positive occupancy. Contenders wait
+outside the lock, then retry or refuse with worker-space-busy before creating their own task/copy.
+Core reads share a ten-second admission budget with at most two seconds per probe; unpublished
+launches have a two-second grace before safe retry refusal. Failed reservations do not establish
+occupancy. Legacy/direct-file writers cannot participate in this protocol.
+
+Slow external operations do not hold the registry lock. Switching never
 moves, relabels or reorders already-spawned workers or creates/removes any space.
 
 ## Desktop/local setter contract, version 1
@@ -297,6 +307,13 @@ and lack of space/document mutations; they are **not** native rendering, connect
 or actual native zero-tab deletion evidence. Those require compatible companion support
 and separately authorized native validation; this task does not touch the running app,
 coordinator or their spaces/tasks.
+
+`--gaps=join-project-space` covers exclusive legacy/v1 combined joins, occupied canonical
+preference, mixed/finished/empty/shell occupancy, dotted projects, verified repair alias joins,
+foreign/remote/other-home exclusions and conservative malformed/unavailable evidence. Its
+fixture-only barriers cover same/different-project contenders, first launches, failed launches,
+post-Core stale preflights, terminal publication and both sides of a mode-switch reservation.
+An external-process guard asserts that no Core/Git/copy call runs under projects.lock.
 
 The additional focused groups `--gaps=worker-space-local-setter` and
 `--gaps=worker-space-local-ordering` cover the desktop command, exact capability/results,

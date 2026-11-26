@@ -1054,9 +1054,90 @@ function joinProjectSpaceRefusalTests() {
     fs.writeFileSync(world, JSON.stringify(clean));
   }
 }
-gapTests['join-project-space'] = () => {
+function joinOutsideRegistryScript(f, gate) {
+  const script = path.join(f.dir, `outside-${path.basename(gate.script)}`);
+  fs.writeFileSync(script, `import cp from 'node:child_process'; import { syncBuiltinESMExports } from 'node:module';
+import checkFs from 'node:fs';
+const originalSpawn = cp.spawnSync;
+cp.spawnSync = (...args) => { if (checkFs.existsSync(${JSON.stringify(path.join(f.home, 'projects.lock'))})) throw Error('External process under registry lock'); return originalSpawn(...args); };
+syncBuiltinESMExports();\n` + fs.readFileSync(gate.script, 'utf8'));
+  return script;
+}
+function joinPublicationBarrier(f) {
+  const ready = path.join(f.dir, 'publication-ready'), release = path.join(f.dir, 'publication-release'), script = path.join(f.dir, 'publication.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const originalRead = fs.readFileSync; let paused = false;
+fs.readFileSync = (file, ...args) => {
+  const result = originalRead(file, ...args);
+  if (!paused && String(file) === ${JSON.stringify(path.join(f.home, 'tasks', 'race', 'task.json'))}) {
+    const w = JSON.parse(originalRead(${JSON.stringify(world)}, 'utf8'));
+    if (Object.values(w.terminals).some(t => t.labels?.['crew.task'] === 'race')) {
+      paused = true; fs.writeFileSync(${JSON.stringify(ready)}, 'ready'); const deadline = Date.now() + 15000;
+      while (!fs.existsSync(${JSON.stringify(release)})) { if (Date.now() > deadline) throw Error('Publication timeout'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+    }
+  }
+  return result;
+}; main(process.argv.slice(2));`);
+  return { ready, release, script };
+}
+async function joinProjectSpaceRaceTests() {
+  for (const scenario of ['combined', 'empty', 'different', 'publication', 'failure']) {
+    const f = joinSpaceFixture(`join-race-${scenario}`); f.add('other');
+    const old = ['combined', 'different', 'publication'].includes(scenario) ? f.spawn('old') : null;
+    f.mode('per-project');
+    const gate = scenario === 'publication' ? joinPublicationBarrier(f) : projectBarrier(f, 'after');
+    const pending = projectProcess(f, ['spawn', 'race', '--project', 'demo', '--agent', 'pi', 'Count.'], {
+      script: joinOutsideRegistryScript(f, gate), terminal: `owner-spaces-join-race-${scenario}`, env: f.env,
+    });
+    try {
+      await until(() => fs.existsSync(gate.ready));
+      const reserved = f.task('race'); assert.equal(reserved.state, 'preparing'); assert.equal(reserved.terminal, null);
+      assert.ok(!fs.existsSync(path.join(f.home, 'projects.lock')));
+      assert.equal(f.call(['project', 'add', 'while-launching', f.repo]).code, 0, 'Slow launch does not block registry edits');
+      const nextProject = scenario === 'different' ? 'other' : 'demo';
+      let r = f.call(['spawn', 'contender', '--project', nextProject, '--agent', 'pi', 'Count.']);
+      assert.equal(r.code, 4, r.out); assert.match(r.out, /worker-space-busy/);
+      assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'contender')));
+      if (scenario === 'failure') fs.renameSync(f.repo, `${f.repo}-away`);
+      fs.writeFileSync(gate.release, 'go'); r = await pending.result;
+      if (scenario === 'failure') {
+        assert.notEqual(r.code, 0, r.out); assert.equal(f.task('race').state, 'failed'); fs.renameSync(`${f.repo}-away`, f.repo);
+      } else assert.equal(r.code, 0, r.out);
+      const next = f.spawn('contender', nextProject);
+      if (scenario === 'different') assert.notEqual(next.workerSpace.id, old.workerSpace.id);
+      else assert.equal(next.workerSpace.id, reserved.workerSpace.id, `${scenario} converges on one identity`);
+      if (old) assert.equal(f.task('race').workerSpace.id, old.workerSpace.id);
+    } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+  }
+  // A preflight taken before another reservation must be refreshed, not frozen.
+  const f = joinSpaceFixture('join-stale'); f.add('other'); const old = f.spawn('old'); f.mode('per-project');
+  const gate = projectBarrier(f, 'before');
+  const pending = projectProcess(f, ['spawn', 'stale', '--project', 'demo', '--agent', 'pi', 'Count.'], {
+    script: joinOutsideRegistryScript(f, gate), terminal: 'owner-spaces-join-stale', env: f.env,
+  });
+  try {
+    await until(() => fs.existsSync(gate.ready));
+    f.mode('combined'); f.spawn('new-q', 'other'); f.mode('per-project');
+    fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
+    assert.notEqual(f.task('stale').workerSpace.id, old.workerSpace.id, 'Stale exclusive observation cannot survive a new Q reservation');
+  } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+  // Current mode is chosen at reservation, including a switch after Core inspection.
+  for (const phase of ['before', 'after']) {
+    const g = joinSpaceFixture(`join-switch-${phase}`); g.mode('per-project');
+    const barrier = projectBarrier(g, phase);
+    const writer = projectProcess(g, ['spawn', 'race', '--project', 'demo', '--agent', 'pi', 'Count.'], {
+      script: joinOutsideRegistryScript(g, barrier), terminal: `owner-spaces-join-switch-${phase}`, env: g.env,
+    });
+    try {
+      await until(() => fs.existsSync(barrier.ready)); g.mode('combined');
+      fs.writeFileSync(barrier.release, 'go'); const r = await writer.result; assert.equal(r.code, 0, r.out);
+      assert.equal(g.task('race').workerSpace.mode, phase === 'before' ? 'combined' : 'per-project');
+    } finally { fs.writeFileSync(barrier.release, 'go'); await writer.result; }
+  }
+}
+gapTests['join-project-space'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
-  try { joinProjectSpaceTests(); joinProjectSpaceRefusalTests(); joinProjectSpaceRepairTest(); }
+  try { joinProjectSpaceTests(); joinProjectSpaceRefusalTests(); joinProjectSpaceRepairTest(); await joinProjectSpaceRaceTests(); }
   finally { fs.writeFileSync(world, before); }
 };
 gapTests['worker-spaces'] = async () => {

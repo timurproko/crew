@@ -8,8 +8,8 @@
 
 ## 2. Concurrent admissions preserve one ordered placement decision
 
-- [ ] 2.1 Revalidate the admission footprint under registry serialization and handle relevant unpublished preparing reservations through bounded retry/refusal outside the lock; deterministic same-project, different-project, first-launch and failed-launch cases assert no split from stale snapshots.
-- [ ] 2.2 Cover before/after-reservation setting switches and before-publication launch barriers without production test hooks, asserting that Core/copy calls never retain projects.lock; run the focused ordering cases and document concurrency/refusal behavior alongside them.
+- [x] 2.1 Revalidate the admission footprint under registry serialization and handle relevant unpublished preparing reservations through bounded retry/refusal outside the lock; deterministic same-project, different-project, first-launch and failed-launch cases assert no split from stale snapshots.
+- [x] 2.2 Cover before/after-reservation setting switches and before-publication launch barriers without production test hooks, asserting that Core/copy calls never retain projects.lock; run the focused ordering cases and document concurrency/refusal behavior alongside them.
 
 ## 3. Inherited workers and mode rollback retain their task spaces
 
