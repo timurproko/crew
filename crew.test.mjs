@@ -3912,7 +3912,12 @@ console.log('https://example.invalid/acme/demo/pull/7');
   const review = taskOf('s1-review');
   assert.ok(readWorld().log.filter(a => a[0] === 'run').at(-1).includes('crew.kind=review'), 'A reviewer is labelled as one');
   assert.deepEqual([review.kind, review.reviews, review.project], ['scout', 's1', 'demo']);
-  assert.ok(fs.readFileSync(review.brief, 'utf8').includes(`git diff HEAD...${review.reviewHead}`) && fs.readFileSync(review.brief, 'utf8').includes('`APPROVE` or `CHANGES NEEDED`'));
+  const reviewerInstructions = fs.readFileSync(review.brief, 'utf8');
+  assert.ok(reviewerInstructions.includes(`git diff HEAD...${review.reviewHead}`));
+  assert.match(reviewerInstructions, /Start your report with exactly `CHANGES NEEDED` only if at least one finding is BLOCKING; otherwise start with `APPROVE`/);
+  assert.match(reviewerInstructions, /short `## What I checked` section, even on APPROVE/);
+  assert.match(reviewerInstructions, /Mark EVERY finding `BLOCKING`.*or `FOLLOW-UP`/);
+  assert.match(reviewerInstructions, /FOLLOW-UP findings.*do not hold the merge/);
   assert.match(own(['review', 's1', '--agent', 'claude']).out, /spawned s1-review-2: claude scout/);
   // land: refused with unsaved work, without a place to push to, and honest when GitHub says no.
   fs.writeFileSync(path.join(s1copy, 'loose.txt'), 'x');
@@ -4099,7 +4104,10 @@ if (a[0] === 'start') {
   // The shared delivery workflow: a repository that carries its instructions is delivered its
   // own way. The worker plans in a draft pull request; crew never pushes or opens one for it.
   assert.equal(p1.workflow, undefined, 'A copy without the shared instructions is a plain one');
-  assert.ok(fs.readFileSync(p1.brief, 'utf8').includes('Do not push or open a pull request unless'));
+  const plainInstructions = fs.readFileSync(p1.brief, 'utf8');
+  assert.match(plainInstructions, /commit and push them/);
+  assert.match(plainInstructions, /Do not open or merge a pull request yourself; crew land handles its publication/);
+  assert.match(plainInstructions, /report at once; do not wait for CI or the delivery bot/);
   commit(project, { 'AGENTS.md': TEMPLATE }, 'Use the shared workflow');
   r = dl(['spawn', 'w1', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'Add a feature.']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /follows the repository's delivery workflow/);
@@ -4165,7 +4173,10 @@ if (a[0] === 'start') {
   r = dl(['project', 'add', 'pooled', project, '--workflow', 'plain']); assert.equal(r.code, 0, r.out); assert.match(r.out, /\(workflow: plain\)/);
   assert.match(dl(['project', 'list']).out, /^pooled\t[^\t\r\n]*\tworkflow plain\r?$/m);
   assert.equal(dl(['spawn', 'w5', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
-  assert.equal(taskOf('w5').workflow, undefined); assert.ok(fs.readFileSync(taskOf('w5').brief, 'utf8').includes('Do not push or open a pull request unless'));
+  assert.equal(taskOf('w5').workflow, undefined);
+  const explicitPlainInstructions = fs.readFileSync(taskOf('w5').brief, 'utf8');
+  assert.match(explicitPlainInstructions, /commit and push them/);
+  assert.match(explicitPlainInstructions, /Do not open or merge a pull request yourself; crew land handles its publication/);
   git('-C', project, 'rm', '-q', 'AGENTS.md'); git('-C', project, ...who, 'commit', '-q', '-m', 'Back to plain');
   dl(['project', 'add', 'pooled', project, '--workflow', 'delivery']);
   assert.equal(dl(['spawn', 'w6', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
@@ -4208,7 +4219,8 @@ if (a[0] === 'start') {
   r = tl(['project', 'add', 'demo', project, '--gate-skip', 'none']); assert.ok(r.out.includes('(gate skips: nothing)'));
   assert.equal(tl(['spawn', 'g4', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   const g4brief = fs.readFileSync(taskOf('g4').brief, 'utf8');
-  assert.ok(!g4brief.includes('--skip') && g4brief.includes('no-mistakes axi handoff') && g4brief.includes('ten minutes'), 'A watched gate is told how its watch ends');
+  assert.ok(!g4brief.includes('--skip'), 'An explicitly watched gate retains its selected steps');
+  assert.match(g4brief, /end any CI watch with `no-mistakes axi handoff` and report at once; do not wait for checks/);
   assert.equal(tl(['finish', 'g4', '--force']).code, 0);
   // The gate wins over the shared delivery workflow: a gated project keeps the gate's flow.
   r = tl(['project', 'add', 'demo', project, '--gate-skip', 'none', '--workflow', 'delivery']); assert.equal(r.code, 0, r.out);
