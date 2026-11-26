@@ -1050,7 +1050,8 @@ gapTests['owned-terminals'] = () => {
 
 gapTests['owned-review'] = () => {
   const f = leftoversFixture('review'), t = f.spawn('author'), bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
-  let r = f.call(['review', t.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+  // This terminal-ownership fixture has no check-run service; readiness has its own fixtures.
+  let r = f.call(['review', t.id, '--agent', 'pi', '--force']); assert.equal(r.code, 0, r.out);
   const review = f.task('author-review'), old = structuredClone(readWorld().terminals[review.terminal]);
   assert.deepEqual(review.terminals.map(t => t.address), [review.terminal]);
   r = f.call(['relaunch', review.id, '--agent', 'pi', '--model', 'next-reviewer'], { CREW_AGENT_PATH: bin }); assert.equal(r.code, 0, r.out);
@@ -3170,7 +3171,7 @@ gapTests['review-label-failures'] = () => {
 
 try {
   const onlyGaps = process.argv.find(a => a === '--gaps' || a.startsWith('--gaps='));
-  for (const [name, test] of Object.entries(gapTests)) if (!onlyGaps || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { await test(); console.log(`PASS: gap ${name}`); }
+  for (const [name, test] of Object.entries(gapTests)) if ((!onlyGaps && !process.argv.includes('--main')) || onlyGaps === '--gaps' || onlyGaps === `--gaps=${name}`) { await test(); console.log(`PASS: gap ${name}`); }
   if (!onlyGaps) {
   // The focused fixtures have their own homes and copies, but share the fake Core transport.
   fs.writeFileSync(world, JSON.stringify({ seq: 0, terminals: {}, log: [] }));
