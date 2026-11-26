@@ -19,7 +19,7 @@ The maintainer integration decision accepts these scenarios:
   "archive": "openspec/changes/archive/2026-11-26-worker-space-local-setter/",
   "acceptanceManifest": "openspec/changes/archive/2026-11-26-worker-space-local-setter/acceptance.md",
   "finalizedDate": "2026-11-26",
-  "specBaseSha": "aafdad1c7eaba51454d9e30456febc180435fae0",
+  "specBaseSha": "40ab92752bbbba42251adf92a4ab5ba74d52a95f",
   "acceptanceScenarios": [
     "Same-user local callers can set only worker-space mode in an explicit existing initialized home, without ownership or Core queries.",
     "Registry transactions preserve projects and unknown metadata, and reserved spawns retain placement while later admissions see the new mode.",
@@ -28,8 +28,8 @@ The maintainer integration decision accepts these scenarios:
     "Fleet root markers, existing fields, discovery and retention remain unchanged, with no extra Core or network lookup for project identity.",
     "Desktop setter and fleet project contracts are documented and published to their Herdr companion pull requests without claiming deployment."
   ],
-  "archiveDigest": "abed9ad819c77f799e9c8c3c17a4f041a537ff0ff9716a5b3c53a48a7f49a959",
-  "specDigest": "777e5fc9ad1ae2f907012ce0275583f073644c7627560bdc8efe67988b369177",
+  "archiveDigest": "80feb7a0fa752f0309e196d65caa8b83ad877b6c46fa0d7d36040ec2fb8b21c2",
+  "specDigest": "ffc779be461e4d8bd892c3780e5a980de54b247aed72e37d8c7d808b07ea567b",
   "tasksDigest": "145dab81164bfec8b4cf831da298454476ba3e951f7ebbe14e861b477ce83427",
   "evidenceDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "knownGaps": []

@@ -860,6 +860,102 @@ For a reported plain ship with an existing open exact PR, crew land SHALL publis
 - **WHEN** local work is dirty, the remote branch diverged or advanced incompatibly, or PR identity/state is unproven
 - **THEN** land refuses safely without a forced update or replacement PR
 
+### Requirement: Task terminals advertise their pull request
+
+Crew SHALL publish a known full PR URL as `crew.pr` on a reviewer terminal at launch and on ship/fix terminals at launch or when report, land or verified status discovery learns the URL. Later knowledge SHALL update the recorded current terminal, not require a replacement launch. Discovered URLs SHALL NOT become authoritative task.pr merely to label a terminal.
+
+#### Scenario: Reviewer starts for a known PR
+
+- **WHEN** crew launches a reviewer for a task with a known implementation PR
+- **THEN** the reviewer terminal has crew.kind=review and crew.pr equal to that PR's full URL, independent of its checkout branch
+
+#### Scenario: Ship or fixer starts with a known PR
+
+- **WHEN** crew launches a ship/fix worker or its replacement with a known task PR
+- **THEN** that terminal receives the full URL as crew.pr
+
+#### Scenario: Report first identifies a PR
+
+- **WHEN** a worker's accepted report supplies its task PR
+- **THEN** crew updates crew.pr on that task's existing terminal without relaunching it
+
+#### Scenario: Land first identifies a PR
+
+- **WHEN** land records or opens the task's PR
+- **THEN** crew updates crew.pr on the ship/fix terminal
+
+#### Scenario: Discovery first identifies a PR
+
+- **WHEN** explicit status discovery saves an exact verified PR observation for a task with a recorded terminal
+- **THEN** crew best-effort publishes its URL there while leaving authoritative task.pr, stage and delivery state unchanged
+
+### Requirement: Ship review context survives terminal loss
+
+Crew SHALL persist reviewRound and lastFinding for ship work and publish them as crew.round and crew.finding on its current terminal. Round SHALL start at 1 and increase once per distinct review reporting CHANGES NEEDED. lastFinding SHALL contain the first line of the latest BLOCKING finding, sanitized to one line without control characters and at most 200 Unicode code points. APPROVE SHALL clear lastFinding and crew.finding without resetting the round.
+
+#### Scenario: First ship round
+
+- **WHEN** ship work starts before any changes-requesting review
+- **THEN** its round is 1 and no blocking finding is advertised
+
+#### Scenario: Changes are requested
+
+- **WHEN** a reviewer reports CHANGES NEEDED with classified findings
+- **THEN** the ship round increases by one and its finding becomes the first BLOCKING finding's first line, not a preceding FOLLOW-UP or heading
+
+#### Scenario: Verdict bookkeeping repeats
+
+- **WHEN** the same review verdict is processed twice, including local and PR-head bookkeeping in one command
+- **THEN** the round increases only once for that reviewer
+
+#### Scenario: Finding text is unsafe or long
+
+- **WHEN** a BLOCKING finding contains control characters or exceeds the length limit
+- **THEN** stored and published text contains no control characters and is truncated safely without splitting a Unicode code point
+
+#### Scenario: Approval clears the finding
+
+- **WHEN** the latest valid review verdict is APPROVE
+- **THEN** lastFinding becomes null and the ship terminal's crew.finding is removed or emptied, while the current round remains unchanged
+
+#### Scenario: No blocking line is available
+
+- **WHEN** a legacy CHANGES NEEDED report has no identifiable BLOCKING finding
+- **THEN** the round advances once and lastFinding is null rather than fabricated from unrelated prose
+
+### Requirement: Ordinary JSON status exposes review context
+
+Ordinary status --json SHALL add reviewRound and lastFinding per task using saved task metadata, even without a live terminal. Ship/fix tasks without saved review context SHALL default to 1 and null. Reviewer and other scout tasks SHALL return null for these fields. Status SHALL NOT read reports to derive them. The minimal fleet v1 shape SHALL remain unchanged.
+
+#### Scenario: Worker terminal has ended
+
+- **WHEN** ordinary JSON status includes a ship whose terminal ended after a changes-requesting review
+- **THEN** reviewRound and lastFinding retain the saved context without depending on terminal labels
+
+#### Scenario: Legacy task or unrelated scout
+
+- **WHEN** ordinary JSON status includes tasks lacking saved review context
+- **THEN** ships/fixers expose reviewRound=1 and lastFinding=null, and scouts/reviewers expose both fields as null
+
+#### Scenario: Fleet consumer keeps its contract
+
+- **WHEN** status --json --view fleet is requested
+- **THEN** no reviewRound or lastFinding fields are added to fleet v1 rows
+
+### Requirement: Terminal metadata is best effort
+
+Crew SHALL bound terminal-metadata writes and never fail an otherwise successful command because labeling fails. Failures SHALL emit one single-line warning per affected hook on stderr, preserve saved task/report/verdict outcomes and leave JSON stdout valid. Metadata hooks SHALL NOT add GitHub requests, retries, background sweeps or mutations of unrelated terminals or labels.
+
+#### Scenario: Terminal has ended or Core is unavailable
+
+- **WHEN** a metadata hook cannot label its task's recorded terminal
+- **THEN** the command continues with its normal exit result and saved facts, with one warning line and no retry
+
+#### Scenario: GitHub advisory labels are disabled
+
+- **WHEN** repository advisory-label writes are opted out or fail
+- **THEN** local terminal metadata and persisted review context still update independently
+
 ### Requirement: Local worker-space support is explicitly discoverable
 
 Crew SHALL support the read-only, home-independent `crew config worker-space --capabilities --json` probe. Exit 0 SHALL return one JSON object with capability `worker-space-local-set`, version 1, modes combined and per-project, and explicitHome true. Help SHALL advertise `worker-space-local-set v1`. Clients SHALL require the successful versioned probe, not infer support from a release number.
@@ -1027,99 +1123,3 @@ Fleet tasks SHALL include project as the exact nonempty recorded string from ful
 
 - **WHEN** fleet reads a cold, warm, changed or rebuilt summary index
 - **THEN** every visible task project agrees with current authoritative task state without extra per-worker Core or network calls
-
-### Requirement: Task terminals advertise their pull request
-
-Crew SHALL publish a known full PR URL as `crew.pr` on a reviewer terminal at launch and on ship/fix terminals at launch or when report, land or verified status discovery learns the URL. Later knowledge SHALL update the recorded current terminal, not require a replacement launch. Discovered URLs SHALL NOT become authoritative task.pr merely to label a terminal.
-
-#### Scenario: Reviewer starts for a known PR
-
-- **WHEN** crew launches a reviewer for a task with a known implementation PR
-- **THEN** the reviewer terminal has crew.kind=review and crew.pr equal to that PR's full URL, independent of its checkout branch
-
-#### Scenario: Ship or fixer starts with a known PR
-
-- **WHEN** crew launches a ship/fix worker or its replacement with a known task PR
-- **THEN** that terminal receives the full URL as crew.pr
-
-#### Scenario: Report first identifies a PR
-
-- **WHEN** a worker's accepted report supplies its task PR
-- **THEN** crew updates crew.pr on that task's existing terminal without relaunching it
-
-#### Scenario: Land first identifies a PR
-
-- **WHEN** land records or opens the task's PR
-- **THEN** crew updates crew.pr on the ship/fix terminal
-
-#### Scenario: Discovery first identifies a PR
-
-- **WHEN** explicit status discovery saves an exact verified PR observation for a task with a recorded terminal
-- **THEN** crew best-effort publishes its URL there while leaving authoritative task.pr, stage and delivery state unchanged
-
-### Requirement: Ship review context survives terminal loss
-
-Crew SHALL persist reviewRound and lastFinding for ship work and publish them as crew.round and crew.finding on its current terminal. Round SHALL start at 1 and increase once per distinct review reporting CHANGES NEEDED. lastFinding SHALL contain the first line of the latest BLOCKING finding, sanitized to one line without control characters and at most 200 Unicode code points. APPROVE SHALL clear lastFinding and crew.finding without resetting the round.
-
-#### Scenario: First ship round
-
-- **WHEN** ship work starts before any changes-requesting review
-- **THEN** its round is 1 and no blocking finding is advertised
-
-#### Scenario: Changes are requested
-
-- **WHEN** a reviewer reports CHANGES NEEDED with classified findings
-- **THEN** the ship round increases by one and its finding becomes the first BLOCKING finding's first line, not a preceding FOLLOW-UP or heading
-
-#### Scenario: Verdict bookkeeping repeats
-
-- **WHEN** the same review verdict is processed twice, including local and PR-head bookkeeping in one command
-- **THEN** the round increases only once for that reviewer
-
-#### Scenario: Finding text is unsafe or long
-
-- **WHEN** a BLOCKING finding contains control characters or exceeds the length limit
-- **THEN** stored and published text contains no control characters and is truncated safely without splitting a Unicode code point
-
-#### Scenario: Approval clears the finding
-
-- **WHEN** the latest valid review verdict is APPROVE
-- **THEN** lastFinding becomes null and the ship terminal's crew.finding is removed or emptied, while the current round remains unchanged
-
-#### Scenario: No blocking line is available
-
-- **WHEN** a legacy CHANGES NEEDED report has no identifiable BLOCKING finding
-- **THEN** the round advances once and lastFinding is null rather than fabricated from unrelated prose
-
-### Requirement: Ordinary JSON status exposes review context
-
-Ordinary status --json SHALL add reviewRound and lastFinding per task using saved task metadata, even without a live terminal. Ship/fix tasks without saved review context SHALL default to 1 and null. Reviewer and other scout tasks SHALL return null for these fields. Status SHALL NOT read reports to derive them. The minimal fleet v1 shape SHALL remain unchanged.
-
-#### Scenario: Worker terminal has ended
-
-- **WHEN** ordinary JSON status includes a ship whose terminal ended after a changes-requesting review
-- **THEN** reviewRound and lastFinding retain the saved context without depending on terminal labels
-
-#### Scenario: Legacy task or unrelated scout
-
-- **WHEN** ordinary JSON status includes tasks lacking saved review context
-- **THEN** ships/fixers expose reviewRound=1 and lastFinding=null, and scouts/reviewers expose both fields as null
-
-#### Scenario: Fleet consumer keeps its contract
-
-- **WHEN** status --json --view fleet is requested
-- **THEN** no reviewRound or lastFinding fields are added to fleet v1 rows
-
-### Requirement: Terminal metadata is best effort
-
-Crew SHALL bound terminal-metadata writes and never fail an otherwise successful command because labeling fails. Failures SHALL emit one single-line warning per affected hook on stderr, preserve saved task/report/verdict outcomes and leave JSON stdout valid. Metadata hooks SHALL NOT add GitHub requests, retries, background sweeps or mutations of unrelated terminals or labels.
-
-#### Scenario: Terminal has ended or Core is unavailable
-
-- **WHEN** a metadata hook cannot label its task's recorded terminal
-- **THEN** the command continues with its normal exit result and saved facts, with one warning line and no retry
-
-#### Scenario: GitHub advisory labels are disabled
-
-- **WHEN** repository advisory-label writes are opted out or fail
-- **THEN** local terminal metadata and persisted review context still update independently
