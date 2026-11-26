@@ -1720,8 +1720,7 @@ function cmdDone(args) {
     return task;
   }, { waitMs: 30000 }); // a new worker can finish before Core acknowledges its start
   const reported = loadTask(h, id);
-  const first = fs.readFileSync(reported.report, 'utf8').split(/\r?\n/)[0];
-  publishTaskTerminal(reported, PR_LINK.exec(first)?.[0]);
+  publishTaskTerminal(reported, reviewPrUrl(reported));
   if (task.reviews) {
     recordReviewContext(h, reported);
     reviewLabels(h, id, 'verdict');
@@ -2574,8 +2573,10 @@ function staleApproval(id) {
 const reviewSha = value => typeof value === 'string' && /^[a-f0-9]{40,64}$/.test(value);
 const approvedHeadOf = task => task.approvedHead ?? (task.reviewVerdict?.verdict === 'APPROVE' ? task.reviewVerdict.head : null);
 function reviewPrUrl(task) {
-  const first = fs.existsSync(task.report ?? '') ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
-  return PR_LINK.exec(first)?.[0] ?? task.pr ?? task.prFacts?.url ?? task.reviewVerdict?.pr;
+  const text = fs.existsSync(task.report ?? '') ? fs.readFileSync(task.report, 'utf8') : '';
+  // Gate reports can put their URL after a summary; workflow reports reserve line one.
+  const report = task.gate ? text : text.trim().split(/\r?\n/)[0];
+  return PR_LINK.exec(report)?.[0] ?? task.pr ?? task.prFacts?.url ?? task.reviewVerdict?.pr;
 }
 function reviewApi(url) {
   const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(url ?? '');
@@ -2659,7 +2660,10 @@ function taskReviewContext(task) {
 function blockingFinding(report) {
   const line = report.split(/[\r\n\u2028\u2029]/).find(line => {
     const text = line.replace(/^\s*(?:[-*+]|\d+[.)]|#{1,6})\s*/, '').replace(/[*_`]/g, '').trim();
-    return /^BLOCKING\b/i.test(text) && !/^BLOCKING(?:\s+findings?)?\s*[:—-]?\s*$/i.test(text);
+    const classification = /\b(BLOCKING|FOLLOW-UP)\b/i.exec(text);
+    const prefix = classification ? text.slice(0, classification.index).trim() : null;
+    return classification?.[1].toUpperCase() === 'BLOCKING' && (prefix === '' || prefix.endsWith(':'))
+      && !/^BLOCKING(?:\s+findings?)?\s*[:—-]?\s*$/i.test(text);
   });
   return line ? Array.from(line.replace(/\s+/g, ' ').replace(/[\p{Cc}\p{Cf}]/gu, '').trim()).slice(0, 200).join('') || null : null;
 }

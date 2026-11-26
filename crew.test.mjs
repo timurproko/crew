@@ -2874,6 +2874,22 @@ gapTests['terminal-pr-hooks'] = () => {
   assert.equal(r.out.split(/\r?\n/).filter(l => l.startsWith('crew: terminal metadata:')).length, 1);
   const reset = readWorld(); delete reset.labelError; fs.writeFileSync(world, JSON.stringify(reset));
 };
+gapTests['terminal-report-conventions'] = () => {
+  const f = reviewLabelsFixture('report-conventions'), url = 'https://github.com/acme/demo/pull/42';
+  const gate = f.parent('gate', { gate: 'no-mistakes' }, 'Delivered.');
+  const asked = f.calls().length;
+  let r = f.done(gate, `Delivered.\nPR: ${url}`); assert.equal(r.code, 0, r.out);
+  assert.equal(readWorld().terminals[gate.terminal].labels['crew.pr'], url, 'Gate done publishes the report URL even when it follows the summary');
+  assert.equal(f.calls().length, asked, 'Report publication needs no GitHub lookup');
+  const workflow = f.parent('workflow', { workflow: 'delivery' }, 'Implemented.');
+  r = f.done(workflow, `Implemented.\nUnrelated PR: ${url}`); assert.equal(r.code, 0, r.out);
+  assert.equal(readWorld().terminals[workflow.terminal].labels['crew.pr'], undefined, 'Workflow reports still resolve their PR only from the first line');
+  const ship = f.parent(), reviewer = f.start().task;
+  const finding = '- change.js:42: **BLOCKING** - loses the saved task on retry.';
+  r = f.done(reviewer, `CHANGES NEEDED\n\n- note.js:12: FOLLOW-UP - clarify the word BLOCKING.\n## BLOCKING\n${finding}`); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(ship.id).reviewRound, 2); assert.equal(f.task(ship.id).lastFinding, finding);
+  assert.equal(readWorld().terminals[ship.terminal].labels['crew.finding'], finding, 'Location-first classifications retain their preview');
+};
 gapTests['terminal-review-context'] = () => {
   const f = reviewLabelsFixture('terminal-context'), ship = f.parent();
   const labels = () => readWorld().terminals[f.task(ship.id).terminal].labels;
