@@ -4,10 +4,11 @@ Verdict: accepted only when an authorized human directly merges the containing e
 
 The maintainer integration decision accepts these scenarios:
 - Same-user local callers can set only worker-space mode in an explicit existing initialized home, without ownership or Core queries.
-- Capability and setter responses use documented version-one JSON and stable refusal codes, with no automatic creation or ambient-home fallback.
-- Registry transactions preserve projects and unknown metadata; existing owner, task and session authority remains unchanged.
-- Reserved spawns retain placement, later admissions see the new mode, and plain status exposes it without changing full or fleet JSON.
-- Desktop integration instructions and the final command contract are published for the Herdr companion without claiming global application or deployment.
+- Registry transactions preserve projects and unknown metadata, and reserved spawns retain placement while later admissions see the new mode.
+- Plain status exposes the setting without restart, and preference changes do not rewrite task projects or alter JSON response shapes.
+- Fleet version one adds the exact recorded task project or null, preserves dotted names, and keeps internal repair task identity as crew:self.
+- Fleet root markers, existing fields, discovery and retention remain unchanged, with no extra Core or network lookup for project identity.
+- Desktop setter and fleet project contracts are documented and published to their Herdr companion pull requests without claiming deployment.
 
 ```openspec-delivery
 {
@@ -18,17 +19,18 @@ The maintainer integration decision accepts these scenarios:
   "archive": "openspec/changes/archive/2026-11-26-worker-space-local-setter/",
   "acceptanceManifest": "openspec/changes/archive/2026-11-26-worker-space-local-setter/acceptance.md",
   "finalizedDate": "2026-11-26",
-  "specBaseSha": "73ee0136ca1d76c15efaf31ffa1520c7528efbf0",
+  "specBaseSha": "aafdad1c7eaba51454d9e30456febc180435fae0",
   "acceptanceScenarios": [
     "Same-user local callers can set only worker-space mode in an explicit existing initialized home, without ownership or Core queries.",
-    "Capability and setter responses use documented version-one JSON and stable refusal codes, with no automatic creation or ambient-home fallback.",
-    "Registry transactions preserve projects and unknown metadata; existing owner, task and session authority remains unchanged.",
-    "Reserved spawns retain placement, later admissions see the new mode, and plain status exposes it without changing full or fleet JSON.",
-    "Desktop integration instructions and the final command contract are published for the Herdr companion without claiming global application or deployment."
+    "Registry transactions preserve projects and unknown metadata, and reserved spawns retain placement while later admissions see the new mode.",
+    "Plain status exposes the setting without restart, and preference changes do not rewrite task projects or alter JSON response shapes.",
+    "Fleet version one adds the exact recorded task project or null, preserves dotted names, and keeps internal repair task identity as crew:self.",
+    "Fleet root markers, existing fields, discovery and retention remain unchanged, with no extra Core or network lookup for project identity.",
+    "Desktop setter and fleet project contracts are documented and published to their Herdr companion pull requests without claiming deployment."
   ],
-  "archiveDigest": "5e5c5c19fe66e3bf359e0c60919a025141f454d29b6dd4a97f22be67d9a48338",
-  "specDigest": "300892bd4ab2f6e5a724d4114b4bbb14b071532ae662cd03a4469f76de1e832a",
-  "tasksDigest": "c4bef4dd21dfb91c882de9dc78c14fff92fedc440d29e642a6a695e7a1137cb3",
+  "archiveDigest": "abed9ad819c77f799e9c8c3c17a4f041a537ff0ff9716a5b3c53a48a7f49a959",
+  "specDigest": "777e5fc9ad1ae2f907012ce0275583f073644c7627560bdc8efe67988b369177",
+  "tasksDigest": "145dab81164bfec8b4cf831da298454476ba3e951f7ebbe14e861b477ce83427",
   "evidenceDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "knownGaps": []
 }

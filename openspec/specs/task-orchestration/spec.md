@@ -374,7 +374,7 @@ Each eligible hook SHALL read `labels/base.json` once through signed-in GitHub A
 
 ### Requirement: Fleet status has a minimal versioned shape
 
-Crew SHALL offer `status --json --view fleet` with exactly home, owner, tasks, prDiscovery and view at the root. The view SHALL be `{name: "fleet", version: 1}` and root prDiscovery SHALL be `{version: 1}`. Non-null owner SHALL contain only terminal and live. Every task SHALL contain only id, state, terminal, pr and prDiscovery; pr SHALL remain the recorded value or null. Discovery results SHALL retain the four-field version-1 shape.
+Crew SHALL offer `status --json --view fleet` with exactly home, owner, tasks, prDiscovery and view at the root. The view SHALL be `{name: "fleet", version: 1}` and root prDiscovery SHALL be `{version: 1}`. Non-null owner SHALL contain only terminal and live. Every task SHALL contain only id, state, project, terminal, pr and prDiscovery; pr SHALL remain the recorded value or null. Discovery results SHALL retain the four-field version-1 shape.
 
 #### Scenario: Fleet output contains only consumer fields
 
@@ -718,7 +718,7 @@ Crew SHALL remove only terminals it recorded starting, never close an entire spa
 
 ### Requirement: Legacy tasks and orchestration commands remain compatible
 
-Tasks without placement metadata SHALL retain old combined inheritance and remain reportable and finishable without bulk migration. Status, wait, tell, review, relaunch and finish SHALL retain existing contracts except the plain-status mode line. End SHALL release ownership without moving or removing work. Read-only status SHALL NOT reconcile spaces or change legacy or minimal fleet JSON output contracts.
+Tasks without placement metadata SHALL retain old combined inheritance and remain reportable and finishable without bulk migration. Status, wait, tell, review, relaunch and finish SHALL retain existing contracts except the plain-status mode line. End SHALL release ownership without moving or removing work. Read-only status SHALL NOT reconcile spaces or change legacy full JSON. Minimal fleet adds only the separately specified authoritative project field.
 
 #### Scenario: Updated tool loads an old running task
 
@@ -739,6 +739,126 @@ Tasks without placement metadata SHALL retain old combined inheritance and remai
 
 - **WHEN** a non-owner requests legacy JSON or minimal fleet status for a mixed layout
 - **THEN** the existing output contract is preserved and no space or terminal mutation occurs
+
+### Requirement: Approval coverage preserves reviewed work
+
+Crew SHALL retain the last approved head independently of later findings. Approval SHALL cover that head and later verified delivery-App finalization or clean base-merge commits only. Non-covered descendant changes SHALL require a delta review; replacement history SHALL require a full review. Unknown evidence SHALL NOT authorize coverage.
+
+#### Scenario: Delivery finalization follows approval
+
+- **WHEN** both GitHub author and committer identify the trusted delivery App and each later task-lineage commit is a single-parent finalize or refinalize for this change touching only its active or archive folders and affected spec folders
+- **THEN** the earlier approval covers the new head without another review
+
+#### Scenario: Delivery merges the base without edits
+
+- **WHEN** a later task-lineage commit belongs to the trusted delivery App, has two parents with its second parent on the base branch, and its tree equals the conflict-free merge of its parents
+- **THEN** that base merge does not invalidate approval or cause imported base commits to be treated as worker changes
+
+#### Scenario: An unapproved change follows approval
+
+- **WHEN** the approved head is an ancestor but a later task commit is human-authored, has untrusted identity, changes unrelated paths, or is not a permitted finalization or clean merge
+- **THEN** crew retains the approved head, records that a delta review is needed and does not describe the prior APPROVE as CHANGES NEEDED
+
+#### Scenario: Force-push removes the approved head
+
+- **WHEN** the approved head is not an ancestor of the current head
+- **THEN** crew retains historical evidence but requires a full review rather than a delta
+
+#### Scenario: Coverage cannot be established
+
+- **WHEN** commit identity, ancestry, path scope or merge-tree evidence is unavailable or malformed
+- **THEN** crew does not claim approval covers the current head
+
+### Requirement: Review and wait follow report-time handoffs
+
+Crew SHALL permit review once a ship worker reports without reading or waiting for CI checks or implementation outcomes. Review SHALL keep the existing safe fast-forward to the exact PR head and refuse ahead or diverged copies. Crew wait SHALL settle reported tasks immediately without querying CI, sending failed-check follow-ups or introducing a check-failure escalation.
+
+#### Scenario: Review runs alongside CI
+
+- **WHEN** a ship worker reports while its PR checks are pending, failed, cancelled, skipped, absent or unavailable
+- **THEN** crew may start its review without a CI-readiness gate, retaining the safe fixed-head synchronization
+
+#### Scenario: Worker is still working
+
+- **WHEN** review is requested before the worker reports
+- **THEN** crew refuses because the report is not ready, not because of checks
+
+#### Scenario: Reported ship settles immediately
+
+- **WHEN** wait observes a reported ship regardless of PR or CI state
+- **THEN** it returns the report without GitHub check reads, checkout movement, automatic failed-check tells or check-based needs-a-person escalation
+
+### Requirement: Review handoffs use targeted tests and classified findings
+
+Worker briefs SHALL request only useful targeted tests, publication and immediate reporting without waiting for CI or a delivery bot. Reviewer briefs SHALL require the fixed head, targeted tests where useful, an exact first-line verdict and What I checked even on APPROVE. Every finding SHALL be BLOCKING or FOLLOW-UP; CHANGES NEEDED SHALL require at least one BLOCKING finding. Neither brief SHALL require a full local suite.
+
+#### Scenario: Worker hands off work
+
+- **WHEN** crew prepares a ship brief
+- **THEN** it requests targeted commands/results and reporting as soon as the work is pushed, allowing CI and review to proceed in parallel
+
+#### Scenario: Reviewer has only follow-ups
+
+- **WHEN** findings concern wording, edge cases or polish rather than failure of the claimed behavior, data loss or getting stuck
+- **THEN** the brief requires FOLLOW-UP findings under APPROVE and a short What I checked section, with follow-ups queued by the coordinator rather than holding the merge
+
+#### Scenario: Reviewer finds a blocker
+
+- **WHEN** the change does not do what it claims, can lose data or can get stuck
+- **THEN** the brief requires a BLOCKING finding and CHANGES NEEDED, with file/line, impact and reproduction details
+
+#### Scenario: Delta review excludes only proven delivery work
+
+- **WHEN** the current head descends from the last reviewed head or retained approval and a fix needs review
+- **THEN** the brief identifies only that fix range and unapproved commits, links prior blockers for rechecking, excludes only verified permitted delivery commits and requests targeted tests where useful
+
+#### Scenario: First review requested changes
+
+- **WHEN** the first review reports BLOCKING findings and the worker pushes a descendant fix without any earlier APPROVE
+- **THEN** the second review covers only that fix while rechecking prior blockers rather than re-reviewing unchanged work
+
+#### Scenario: Unapproved spec changes remain visible
+
+- **WHEN** a human or unverified commit changes specs after an approval
+- **THEN** that change remains in the delta review rather than being excluded by a blanket spec-path filter
+
+### Requirement: Coordinator instructions use the parallel fix loop
+
+Crew's installed coordinator instructions SHALL start review at the worker report alongside CI, combine CI failures and BLOCKING findings into one fix request, queue FOLLOW-UP findings with crew backlog add and escalate after two failing rounds. Merge readiness SHALL require covered review approval and green required checks. New scope SHALL start a new task. Existing homes SHALL pick up changed instructions at crew start after updating the tool.
+
+#### Scenario: Implementation is reported
+
+- **WHEN** a coordinator follows the installed template after a worker reports pushed implementation
+- **THEN** it starts review without waiting for CI or the delivery bot and combines resulting failures and blockers in one fix round
+
+#### Scenario: Only follow-ups remain
+
+- **WHEN** a review approves with FOLLOW-UP findings and required checks are green
+- **THEN** the coordinator queues follow-ups without holding the merge, and asks the person after two rounds that still fail
+
+#### Scenario: Existing home starts the new tool
+
+- **WHEN** an existing home starts Crew after crew update installs a changed coordinator template
+- **THEN** crew start rewrites its coordinator instructions with the current loop without manual edits
+
+### Requirement: Plain land publishes repairs to its existing PR
+
+For a reported plain ship with an existing open exact PR, crew land SHALL publish new committed work to the same branch using an ordinary push and refresh review coverage. It SHALL NOT create a second PR or force-push. Dirty copies, wrong branch/PR identity, closed PRs and conflicting remote history SHALL NOT authorize publication. Existing verified-merged cleanup SHALL remain guarded.
+
+#### Scenario: Plain worker fixes a landed PR
+
+- **WHEN** a reported plain ship has clean follow-up commits and its existing PR is open on the recorded repository and branch
+- **THEN** land pushes the new commits to that PR and updates review freshness without opening another PR
+
+#### Scenario: Existing PR has no new local commits
+
+- **WHEN** a reported plain ship's existing open PR already contains its head
+- **THEN** repeated land is idempotent and reports the same link
+
+#### Scenario: Publication would overwrite work
+
+- **WHEN** local work is dirty, the remote branch diverged or advanced incompatibly, or PR identity/state is unproven
+- **THEN** land refuses safely without a forced update or replacement PR
 
 ### Requirement: Local worker-space support is explicitly discoverable
 
@@ -879,122 +999,31 @@ Plain crew status SHALL show the current effective worker-space mode after the h
 - **WHEN** a caller requests legacy status JSON or fleet JSON
 - **THEN** no worker-space field or notification metadata is added and the existing serialized contract remains unchanged
 
-### Requirement: Approval coverage preserves reviewed work
+### Requirement: Fleet task project preserves authoritative task identity
 
-Crew SHALL retain the last approved head independently of later findings. Approval SHALL cover that head and later verified delivery-App finalization or clean base-merge commits only. Non-covered descendant changes SHALL require a delta review; replacement history SHALL require a full review. Unknown evidence SHALL NOT authorize coverage.
+Fleet tasks SHALL include project as the exact nonempty recorded string from full status, or null when absent or unusable. Crew SHALL NOT infer project from labels, cwd, titles or current registry membership. Adding project SHALL NOT change other fleet fields, version markers, retention, discovery or authority. Internal repairs SHALL retain crew:self even when verified placement shares the registered crew space.
 
-#### Scenario: Delivery finalization follows approval
+#### Scenario: Registered project spelling is preserved
 
-- **WHEN** both GitHub author and committer identify the trusted delivery App and each later task-lineage commit is a single-parent finalize or refinalize for this change touching only its active or archive folders and affected spec folders
-- **THEN** the earlier approval covers the new head without another review
+- **WHEN** combined or per-project tasks use a dotted registration such as .xrbuild or agentnumberone.dev
+- **THEN** fleet task project equals the exact recorded full-status project with no normalization
 
-#### Scenario: Delivery merges the base without edits
+#### Scenario: Internal repair uses a placement alias
 
-- **WHEN** a later task-lineage commit belongs to the trusted delivery App, has two parents with its second parent on the base branch, and its tree equals the conflict-free merge of its parents
-- **THEN** that base merge does not invalidate approval or cause imported base commits to be treated as worker changes
+- **WHEN** an internal repair with task project crew:self requests either internal crew:self placement or a verified registered crew placement
+- **THEN** its fleet project remains crew:self, equal to full status, without rewriting task or placement identity
 
-#### Scenario: An unapproved change follows approval
+#### Scenario: Historical retained task lost its registration
 
-- **WHEN** the approved head is an ancestor but a later task commit is human-authored, has untrusted identity, changes unrelated paths, or is not a permitted finalization or clean merge
-- **THEN** crew retains the approved head, records that a delta review is needed and does not describe the prior APPROVE as CHANGES NEEDED
+- **WHEN** a closed task remains visible through its PR but its registration or working copy is gone
+- **THEN** its fleet project remains the recorded project without new registry or repository verification
 
-#### Scenario: Force-push removes the approved head
+#### Scenario: Project evidence is missing
 
-- **WHEN** the approved head is not an ancestor of the current head
-- **THEN** crew retains historical evidence but requires a full review rather than a delta
+- **WHEN** a visible task has no nonempty string project
+- **THEN** fleet emits project null rather than omitting the field or inventing evidence from labels
 
-#### Scenario: Coverage cannot be established
+#### Scenario: Indexed reads preserve project updates
 
-- **WHEN** commit identity, ancestry, path scope or merge-tree evidence is unavailable or malformed
-- **THEN** crew does not claim approval covers the current head
-
-### Requirement: Review and wait follow report-time handoffs
-
-Crew SHALL permit review once a ship worker reports without reading or waiting for CI checks or implementation outcomes. Review SHALL keep the existing safe fast-forward to the exact PR head and refuse ahead or diverged copies. Crew wait SHALL settle reported tasks immediately without querying CI, sending failed-check follow-ups or introducing a check-failure escalation.
-
-#### Scenario: Review runs alongside CI
-
-- **WHEN** a ship worker reports while its PR checks are pending, failed, cancelled, skipped, absent or unavailable
-- **THEN** crew may start its review without a CI-readiness gate, retaining the safe fixed-head synchronization
-
-#### Scenario: Worker is still working
-
-- **WHEN** review is requested before the worker reports
-- **THEN** crew refuses because the report is not ready, not because of checks
-
-#### Scenario: Reported ship settles immediately
-
-- **WHEN** wait observes a reported ship regardless of PR or CI state
-- **THEN** it returns the report without GitHub check reads, checkout movement, automatic failed-check tells or check-based needs-a-person escalation
-
-### Requirement: Review handoffs use targeted tests and classified findings
-
-Worker briefs SHALL request only useful targeted tests, publication and immediate reporting without waiting for CI or a delivery bot. Reviewer briefs SHALL require the fixed head, targeted tests where useful, an exact first-line verdict and What I checked even on APPROVE. Every finding SHALL be BLOCKING or FOLLOW-UP; CHANGES NEEDED SHALL require at least one BLOCKING finding. Neither brief SHALL require a full local suite.
-
-#### Scenario: Worker hands off work
-
-- **WHEN** crew prepares a ship brief
-- **THEN** it requests targeted commands/results and reporting as soon as the work is pushed, allowing CI and review to proceed in parallel
-
-#### Scenario: Reviewer has only follow-ups
-
-- **WHEN** findings concern wording, edge cases or polish rather than failure of the claimed behavior, data loss or getting stuck
-- **THEN** the brief requires FOLLOW-UP findings under APPROVE and a short What I checked section, with follow-ups queued by the coordinator rather than holding the merge
-
-#### Scenario: Reviewer finds a blocker
-
-- **WHEN** the change does not do what it claims, can lose data or can get stuck
-- **THEN** the brief requires a BLOCKING finding and CHANGES NEEDED, with file/line, impact and reproduction details
-
-#### Scenario: Delta review excludes only proven delivery work
-
-- **WHEN** the current head descends from the last reviewed head or retained approval and a fix needs review
-- **THEN** the brief identifies only that fix range and unapproved commits, links prior blockers for rechecking, excludes only verified permitted delivery commits and requests targeted tests where useful
-
-#### Scenario: First review requested changes
-
-- **WHEN** the first review reports BLOCKING findings and the worker pushes a descendant fix without any earlier APPROVE
-- **THEN** the second review covers only that fix while rechecking prior blockers rather than re-reviewing unchanged work
-
-#### Scenario: Unapproved spec changes remain visible
-
-- **WHEN** a human or unverified commit changes specs after an approval
-- **THEN** that change remains in the delta review rather than being excluded by a blanket spec-path filter
-
-### Requirement: Coordinator instructions use the parallel fix loop
-
-Crew's installed coordinator instructions SHALL start review at the worker report alongside CI, combine CI failures and BLOCKING findings into one fix request, queue FOLLOW-UP findings with crew backlog add and escalate after two failing rounds. Merge readiness SHALL require covered review approval and green required checks. New scope SHALL start a new task. Existing homes SHALL pick up changed instructions at crew start after updating the tool.
-
-#### Scenario: Implementation is reported
-
-- **WHEN** a coordinator follows the installed template after a worker reports pushed implementation
-- **THEN** it starts review without waiting for CI or the delivery bot and combines resulting failures and blockers in one fix round
-
-#### Scenario: Only follow-ups remain
-
-- **WHEN** a review approves with FOLLOW-UP findings and required checks are green
-- **THEN** the coordinator queues follow-ups without holding the merge, and asks the person after two rounds that still fail
-
-#### Scenario: Existing home starts the new tool
-
-- **WHEN** an existing home starts Crew after crew update installs a changed coordinator template
-- **THEN** crew start rewrites its coordinator instructions with the current loop without manual edits
-
-### Requirement: Plain land publishes repairs to its existing PR
-
-For a reported plain ship with an existing open exact PR, crew land SHALL publish new committed work to the same branch using an ordinary push and refresh review coverage. It SHALL NOT create a second PR or force-push. Dirty copies, wrong branch/PR identity, closed PRs and conflicting remote history SHALL NOT authorize publication. Existing verified-merged cleanup SHALL remain guarded.
-
-#### Scenario: Plain worker fixes a landed PR
-
-- **WHEN** a reported plain ship has clean follow-up commits and its existing PR is open on the recorded repository and branch
-- **THEN** land pushes the new commits to that PR and updates review freshness without opening another PR
-
-#### Scenario: Existing PR has no new local commits
-
-- **WHEN** a reported plain ship's existing open PR already contains its head
-- **THEN** repeated land is idempotent and reports the same link
-
-#### Scenario: Publication would overwrite work
-
-- **WHEN** local work is dirty, the remote branch diverged or advanced incompatibly, or PR identity/state is unproven
-- **THEN** land refuses safely without a forced update or replacement PR
+- **WHEN** fleet reads a cold, warm, changed or rebuilt summary index
+- **THEN** every visible task project agrees with current authoritative task state without extra per-worker Core or network calls
