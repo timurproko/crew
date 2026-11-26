@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import { requiredProblems } from './ci-required.mjs';
 
 const successful = () => ({ readiness: { result: 'success', outputs: { ready: 'true' } }, openspec: { result: 'success' }, tests: { result: 'success' } });
@@ -34,12 +35,12 @@ test('aggregate command returns nonzero on a skipped suite', () => {
   assert.equal(r.status, 1, r.stderr); assert.match(r.stderr, /tests: expected success, got skipped/);
 });
 
-test('workflow ignores label events and preserves code-change supersession', () => {
+test('workflow ignores metadata edits and labels but preserves code-change supersession', () => {
   const workflow = readFileSync(new URL('../.github/workflows/tests.yml', import.meta.url), 'utf8');
   const types = workflow.match(/pull_request:\s*\n\s*branches: \[main\]\s*\n\s*types: \[([^\]]+)\]/);
   assert.ok(types, 'pull request trigger types are declared');
   assert.deepEqual(types[1].split(',').map(type => type.trim()), [
-    'opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft', 'edited',
+    'opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft',
   ]);
   assert.match(workflow, /group: \$\{\{ github\.event_name == 'pull_request' && format\('ci-pr-\{0\}', github\.event\.pull_request\.number\) \|\| format\('ci-run-\{0\}', github\.run_id\) \}\}/);
   assert.match(workflow, /cancel-in-progress: true/);
@@ -64,10 +65,37 @@ test('review labels use a separate advisory-only caller and policy declaration',
   ]);
 });
 
+test('aggregate skips cancelled runs and drafts without masking real dependency failures', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/tests.yml', import.meta.url), 'utf8');
+  const condition = workflow.match(/  required:\s*\n\s*name: CI required\s*\n(?:\s*#[^\n]*\n)*\s*if: \$\{\{ (.+) \}\}/)?.[1];
+  assert.ok(condition, 'aggregate declares an explicit status condition');
+  // cancelled() is a status function: Actions does not add its implicit success() guard.
+  // Evaluate the workflow's actual expression with the event/status contexts, not a copy.
+  assert.match(condition, /!cancelled\(\)/);
+  for (const event of ['pull_request', 'push', 'workflow_dispatch']) {
+    for (const draft of [false, true]) {
+      for (const cancelled of [false, true]) {
+        const github = { event_name: event, event: { pull_request: { draft } } };
+        const runs = runInNewContext(condition, { github, cancelled: () => cancelled });
+        assert.equal(runs, !cancelled && (event !== 'pull_request' || !draft),
+          JSON.stringify({ event, draft, cancelled }));
+        if (!runs) continue;
+        assert.deepEqual(requiredProblems(successful()), []);
+        for (const name of ['readiness', 'openspec', 'tests']) {
+          for (const result of ['failure', 'cancelled', 'skipped']) {
+            const needs = successful(); needs[name].result = result;
+            assert.ok(requiredProblems(needs).length, `${name}: ${result} must not pass`);
+          }
+        }
+      }
+    }
+  }
+});
+
 test('workflow keeps draft suites and aggregate disabled and checks both platforms', () => {
   const workflow = readFileSync(new URL('../.github/workflows/tests.yml', import.meta.url), 'utf8');
   assert.match(workflow, /if: needs\.readiness\.outputs\.ready == 'true'/);
-  assert.match(workflow, /if: always\(\) && \(github\.event_name != 'pull_request' \|\| !github\.event\.pull_request\.draft\)/);
+  assert.match(workflow, /if: \$\{\{ !cancelled\(\) && \(github\.event_name != 'pull_request' \|\| !github\.event\.pull_request\.draft\) \}\}/);
   assert.match(workflow, /os: \[windows-latest, ubuntu-latest\]/);
   assert.match(workflow, /needs: \[readiness, openspec, tests\]/);
   assert.equal((workflow.match(/name: CI required/g) || []).length, 1);
