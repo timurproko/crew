@@ -28,9 +28,9 @@ The maintainer integration decision accepts these scenarios:
     "Plain land publishes repairs to the existing open pull request without force or duplicate creation.",
     "Approved is immediate and independent of CI; stable manifest roles preserve opt-out, aliases, unrelated labels and closed-PR safeguards."
   ],
-  "archiveDigest": "adb8961a47a20cdcd670e5d84861f464474ead1a616bfb0c055ee7c9165c73a7",
-  "specDigest": "b6d476339efc7cab635518c0dd39c61da0567e4320167a405bae2442472ead67",
-  "tasksDigest": "8e6acadb6fb38279ecc6fa05fa069049ece8dd14f6d26460cbc33d7d3aefcfe2",
+  "archiveDigest": "6fd8c4d5ce32118f007b8bca29c3f7831feca4ff829b7d95abb06f5d6c83301c",
+  "specDigest": "e4580ac884fd8c631d680ec5696976f2acdfd25b6e907c8a78634e8121f6711a",
+  "tasksDigest": "daece1f7e98fdfb21f9338089e1830ea219986e0d22dc3fad9becfc8526e5c52",
   "evidenceDigest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
   "knownGaps": []
 }
