@@ -541,7 +541,8 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
      delivered depends on the project: see "Code changes".
    - Independent tasks may be spawned one after another without waiting; they run together.
    - Who does it is crew's choice unless the person said otherwise: see "Who does the work".
-2. \`crew wait <id> [<id>...]\` blocks until each worker reports (or fails). It prints the reports.
+2. \`crew wait <id> [<id>...]\` returns each worker's report. For implementation, start review
+   at once as below; do not wait for CI or the delivery bot.
 3. Tell the person the result in your own words. Do not paste the whole report unless asked.
 4. \`crew finish <id>\` stops the worker and removes its terminal and working copy.
    Finish only after the person has their answer; never finish a task that is still working
@@ -555,16 +556,20 @@ yourself; you hand each piece to a worker with the \`crew\` command and report r
      or send it back with what to change. Ask the person only when the plan needs a decision
      that is theirs (scope, direction, a risk the task did not cover); otherwise tell them the
      plan and that you approved it, in a line or two.
-  2. After it reports the implementation, have it checked as for a plain project (steps 1-2).
+  2. After implementation reports, use the parallel CI/review loop below (steps 1-3).
   3. \`crew land <id>\` records its pull request. Give the person the link.
 - **no-mistakes gate**: see Tools. Skip \`crew review\`; \`crew land\` records the gate's pull request.
 - **Plain project**:
-  1. After the worker reported, have the change checked unless it is trivial:
-     \`crew review <id>\` starts a reviewer (\`--agent\`, \`--model\` or \`--account\` picks another one
-     for a second opinion); \`crew wait <id>-review\`. Its report starts with \`APPROVE\` or \`CHANGES NEEDED\`.
-  2. On \`CHANGES NEEDED\`: \`crew tell <id> "<the defects, as the reviewer wrote them>"\`, then
-     \`crew wait <id>\` and review again. After two rounds that still fail, tell the person.
-  3. \`crew land <id>\` pushes the branch and opens a pull request. Give the person the link.
+  1. As soon as the worker reports, \`crew land <id>\` publishes its PR; start \`crew review <id>\`
+     at once, then \`crew wait <printed-review-id>\`. CI and review run together: wait for neither
+     CI nor the delivery bot before starting review. Workers run targeted tests, not a full local suite.
+  2. Gather CI failures and review findings, then send them together with \`crew tell <id> "..."\`
+     so one fix push covers both. Only BLOCKING findings cause another round; queue FOLLOW-UP
+     findings with \`crew backlog add <id> "<finding>"\` without holding the merge. The next review
+     covers only the fix. After two rounds that still fail, tell the person.
+  3. A PR is ready to merge when review approved its head (or only covered delivery-App commits
+     follow it) and required checks are green. \`crew land <id>\` records/publishes repairs;
+     give the person the link. The Approved label alone is not proof of green CI.
 - Merging is the person's: never merge a project's pull request unless they told you to.
   Finish the reviewer and the task only once \`crew land\` has recorded the pull request (a
   workflow task's draft is open from its plan on; finishing it then loses the worker).
@@ -597,6 +602,7 @@ behind it. Crew reads the quota itself (quota-axi, each saved Claude account sep
   every tool prompt. Where auto mode cannot start they run in acceptEdits; the start line says so.
 
 ## Rules
+- Do not add scope to an open pull request; start a new task.
 - Never work in a worker's copy yourself and never edit a project directly.
 - When the person has you do a piece of work yourself, follow the shared delivery workflow
   (the \`change-delivery\` skill) for your working copy, as workers do.
@@ -1327,20 +1333,23 @@ export function briefText({ id, kind, task, worktree, project, report, tools = [
             '- A small fix the skill allows without a plan: implement it in a draft pull request with the body in the skill\'s format, ticking each outcome as it lands.',
             '- Once implemented, the first line of your report is `Implementation: <pull request link>`. Every report starts with one of these two lines.',
             '- Never mark the pull request ready and never merge it.']
-          : ['- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.']),
+          : ['- Make your changes on the branch already checked out here, commit and push them. Do not open or merge a pull request yourself; crew land handles its publication.']),
     ...(kind === 'ship' && gate ? [
       `- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file ${gate}${skip}\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. A wait that runs out is not a failure: run the same command again to go on. Do not push or open a pull request any other way.`,
       watched
-        ? '- The gate also watches the pull request\'s checks. Once they have passed, end its watch with `no-mistakes axi handoff`; if no check has appeared ten minutes after the pull request opened, say so in the report and stop waiting.'
+        ? '- Once the gate has pushed and opened the pull request, end any CI watch with `no-mistakes axi handoff` and report at once; do not wait for checks.'
         : '- The gate ends when the pull request is open. Its checks are not watched here: the person reads them on the pull request.',
       '- Put the pull request link the gate gives you in the first lines of your report. If the gate stops on something only a person can decide, say exactly what in the report.',
     ] : []),
+    ...(kind === 'ship' ? [LOCAL_HANDOFF] : []),
     `- When you are finished, write your result to \`${report}\` in Markdown, with the answer in the first lines.`,
     `- Then run \`crew done ${id}\` and stop. Do not start any other work.`,
     '- If you cannot finish, write what blocked you to the same file and still run the command.', '',
     ...(hints.length ? ['## Tools on this machine', ...hints, ''] : []),
   ].join('\n');
 }
+
+const LOCAL_HANDOFF = '- Run only targeted tests for what you touched, where useful, and list commands/results in your report. Do not run the full local test suite. Push through the project publication path, then report at once; do not wait for CI or the delivery bot. CI and review run in parallel, and the coordinator will combine failures and BLOCKING findings into one fix round.';
 
 // A ship task works on a branch named the way the shared delivery workflow names them:
 // <type>/<task id>. Tasks from before 0.7 are on crew/<id>.
@@ -2393,22 +2402,32 @@ function cmdTell(args) {
   const [id, ...words] = args, message = words.join(' ').trim();
   if (!id || !message) refuse('Usage: crew tell <id> "<message for the worker>"');
   const task = loadTask(h, id);
-  if (!['working', 'reported'].includes(task.state)) refuse(`Task ${id} is ${task.state}; there is no worker to tell. Spawn a new task instead.`);
+  try { sendTaskTell(h, task, message); } catch (error) { refuse(error.message, error.code ?? 4); }
+  console.log(`told ${id}; next: crew wait ${id}`);
+}
+function sendTaskTell(h, task, message) {
+  const id = task.id;
+  const no = (reason, code = 4) => { throw Object.assign(Error(reason), { code }); };
+  if (!['working', 'reported'].includes(task.state)) no(`Task ${id} is ${task.state}; there is no worker to tell. Spawn a new task instead.`, 2);
   const { state: seen, t } = probe(task.terminal);
-  if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was sent. Try again.`, 4);
-  if (seen !== 'live') refuse(`The worker terminal of ${id} is gone; spawn a new task instead.`, 6);
-  if (t.status?.state === 'blocked') refuse(`The worker of ${id} is waiting for a person (terminal ${task.terminal}); nothing was sent.`, 7);
+  if (seen === 'unknown') no(`${CORE_SILENT} terminal ${task.terminal}; nothing was sent. Try again.`, 4);
+  if (seen !== 'live') no(`The worker terminal of ${id} is gone; spawn a new task instead.`, 6);
+  if (t.status?.state === 'blocked') no(`The worker of ${id} is waiting for a person (terminal ${task.terminal}); nothing was sent.`, 7);
   const text = `Message from the coordinator about task ${id}: ${message}\nWhen you have dealt with it, rewrite ${task.report} so it holds the complete, current result, then run \`crew done ${id}\` again and stop.`;
   // The task is open again BEFORE the message goes out, so a fast worker's new report is
   // never overwritten by this command.
-  saveTask(h, { ...task, state: 'working', told: now(), tells: (task.tells ?? 0) + 1 });
+  const told = now();
+  taskTransaction(h, id, current => {
+    if (!sameWorker(current, task) || current.state !== task.state || current.reported !== task.reported || current.told !== task.told) no('worker or report changed; nothing was sent');
+    writeJson(taskFile(h, id), { ...current, state: 'working', told, tells: (current.tells ?? 0) + 1, updated: now() });
+  });
   const sent = hc(['send', task.terminal, text]);
-  if (sent.code !== 0) {
-    saveTask(h, { ...loadTask(h, id), state: task.state });
-    refuse(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
-  }
+  taskTransaction(h, id, current => {
+    if (!sameWorker({ ...current, state: task.state }, task) || current.told !== told) return;
+    if (sent.code !== 0 && current.state === 'working') writeJson(taskFile(h, id), { ...current, state: task.state, updated: now() });
+  });
+  if (sent.code !== 0) no(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
   reviewLabels(h, id, 'rework');
-  console.log(`told ${id}; next: crew wait ${id}`);
 }
 
 // review: a second pair of eyes on a ship task's branch, as an ordinary read-only task.
@@ -2430,14 +2449,29 @@ function cmdReview(args) {
   let n = 1, reviewId = `${id}-review`.slice(0, 40);
   while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
   const reviewHead = pullRequestReviewHead(task), target = reviewHead ?? branchOf(task);
+  if (!reviewSha(reviewHead)) refuse(`Task ${id} has no verifiable fixed head to review.`, 6);
+  const approvedHead = approvedHeadOf(task), approval = approvalCovers(task, approvedHead, reviewHead);
+  const reviewBase = task.reviewVerdict?.head ?? approvedHead;
+  const coverage = reviewBase === approvedHead ? approval : approvalCovers(task, reviewBase, reviewHead);
+  const delta = !!reviewBase && coverage.mode === 'delta' && (!approvedHead || approval.mode === 'delta');
+  const previousReport = validId(task.reviewVerdict?.reviewer) ? path.join(taskDir(h, task.reviewVerdict.reviewer), 'report.md') : null;
   const text = [
     `Review the work of task ${id}. It is the branch \`${branchOf(task)}\` of this repository; you are on the commit it started from.`,
-    '', `- Review the fixed head \`${target}\` with \`git log HEAD..${target}\` and \`git diff HEAD...${target}\`. Read the changed files whole where the diff is not enough.`,
+    '', delta ? `- The fixed head is \`${target}\`. Review only the delta scope below; use earlier files only as context.` : `- Review the fixed head \`${target}\` with \`git log HEAD..${target}\` and \`git diff HEAD...${target}\`. Read the changed files whole where the diff is not enough.`,
+    ...(delta ? [
+      `- This is a DELTA review of \`${reviewBase}..${target}\`, covering only the fix, not a re-review of unchanged work. Inspect \`git log ${reviewBase}..${target}\`.`,
+      ...(previousReport && fs.existsSync(previousReport) ? [`- Recheck prior BLOCKING findings in \`${slash(previousReport)}\` against the fix; queue FOLLOW-UP items rather than re-reviewing unchanged work.`] : []),
+      `- Unapproved task commits (review each with \`git show --format=fuller --first-parent <sha>\`): ${coverage.commits.join(', ') || 'none; approval still covers this head'}.`,
+      `- Excluded verified delivery commits: ${coverage.excluded.join(', ') || 'none'}. Do not exclude other spec changes or rely on a blanket path filter.`,
+    ] : ['- This is a FULL review; no ancestral approval supplies a safe delta basis.']),
     `- What it was asked to do is in \`${task.brief}\`; what its author says it did is in \`${task.report}\`.`,
-    '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
-    '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
+    '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Ignore style.',
+    `- Check out the fixed head with \`git checkout --detach ${target}\` in your isolated copy before building or testing. Do not change the ship copy.`,
+    '- Read the diff and changed files, and run targeted tests where useful. Do not run the full local test suite; CI runs in parallel. List the commands/results, or say no targeted test was useful.',
+    '- Mark EVERY finding `BLOCKING` (the change does not do what it claims, can lose data, or can get stuck) or `FOLLOW-UP` (wording, edge cases, polish). Give file/line, impact and reproduction details.',
+    '- Start your report with exactly `CHANGES NEEDED` only if at least one finding is BLOCKING; otherwise start with `APPROVE`. Then always include a short `## What I checked` section, even on APPROVE. FOLLOW-UP findings are for the coordinator to queue and do not hold the merge.',
   ].join('\n');
-  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead, workerSpace } });
+  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead, workerSpace, reviewMode: delta ? 'delta' : 'full', reviewBase: delta ? reviewBase : null, reviewCommits: delta ? coverage.commits : null, reviewExcluded: delta ? coverage.excluded : [] } });
   reviewLabels(h, reviewId);
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }
@@ -2468,7 +2502,7 @@ function pullRequestReviewHead(task) {
   if (!m) return local;
   const read = gh(['api', '--hostname', m[1], '--method', 'GET', `repos/${m[2]}/${m[3]}/pulls/${m[4]}`], { timeout: 2000 });
   let pr = null;
-  try { if (read.code === 0) pr = JSON.parse(read.stdout); } catch { /* unreadable: review the local head */ }
+  try { if (read.code === 0) pr = JSON.parse(read.stdout); } catch { /* local review fallback */ }
   const head = pr?.head?.sha;
   if (pr?.state !== 'open' || pr.merged_at || typeof head !== 'string' || !/^[a-f0-9]{40,64}$/.test(head) || head === local) return local;
   const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 60000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
@@ -2487,16 +2521,125 @@ function pullRequestReviewHead(task) {
   const ahead = git('merge-base', '--is-ancestor', head, local).code === 0;
   refuse(`${where}; the local copy is ${ahead ? 'ahead of the pull request: push it first' : 'diverged from the pull request: reconcile them first'}. Nothing was reviewed.`);
 }
+// Existing-PR publication must prove repository and branch identity; the report
+// link is only a locator. This helper does not gate review or poll CI.
+function taskPullRequest(task) {
+  let url = reviewPrUrl(task);
+  if (!url && task.workflow) {
+    const found = gh(['pr', 'view', branchOf(task), '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 2000 });
+    if (found.code !== 0) throw Error('implementation PR could not be read');
+    url = found.stdout.trim();
+  }
+  if (!url) return null;
+  const api = reviewApi(url), pr = api.get(`pulls/${api.number}`);
+  const origin = run('git', ['-C', task.worktree, 'config', '--get', 'remote.origin.url'], { timeout: 2000 });
+  const repository = /[:/]([^/:]+\/[^/]+?)(?:\.git)?\/?$/.exec(origin.stdout.trim())?.[1];
+  const current = run('git', ['-C', task.worktree, 'symbolic-ref', '--short', 'HEAD'], { timeout: 2000 });
+  if (current.code !== 0 || current.stdout.trim() !== branchOf(task)) throw Error('copy is not on its recorded branch');
+  if (origin.code !== 0 || repository?.toLowerCase() !== api.repository.toLowerCase() || pr.number !== api.number || canonicalPrUrl(pr.html_url)?.toLowerCase() !== canonicalPrUrl(url)?.toLowerCase() || pr.head?.ref !== branchOf(task) || pr.head?.repo?.full_name?.toLowerCase() !== api.repository.toLowerCase() || !reviewSha(pr.head?.sha)) throw Error('PR repository, branch or head identity is unproven');
+  return { ...api, url, pr };
+}
 function staleApproval(id) {
   console.log(`crew: ${id}: approval is for an older head (or its head could not be verified); task needs another review`);
 }
+const reviewSha = value => typeof value === 'string' && /^[a-f0-9]{40,64}$/.test(value);
+const approvedHeadOf = task => task.approvedHead ?? (task.reviewVerdict?.verdict === 'APPROVE' ? task.reviewVerdict.head : null);
+function reviewPrUrl(task) {
+  const first = fs.existsSync(task.report ?? '') ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
+  return (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr;
+}
+function reviewApi(url) {
+  const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(url ?? '');
+  if (!m) throw Error('implementation PR URL unavailable');
+  const repo = `repos/${m[2]}/${m[3]}`, deadline = Date.now() + 10000;
+  const get = endpoint => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw Error('GitHub evidence read budget exhausted');
+    const r = gh(['api', '--hostname', m[1], '--method', 'GET', `${repo}/${endpoint}`], { timeout: Math.min(2000, remaining) });
+    if (r.code !== 0) throw Error((r.stderr || r.stdout).trim().replace(/\s+/g, ' ') || 'GitHub unavailable');
+    try { return JSON.parse(r.stdout); } catch { throw Error('GitHub evidence unreadable'); }
+  };
+  return { get, repo, number: Number(m[4]), repository: `${m[2]}/${m[3]}`, hostname: m[1] };
+}
+// Classify only the task lineage: a proven clean base merge imports already-owned base
+// history, not new worker commits. Unknown evidence always remains in the review scope.
+export function approvalCovers(task, approvedHead, head, evidence = {}) {
+  const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 2000 });
+  const result = { covered: false, verified: false, mode: 'full', commits: [], excluded: [], reason: 'head could not be verified' };
+  if (!reviewSha(approvedHead) || !reviewSha(head)) return result;
+  if (approvedHead === head) return { ...result, covered: true, verified: true, mode: 'delta', reason: 'approved head' };
+  if (git('cat-file', '-e', `${head}^{commit}`).code !== 0) {
+    try { const api = evidence.api ?? reviewApi(reviewPrUrl(task)); run('git', ['-C', task.worktree, 'fetch', '--quiet', 'origin', `refs/pull/${api.number}/head`], { timeout: 2000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }); } catch { /* unknown remains unverified */ }
+  }
+  const ancestor = git('merge-base', '--is-ancestor', approvedHead, head);
+  if (ancestor.code !== 0) return { ...result, verified: ancestor.code === 1, reason: ancestor.code === 1 ? 'approved head is not an ancestor; full review required' : result.reason };
+  result.verified = true;
+  const listed = git('rev-list', '--first-parent', '--reverse', `${approvedHead}..${head}`);
+  if (listed.code !== 0) return result;
+  result.mode = 'delta'; result.commits = listed.stdout.trim().split(/\r?\n/).filter(Boolean);
+  // Do not skip a merge which imported the approval through its second parent.
+  const lineage = git('rev-list', '--first-parent', head).stdout.split(/\r?\n/);
+  if (!lineage.includes(approvedHead)) return { ...result, mode: 'full', reason: 'approved head is outside task lineage; full review required' };
+  let api, pr, change, prefixes = [], slug = process.env.CREW_DELIVERY_APP_SLUG;
+  try {
+    if (!/^[a-zA-Z0-9-]+$/.test(slug ?? '')) throw Error('trusted delivery App slug is not configured');
+    api = evidence.api ?? reviewApi(reviewPrUrl(task)); pr = evidence.pr ?? api.get(`pulls/${api.number}`);
+    const block = /```openspec-implementation\s*\n([\s\S]*?)\n```/.exec(pr.body ?? '');
+    const association = block ? JSON.parse(block[1]) : null;
+    change = association?.change;
+    if (/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(change ?? '')) {
+      const active = `openspec/changes/${change}/`;
+      const archive = typeof association.archive === 'string' && new RegExp(`^openspec/changes/archive/\\d{4}-\\d{2}-\\d{2}-${change}/$`).test(association.archive) ? association.archive : null;
+      const roots = [active, ...(archive ? [archive] : [])];
+      prefixes = [...roots];
+      for (const root of roots) {
+        const paths = git('ls-tree', '-r', '--name-only', approvedHead, '--', `${root}specs/`);
+        if (paths.code !== 0) throw Error('change scope unreadable');
+        for (const file of paths.stdout.split(/\r?\n/)) if (file.startsWith(`${root}specs/`) && file.endsWith('/spec.md')) prefixes.push(`openspec/specs/${file.slice(`${root}specs/`.length, -'spec.md'.length)}`);
+      }
+    }
+    for (const sha of [...result.commits]) {
+      try {
+        const commit = api.get(`commits/${sha}`), login = `${slug}[bot]`;
+        if (commit.sha !== sha || commit.author?.login !== login || commit.committer?.login !== login) continue;
+        const parents = git('show', '-s', '--format=%P', sha).stdout.trim().split(' ').filter(Boolean);
+        if (parents.length === 1 && change && new RegExp(`^docs\\(openspec\\): (?:finalize|refinalize) ${change}$`).test(git('show', '-s', '--format=%s', sha).stdout.trim())) {
+          const changed = git('diff-tree', '--no-commit-id', '--name-only', '-r', sha);
+          const paths = changed.stdout.trim().split(/\r?\n/).filter(Boolean);
+          if (changed.code === 0 && paths.length && paths.every(p => prefixes.some(prefix => p.startsWith(prefix)))) result.excluded.push(sha);
+        } else if (parents.length === 2 && reviewSha(pr.base?.sha)) {
+          if (git('cat-file', '-e', `${pr.base.sha}^{commit}`).code !== 0) {
+            run('git', ['-C', task.worktree, 'fetch', '--quiet', 'origin', pr.base.sha], { timeout: 2000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+          }
+          if (git('merge-base', '--is-ancestor', parents[1], pr.base.sha).code !== 0) continue;
+          const merged = git('merge-tree', '--write-tree', ...parents);
+          if (merged.code === 0 && merged.stdout.trim() === git('show', '-s', '--format=%T', sha).stdout.trim()) result.excluded.push(sha);
+        }
+      } catch { /* a failed commit proof stays in the delta */ }
+    }
+  } catch (error) { result.reason = error.message; }
+  result.commits = result.commits.filter(sha => !result.excluded.includes(sha));
+  result.covered = result.commits.length === 0;
+  result.reason = result.covered ? 'only verified delivery commits follow approval' : 'non-covered commits need delta review';
+  return result;
+}
 function recordReviewVerdict(h, task, reviewer, verdict, currentHead, pr) {
-  const head = reviewer.reviewHead ?? null, stale = verdict === 'APPROVE' && (!head || !currentHead || head !== currentHead);
-  const reviewVerdict = { verdict, head, currentHead, stale, needsReview: verdict !== 'APPROVE' || stale, at: now(), reviewer: reviewer.id, ...(pr ? { pr } : {}) };
+  const head = reviewer.reviewHead ?? null;
+  const coverage = verdict === 'APPROVE' ? approvalCovers({ ...task, ...(pr ? { pr } : {}) }, head, currentHead) : null;
+  const stale = verdict === 'APPROVE' && !coverage.covered;
+  const reviewVerdict = { verdict, head, currentHead, stale, needsReview: verdict !== 'APPROVE' || stale, at: now(), reviewer: reviewer.id, ...(coverage ? { coverage } : {}), ...(pr ? { pr } : {}) };
   saveTask(h, { ...loadTask(h, reviewer.id), reviewVerdict });
-  saveTask(h, { ...loadTask(h, task.id), reviewVerdict });
+  const approvedHead = verdict === 'APPROVE' && reviewSha(head) ? head : approvedHeadOf(task);
+  saveTask(h, { ...loadTask(h, task.id), ...(approvedHead ? { approvedHead } : {}), reviewVerdict });
   return reviewVerdict;
 }
+// Stable semantic roles. Display names and aliases are resolved once per hook;
+// the shared manifest can rename Build without changing any transition logic.
+const REVIEW_ROLES = [
+  { role: 'review', key: 'under-review', name: '\u{1F916} Review', previousNames: ['\u{1F916} Under review'] },
+  { role: 'approved', key: 'review-approved', name: '\u{1F916} Approved', previousNames: [] },
+  { role: 'build', key: 'review-changes-needed', name: '\u{1F916} Rework', previousNames: ['\u{1F916} Changes needed'] },
+];
 // Advisory hooks only: saved launch/report, successful follow-up/handover, or plain land.
 // Each PR state/head read is bounded and attempted once, with no label retries or leases.
 function reviewLabels(h, id, action = 'start') {
@@ -2518,7 +2661,7 @@ function reviewLabels(h, id, action = 'start') {
     if (task.stage === 'plan' || /^Plan:/i.test(first)) return;
     if (completed) recordReviewVerdict(h, task, reviewer, verdict, reviewHeadOf(task));
     if (check && !task.reviewVerdict) return;
-    if (rework && task.reviewVerdict) saveTask(h, { ...loadTask(h, id), reviewVerdict: { ...task.reviewVerdict, needsReview: true } });
+    if (rework && task.reviewVerdict) saveTask(h, { ...loadTask(h, id), reviewVerdict: { ...task.reviewVerdict, needsReview: true, invalidated: true } });
     let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr ?? (abandon ? reviewer.reviewLabelBefore?.pr : null);
     if (!url && rework && run('git', ['-C', task.worktree, 'remote', 'get-url', 'origin'], { timeout: 2000 }).code !== 0) return;
     if (!url) {
@@ -2545,8 +2688,9 @@ function reviewLabels(h, id, action = 'start') {
     let recorded;
     if (completed) recorded = recordReviewVerdict(h, task, reviewer, verdict, currentHead, url);
     if (check) {
-      const previous = task.reviewVerdict, stale = previous.verdict === 'APPROVE' && (!previous.head || !currentHead || previous.head !== currentHead);
-      recorded = { ...previous, currentHead, stale, needsReview: previous.needsReview || stale };
+      const previous = task.reviewVerdict, coverage = approvalCovers(task, approvedHeadOf(task), currentHead);
+      const stale = previous.verdict === 'APPROVE' && !coverage.covered;
+      recorded = { ...previous, currentHead, stale, coverage, needsReview: previous.verdict !== 'APPROVE' || previous.invalidated === true || !coverage.covered };
       saveTask(h, { ...loadTask(h, id), reviewVerdict: recorded });
       if (open && stale) staleApproval(id);
     }
@@ -2557,12 +2701,8 @@ function reviewLabels(h, id, action = 'start') {
     const pages = JSON.parse(api('GET', `${repo}/actions/variables`, ['--paginate', '--slurp']));
     if (!Array.isArray(pages) || !pages.length || pages.some(p => !Array.isArray(p?.variables) || p.variables.some(v => typeof v.name !== 'string' || typeof v.value !== 'string'))) throw new Error('repository variables unreadable');
     if (pages.flatMap(p => p.variables).some(v => v.name === 'DELIVERY_LABELS_ENABLED' && v.value.toLowerCase() === 'false')) throw new Error('repository opted out with DELIVERY_LABELS_ENABLED=false');
-    const keys = ['under-review', 'review-approved', 'review-changes-needed'];
-    let palette = [
-      { name: '\u{1F916} Review', previousNames: ['\u{1F916} Under review'] },
-      { name: '\u{1F916} Approved', previousNames: [] },
-      { name: '\u{1F916} Rework', previousNames: ['\u{1F916} Changes needed'] },
-    ];
+    const keys = REVIEW_ROLES.map(role => role.key);
+    let palette = REVIEW_ROLES;
     try {
       const source = process.env.CREW_REVIEW_LABELS_REPO ?? 'timurproko/MyWorkflows';
       if (!/^[\w.-]+\/[\w.-]+$/.test(source)) throw new Error('invalid CREW_REVIEW_LABELS_REPO');
@@ -2577,8 +2717,11 @@ function reviewLabels(h, id, action = 'start') {
     if (!Array.isArray(current) || current.some(l => typeof l?.name !== 'string')) throw new Error('PR labels unreadable');
     const assigned = index => current.some(l => [palette[index].name, ...palette[index].previousNames].includes(l.name));
     if (rework && !palette.some((_, i) => assigned(i))) return;
-    const needsRework = rework || completed && (verdict !== 'APPROVE' || recorded.stale) || check && recorded.needsReview;
-    let desired = palette[needsRework ? 2 : completed || check ? 1 : 0].name;
+    // Build means work/review remains, never a fabricated negative review verdict.
+    if ((completed || check) && recorded.stale && (!currentHead || recorded.coverage?.verified === false)) throw Error('approval head could not be verified; keeping labels unchanged');
+    const needsBuild = rework || completed && (verdict !== 'APPROVE' || recorded.stale) || check && recorded.needsReview;
+    const role = needsBuild ? 'build' : completed || check ? 'approved' : 'review';
+    let desired = palette[REVIEW_ROLES.findIndex(r => r.role === role)].name;
     if (starting) {
       // Save stable roles before removing anything, including labels added by hand.
       const prior = [1, 2].filter(assigned);
@@ -2670,8 +2813,11 @@ function cmdLand(args) {
   // A workflow task's link is recorded already when its worker reports; it lands only once.
   if (task.pr && (task.landed || !task.workflow)) {
     if (finishMergedTask(h, task)) return;
-    if (!task.workflow && !task.gate) reviewLabels(h, id, 'check');
-    console.log(`${id} already has a pull request: ${task.pr}`); return;
+    if (task.workflow || task.gate || task.state === 'closed') {
+      if (!task.workflow && !task.gate) reviewLabels(h, id, 'check');
+      console.log(`${id} already has a pull request: ${task.pr}`); return;
+    }
+    // Plain tasks can have new repairs to publish to this same open pull request.
   }
   if (task.state === 'closed' && finishMergedTask(h, task)) return;
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; it is delivered only after its worker reported.`);
@@ -2684,6 +2830,21 @@ function cmdLand(args) {
   // Keep first-land local refusals ahead of GitHub reads and cleanup.
   if (task.workflow && task.stage === 'plan') no(`its last report is a plan awaiting approval, not an implementation. Read the plan, then: crew tell ${id} "approved, implement", or send it back with what to change.`);
   const remote = git('remote', 'get-url', 'origin');
+  if (task.pr && !task.workflow && !task.gate) {
+    let context;
+    try { context = taskPullRequest(task); } catch (error) { no(error.message); }
+    if (!context || context.pr.state !== 'open' || context.pr.merged_at) no('its existing PR is not open; no commits were pushed');
+    const local = reviewHeadOf(task), published = git('ls-remote', '--exit-code', '--heads', 'origin', branchOf(task));
+    if (published.code !== 0 || published.stdout.trim().split(/\s+/)[0] !== context.pr.head.sha) no('its published branch does not match the PR head; reconcile it first');
+    if (git('fetch', '--quiet', 'origin', branchOf(task)).code !== 0) no('its published branch could not be fetched', 4);
+    if (git('merge-base', '--is-ancestor', 'FETCH_HEAD', local).code !== 0) no('its published branch is ahead or diverged; reconcile it without force');
+    const pushed = git('push', '--quiet', 'origin', `HEAD:refs/heads/${branchOf(task)}`);
+    if (pushed.code !== 0) no(`the ordinary push was refused (${lastLine(pushed.stderr)}).`, 4);
+    saveTask(h, { ...loadTask(h, id), landed: task.landed ?? now() });
+    reviewLabels(h, id, 'check');
+    console.log(`delivered ${id} to its existing pull request: ${task.pr}${local === context.pr.head.sha ? ' (no new commits)' : ' (published repair commits)'}`);
+    return;
+  }
   if (task.gate === 'no-mistakes') {
     // The gate reviewed, pushed and opened the pull request while the worker drove it; what
     // is left is to find that pull request: in the report, or by asking GitHub for the branch.
@@ -3244,7 +3405,7 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
       backlog: only reported scouts move here (not reviewers, except legacy treehouse); ships move at land
   crew done [<id>]                         (worker) my report is written
   crew tell <id> "<message>"               send the worker a follow-up; it reports again
-  crew review <id> [who]                   start a read-only reviewer; use its printed ID (truncated or numbered when needed)
+  crew review <id> [who]                   review a reported ship in parallel with CI
   crew land <id> [--title "<title>"]       push/open a plain PR, or record the workflow/gate PR
       first land requires a reported worker, existing copy and clean tracked/untracked files; an already-landed PR can return early
       plain PR text uses the first 200 report lines plus attribution; workflow draft/outcome summary is best-effort

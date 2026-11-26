@@ -71,7 +71,7 @@ crew done [<id>]                         (worker) my report is written
 crew tools [--json]                      companion tools on this machine and what crew does with each
 crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
 crew tell <id> "<message>"               send the worker a follow-up; it reports again
-crew review <id> [who]                   start a reviewer on a ship task's branch
+crew review <id> [who]                   review a reported ship in parallel with CI
 crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request, or record the one its workflow or gate opened
 crew fix [who] "<problem>"               start a worker that repairs crew itself
 crew selfrepair <id>                     check that repair and open its pull request
@@ -434,6 +434,12 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
   accounts, that account is used. crew never merges a project's pull request.
 - `crew review` and `crew tell` work the same way for a workflow project's implementation.
 
+For plain projects with an existing open PR, `crew land` publishes clean committed repairs
+to the same recorded branch with an ordinary push; it never opens another PR or force-pushes.
+The worker must report again. PR/repository/branch identity and remote history are checked;
+dirty, closed, ahead or diverged work is refused safely. No new commits is idempotent.
+Workflow and gate land still publish nothing themselves.
+
 For every kind, first land requires a reported worker, an existing copy, and clean tracked
 and untracked files, even when it only records a link. An already-landed open PR can return early.
 Land records the PR link, landed timestamp and backlog completion before any merged-task
@@ -445,6 +451,32 @@ terminals still prevent unsafe cleanup. Finish and merged-task land include one 
 saying which ignored roots or local changes/scratch were discarded, or `discarded none` when
 nothing was removed. A failed partial discard is identified as incomplete rather than reported
 as a successful return; reports and unmerged branches stay retained.
+
+### Parallel CI and review
+
+Workers run only useful targeted tests, push through the project's publication path and
+report immediately, without waiting for CI or the delivery bot. As soon as implementation
+reports, publish/record the PR with `crew land` and start `crew review`: CI and review run
+together. Review requires a reported worker, not passing checks or ticked outcomes. It keeps
+the safe PR-head fast-forward and refuses ahead/diverged copies rather than overwriting work.
+`crew wait` returns at the report as before; it does not read checks, send failed-check tells
+or hold a reported ship for CI. Existing provider/quota/idle recovery is unchanged.
+
+The coordinator gathers CI failures and review findings, then sends both in one `crew tell`
+so one fix push covers them. Every finding is **BLOCKING** (the change does not do what it
+claims, can lose data, or can get stuck) or **FOLLOW-UP** (wording, edge cases, polish).
+Only BLOCKING findings cause CHANGES NEEDED and another round; queue FOLLOW-UP items with
+`crew backlog add <id> "<finding>"` without holding the merge. The next review covers only the
+fix, not unchanged work. After two rounds that still fail, tell the person.
+
+A PR is ready to merge when review approved its head, or later head changes are covered
+by the delivery-App rule below, and required checks are green. The Approved label alone
+is not proof of green CI. Do not add scope to an open PR; start a new task. Dispatching the
+delivery bot after approval is not part of this flow.
+
+These rules are in the coordinator template installed into a Crew home. `crew update`
+installs the new tool; the next `crew start` automatically rewrites the home's coordinator
+instructions when the template differs, with no manual editing of existing homes.
 
 ### Advisory review labels
 
@@ -470,16 +502,33 @@ ahead of the PR, diverged from it, or cannot be fast-forwarded, the review is re
 nothing is launched. Without a readable open PR the local head is reviewed. A valid verdict records
 `reviewVerdict` on both the reviewer and ship task: verdict, reviewed `head`, observed
 `currentHead`, `stale`, `needsReview`, timestamp and reviewer ID (and PR link when known).
-For a PR, that same state read supplies its current head. An `APPROVE` for a different or
-unverifiable head sets Rework instead of Approved and says the task needs another review.
-Before a plain branch has a PR, the local branch head supplies the comparison. Plain
-`crew land`, including a repeated land, checks the PR head against the last verdict,
-updates recorded freshness and normalizes open-PR labels to Approved or Rework. A stale
-approval warns and selects Rework. Status JSON exposes the saved
+For a PR, that same state read supplies its current head. Approval is retained separately
+from later findings. `CREW_DELIVERY_APP_SLUG` names the trusted delivery App (without `[bot]`):
+GitHub author and committer must both match it. Approval covers later single-parent
+`docs(openspec): finalize|refinalize <change>` commits limited to that change's active/archive
+and affected spec folders, or App-owned clean base merges whose tree matches `git merge-tree`.
+Without configured identity or verifiable proof, no bot exemption is granted. Other descendant
+commits need delta review; a force-push away needs full review. Neither invents a negative verdict.
+An unverifiable head warns instead of selecting Approved or fabricating CHANGES NEEDED.
+Before a plain branch has a PR, the local branch head supplies the comparison. Reviewers
+check out the fixed head, read the diff and run targeted tests where useful, never a full
+local suite. Reports begin APPROVE or CHANGES NEEDED, then include a short **What I checked**
+section even on APPROVE. Every finding is BLOCKING or FOLLOW-UP; only a BLOCKING finding
+justifies CHANGES NEEDED. Delta review uses the last reviewed-to-current range (or retained
+approval as fallback) and rechecks prior blockers against only the fix, excluding individually
+verified delivery commits, not all spec paths. Rewritten approved history gets full review.
+Plain
+`crew land`, including a repeated land, checks the PR head against retained approval,
+updates freshness and normalizes open-PR labels. The three semantic roles are **Build**,
+**Review**, **Approved**, from one table: today's Build-role manifest name is still `🤖 Rework`
+until the shared rename lands. Covered approval selects Approved immediately, even with
+pending CI; non-covered work selects Build and needs delta/full review, never a fabricated
+CHANGES NEEDED verdict. GitHub's checks show CI and its required check blocks merging.
+There is no fourth stage or approval-waiting-for-CI chip. Status JSON exposes the saved
 verdict; plain status says `needs another review` when recorded, without new GitHub reads.
 
 After a successful `crew tell` or `crew relaunch` of a ship task, existing managed
-assignments (including an active Review) are best-effort replaced by the current Rework
+assignments (including an active Review) are best-effort replaced by the current Build-role
 name on an open PR. Recorded verdicts are marked as needing another review. No PR, no
 managed assignment, or a merged/closed PR causes no label writes. Every label-setting hook
 removes the other managed roles and historical aliases, even when added by hand; if a
