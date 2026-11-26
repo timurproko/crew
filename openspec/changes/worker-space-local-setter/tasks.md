@@ -2,12 +2,12 @@
 
 ## 1. Discoverable explicit-home worker-space-only setter
 
-- [ ] 1.1 Add the strict local setter and home-independent capability probe in crew.mjs with the v1 help marker; verify exact JSON and option rejection in the focused worker-space-local-setter group.
-- [ ] 1.2 Validate the explicit canonical initialized home without ambient discovery, creation or migration; verify missing/uninitialized/invalid/relative/redirected targets refuse and outside sentinel files remain unchanged.
-- [ ] 1.3 Apply only workerSpaceMode under the existing registry transaction with exclusive safe temporary publication and current sharing retries; verify changed/no-op results and stable JSON refusal/exit codes for contention, IO and unexpected errors.
-- [ ] 1.4 Cover another live owner, unknown owner, unowned and stale-owner homes with both terminal identity variables empty; verify success without Core calls, owner mutation or any other registry/task/rules change.
-- [ ] 1.5 Preserve the owner positional setter/getter and all other ownership checks; verify non-owner positional sets, unrelated config writes and spawn/stop/finish/end still refuse in isolated homes.
-- [ ] 1.6 Document the capability, setter JSON/exit codes, same-user filesystem authority, explicit-home validation and idempotency in docs/worker-spaces.md and the README overview; verify examples match focused CLI assertions.
+- [x] 1.1 Add the strict local setter and home-independent capability probe in crew.mjs with the v1 help marker; verify exact JSON and option rejection in the focused worker-space-local-setter group.
+- [x] 1.2 Validate the explicit canonical initialized home without ambient discovery, creation or migration; verify missing/uninitialized/invalid/relative/redirected targets refuse and outside sentinel files remain unchanged.
+- [x] 1.3 Apply only workerSpaceMode under the existing registry transaction with exclusive safe temporary publication and current sharing retries; verify changed/no-op results and stable JSON refusal/exit codes for contention, IO and unexpected errors.
+- [x] 1.4 Cover another live owner, unknown owner, unowned and stale-owner homes with both terminal identity variables empty; verify success without Core calls, owner mutation or any other registry/task/rules change.
+- [x] 1.5 Preserve the owner positional setter/getter and all other ownership checks; verify non-owner positional sets, unrelated config writes and spawn/stop/finish/end still refuse in isolated homes.
+- [x] 1.6 Document the capability, setter JSON/exit codes, same-user filesystem authority, explicit-home validation and idempotency in docs/worker-spaces.md and the README overview; verify examples match focused CLI assertions.
 
 ## 2. Coordinator observation and ordered desktop integration
 

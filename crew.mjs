@@ -72,10 +72,16 @@ export const bashPath = p => { const s = slash(p); return /^[A-Za-z]:\//.test(s)
 const now = () => new Date().toISOString();
 
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } }
-function writeJson(file, value, { retrySharing = true } = {}) {
-  const tmp = `${file}.${process.pid}.tmp`;
+function writeJson(file, value, { retrySharing = true, exclusive = false } = {}) {
+  const tmp = `${file}.${exclusive ? randomUUID() : process.pid}.tmp`;
+  let created = !exclusive;
   try {
-    fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+    if (exclusive) {
+      const fd = fs.openSync(tmp, 'wx');
+      created = true;
+      try { fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`); }
+      finally { fs.closeSync(fd); }
+    } else fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
     const deadline = Date.now() + 1000;
     for (;;) {
       try { fs.renameSync(tmp, file); break; }
@@ -88,7 +94,7 @@ function writeJson(file, value, { retrySharing = true } = {}) {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(20, remaining));
       }
     }
-  } finally { fs.rmSync(tmp, { force: true }); }
+  } finally { if (created) fs.rmSync(tmp, { force: true }); }
 }
 function run(command, args, options = {}) {
   const r = spawnSync(command, args, { encoding: 'utf8', windowsHide: true, ...options });
@@ -194,8 +200,8 @@ function home() {
     : unpacked ? path.join(dir, '.worktrees') : path.join(CREW_DIR, '.worktrees', String(config.tag));
   return { dir, config, coordinator, tasks: path.join(dir, 'tasks'), worktrees, owner: path.join(dir, 'owner.json') };
 }
-function readRegistry(dir) {
-  const config = readJson(path.join(dir, 'crew.json'));
+function readRegistry(dir) { return validateRegistry(dir, readJson(path.join(dir, 'crew.json'))); }
+function validateRegistry(dir, config) {
   if (!config || config.version !== 1 || !config.projects || typeof config.projects !== 'object' || Array.isArray(config.projects)
       || Object.values(config.projects).some(p => !p || typeof p.path !== 'string' || !p.path)) {
     refuse(`Crew home ${slash(dir)} has an invalid version 1 registry (crew.json); nothing was changed.`);
@@ -208,6 +214,10 @@ function readRegistry(dir) {
 
 const WORKER_SPACE_MODES = ['combined', 'per-project'];
 function cmdConfig(args) {
+  // Local authority is deliberately confined to this key and these opt-in forms.
+  if (args[0] === 'worker-space' && args.some(a => ['--set-local', '--capabilities', '--home', '--json'].includes(a))) {
+    cmdLocalWorkerSpace(args.slice(1)); return;
+  }
   const [key, mode, ...extra] = args;
   if (key !== 'worker-space' || extra.length || (mode !== undefined && !WORKER_SPACE_MODES.includes(mode))) {
     refuse('Usage: crew config worker-space [combined|per-project]');
@@ -223,23 +233,124 @@ function cmdConfig(args) {
   if (mode === 'per-project') console.log('Connected project spaces and project names need compatible Herdr support; until installed, they may not appear connected under the coordinator.');
 }
 
+const LOCAL_WORKER_SPACE = { capability: 'worker-space-local-set', version: 1 };
+class LocalSettingRefusal extends Refusal {
+  constructor(reason, message, code = 2) { super(message, code); this.reason = reason; }
+}
+const localSettingRefuse = (reason, message, code) => { throw new LocalSettingRefusal(reason, message, code); };
+
+// No discovery, owner identity or Core calls. OS permissions are the authority;
+// this is a preference exception, not permission to control any work in the home.
+function localWorkerSpaceHome(target, identity) {
+  if (!target || !path.isAbsolute(target) || (WINDOWS && (!/^[A-Za-z]:[\\/]/.test(target) || /^[/\\]{2}/.test(target)))) {
+    localSettingRefuse('invalid-home', 'An absolute local coordinator home directory is required.');
+  }
+  let dir, stat;
+  try {
+    dir = fs.realpathSync(target);
+    stat = fs.lstatSync(dir);
+  } catch (error) {
+    if (error.code === 'ENOENT') localSettingRefuse('home-not-found', 'The explicit coordinator home does not exist.');
+    throw error;
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (WINDOWS && !/^[A-Za-z]:[\\/]/.test(dir))
+      || (identity && (comparablePath(dir) !== comparablePath(target) || stat.dev !== identity.dev || stat.ino !== identity.ino))) {
+    localSettingRefuse('invalid-home', 'The canonical coordinator home must be an unchanged local directory.');
+  }
+  for (const name of ['crew.json', 'tasks']) {
+    let entry;
+    try { entry = fs.lstatSync(path.join(dir, name)); }
+    catch (error) {
+      if (error.code === 'ENOENT') localSettingRefuse('home-not-initialized', 'The explicit directory is not an initialized coordinator home.');
+      throw error;
+    }
+    if (entry.isSymbolicLink() || (name === 'crew.json' ? !entry.isFile() || entry.nlink !== 1 : !entry.isDirectory())) {
+      localSettingRefuse('invalid-home', `The coordinator home's ${name} must not redirect outside its real home.`);
+    }
+  }
+  let config;
+  try { config = JSON.parse(fs.readFileSync(path.join(dir, 'crew.json'), 'utf8')); }
+  catch (error) {
+    if (error instanceof SyntaxError) localSettingRefuse('invalid-registry', 'The coordinator registry is not valid JSON.');
+    throw error;
+  }
+  try { validateRegistry(dir, config); }
+  catch (error) {
+    if (error instanceof Refusal) localSettingRefuse('invalid-registry', error.message);
+    throw error;
+  }
+  if (typeof config.tag !== 'string' || !config.tag.trim()) localSettingRefuse('invalid-registry', 'An initialized coordinator registry needs a nonempty string tag.');
+  return { dir, config, identity: stat };
+}
+
+function cmdLocalWorkerSpace(args) {
+  let h;
+  try {
+    const options = new Map();
+    for (let i = 0; i < args.length; i++) {
+      const key = args[i];
+      if (!['--set-local', '--home', '--json', '--capabilities'].includes(key) || options.has(key)) {
+        localSettingRefuse('invalid-arguments', 'Use --capabilities --json or --set-local MODE --home ABSOLUTE_HOME --json, without extra or repeated arguments.');
+      }
+      let value = true;
+      if (key === '--set-local' || key === '--home') {
+        value = args[++i];
+        if (!value || value.startsWith('--')) localSettingRefuse('invalid-arguments', `Missing value for ${key}.`);
+      }
+      options.set(key, value);
+    }
+    if (options.size === 2 && options.has('--capabilities') && options.has('--json')) {
+      console.log(JSON.stringify({ ...LOCAL_WORKER_SPACE, modes: WORKER_SPACE_MODES, explicitHome: true })); return;
+    }
+    if (options.size !== 3 || !options.has('--set-local') || !options.has('--home') || !options.has('--json')) {
+      localSettingRefuse('invalid-arguments', 'The local setter requires --set-local MODE --home ABSOLUTE_HOME --json.');
+    }
+    const mode = options.get('--set-local');
+    if (!WORKER_SPACE_MODES.includes(mode)) localSettingRefuse('invalid-mode', 'worker-space mode must be combined or per-project.');
+    h = localWorkerSpaceHome(options.get('--home'));
+    const changed = withRegistry(h, () => {
+      if ((h.config.workerSpaceMode ?? 'combined') === mode) return false;
+      h.config.workerSpaceMode = mode;
+      writeJson(path.join(h.dir, 'crew.json'), h.config, { exclusive: true });
+      return true;
+    }, {
+      read: () => localWorkerSpaceHome(h.dir, h.identity).config,
+      lockError: (error, busy) => localSettingRefuse(busy ? 'registry-busy' : 'io-error',
+        busy ? `Coordinator registry is busy at ${slash(path.join(h.dir, 'projects.lock'))}; retry without removing another writer's lock.` : `Cannot lock coordinator registry: ${error.code}.`, busy ? 3 : 4),
+    });
+    console.log(JSON.stringify({ ...LOCAL_WORKER_SPACE, ok: true, home: slash(h.dir), mode, changed }));
+  } catch (error) {
+    const reason = error instanceof LocalSettingRefusal ? error.reason : typeof error.code === 'string' ? 'io-error' : 'internal-error';
+    process.exitCode = error instanceof LocalSettingRefusal ? error.exitCode : reason === 'io-error' ? 4 : 70;
+    // Never send a local-setting failure to recordCrash's ambient/default home.
+    console.log(JSON.stringify({ ...LOCAL_WORKER_SPACE, ok: false, home: h ? slash(h.dir) : null, mode: null, changed: false,
+      error: { code: reason, message: error.message || String(error) } }));
+  }
+}
+
 // Atomic rename alone cannot serialize read-modify-write or protect task admission.
 // All registry writers and the first task record share this short critical section.
 // Never steal a lock on age/PID guesses: an abandoned lock needs deliberate recovery.
-function withRegistry(h, action) {
+function withRegistry(h, action, { read = readRegistry, lockError } = {}) {
   const lock = path.join(h.dir, 'projects.lock'), deadline = Date.now() + 2000;
   let fd;
   for (;;) {
     try { fd = fs.openSync(lock, 'wx'); break; }
     catch (error) {
-      if (error.code !== 'EEXIST') refuse(`Crew home ${slash(h.dir)}: could not lock its project registry (${error.code}). Nothing was changed.`);
-      if (Date.now() >= deadline) refuse(`Crew home ${slash(h.dir)}: project registry is locked at ${slash(lock)} (PID ${readJson(lock)?.pid ?? 'unknown'}). Retry; if abandoned, remove that lock only after confirming no process is using it. Nothing was changed.`, 3);
+      if (error.code !== 'EEXIST') {
+        if (lockError) lockError(error, false);
+        refuse(`Crew home ${slash(h.dir)}: could not lock its project registry (${error.code}). Nothing was changed.`);
+      }
+      if (Date.now() >= deadline) {
+        if (lockError) lockError(error, true);
+        refuse(`Crew home ${slash(h.dir)}: project registry is locked at ${slash(lock)} (PID ${readJson(lock)?.pid ?? 'unknown'}). Retry; if abandoned, remove that lock only after confirming no process is using it. Nothing was changed.`, 3);
+      }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
     }
   }
   try {
     fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token: randomUUID() }));
-    h.config = readRegistry(h.dir); // never write a snapshot read before taking the lock
+    h.config = read(h.dir); // never write a snapshot read before taking the lock
     return action();
   } finally {
     fs.closeSync(fd);
@@ -3223,6 +3334,8 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
   crew config worker-space [combined|per-project]   show/change new-task grouping (default combined)
+  crew config worker-space --capabilities --json   discover worker-space-local-set v1 (no home needed)
+  crew config worker-space --set-local <mode> --home <absolute-home> --json   local worker-space-only preference; no ownership needed
       existing workers never move; reviews and replacements inherit their task's space; connected project names need compatible Herdr
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
       who: ${PICK_USAGE}
@@ -3272,7 +3385,8 @@ export function main(argv) {
   if (name === '--version') { console.log(VERSION); return; }
   const command = COMMANDS[name];
   // `crew <command> --help` is a question, never an id or a task text.
-  if (command && name !== 'backlog' && args.some(a => a === '--help' || a === '-h')) { console.log(USAGE); return; }
+  const localConfig = name === 'config' && args[0] === 'worker-space' && args.some(a => ['--set-local', '--capabilities', '--home', '--json'].includes(a));
+  if (command && name !== 'backlog' && !localConfig && args.some(a => a === '--help' || a === '-h')) { console.log(USAGE); return; }
   if (!command) { console.log(USAGE); process.exitCode = name && name !== '--help' && name !== 'help' ? 2 : 0; return; }
   try { command(args); } catch (error) {
     if (error instanceof Refusal) {

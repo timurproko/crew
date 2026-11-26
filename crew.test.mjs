@@ -926,6 +926,154 @@ gapTests['worker-spaces'] = async () => {
   } finally { fs.writeFileSync(world, before); }
 };
 
+gapTests['worker-space-local-setter'] = async () => {
+  const beforeWorld = fs.readFileSync(world, 'utf8');
+  try {
+    const f = gapFixture('local-space'), registry = path.join(f.home, 'crew.json'), owner = path.join(f.home, 'owner.json');
+    const read = () => JSON.parse(fs.readFileSync(registry, 'utf8'));
+    const ambient = path.join(f.dir, 'ambient'); assert.equal(f.call(['init', ambient]).code, 0);
+    const ambientBefore = fs.readFileSync(path.join(ambient, 'crew.json'), 'utf8');
+    const call = (args, { script = path.join(here, 'crew.mjs'), env = {} } = {}) => {
+      const r = spawnSync(process.execPath, [script, 'config', 'worker-space', ...args], { cwd: ambient, encoding: 'utf8', env: {
+        ...process.env, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HOME: ambient, CREW_HC: fake,
+        CREW_TERMINAL: '', HC_TERMINAL_ID: '', ...env,
+      } });
+      assert.equal(r.stderr, '', r.stderr);
+      const value = JSON.parse(r.stdout); assert.equal(r.stdout.trim().split('\n').length, 1);
+      assert.equal(value.capability, 'worker-space-local-set'); assert.equal(value.version, 1);
+      return { code: r.status, value };
+    };
+    const args = (mode = 'per-project', home = f.home) => ['--set-local', mode, '--home', home, '--json'];
+    const success = (mode, changed, options) => {
+      const r = call(args(mode), options); assert.equal(r.code, 0, JSON.stringify(r.value));
+      assert.deepEqual(r.value, { capability: 'worker-space-local-set', version: 1, ok: true,
+        home: slash(fs.realpathSync(f.home)), mode, changed });
+    };
+    const failure = (tail, code, reason, options) => {
+      const before = fs.readFileSync(registry, 'utf8'), r = call(tail, options);
+      assert.equal(r.code, code, JSON.stringify(r.value)); assert.equal(r.value.ok, false);
+      assert.equal(r.value.mode, null); assert.equal(r.value.changed, false); assert.equal(r.value.error.code, reason);
+      assert.ok(r.value.error.message); assert.equal(fs.readFileSync(registry, 'utf8'), before);
+      return r.value;
+    };
+    const probeFiles = fs.readdirSync(ambient), logBefore = readWorld().log.length;
+    assert.deepEqual(call(['--capabilities', '--json'], { env: { CREW_HOME: path.join(f.dir, 'missing'), CREW_HC: path.join(f.dir, 'no-core') } }), {
+      code: 0, value: { capability: 'worker-space-local-set', version: 1, modes: ['combined', 'per-project'], explicitHome: true },
+    });
+    assert.deepEqual(fs.readdirSync(ambient), probeFiles);
+    assert.match(f.call(['--help']).out, /worker-space-local-set v1/);
+    fs.writeFileSync(registry, JSON.stringify({ ...read(), future: { nested: ['kept', 1] } }));
+    const baseline = read(), bytes = fs.readFileSync(registry, 'utf8');
+    const task = f.spawn('existing', ['--agent', 'pi']);
+    const untouched = [owner, path.join(f.home, 'tasks', task.id, 'task.json'), path.join(f.home, 'coordinator', 'AGENTS.md')];
+    const snapshots = untouched.map(file => fs.readFileSync(file, 'utf8'));
+    const coreBefore = fs.readFileSync(world, 'utf8');
+    success('combined', false); assert.equal(fs.readFileSync(registry, 'utf8'), bytes, 'Default combined does not materialize the setting');
+    success('per-project', true); success('per-project', false); success('combined', true);
+    for (const [i, file] of untouched.entries()) assert.equal(fs.readFileSync(file, 'utf8'), snapshots[i]);
+    const { workerSpaceMode, ...rest } = read(); assert.deepEqual(rest, baseline);
+    assert.equal(fs.readFileSync(world, 'utf8'), coreBefore, 'Live-owner local calls never query/mutate Core');
+    for (const state of ['unknown', 'unowned', 'stale']) {
+      if (state === 'unknown') { const w = readWorld(); w.silent = true; fs.writeFileSync(world, JSON.stringify(w)); }
+      if (state === 'unowned') fs.unlinkSync(owner);
+      if (state === 'stale') fs.writeFileSync(owner, JSON.stringify({ terminal: 'missing-owner', future: 5 }));
+      const ownerBefore = fs.existsSync(owner) ? fs.readFileSync(owner, 'utf8') : null, core = fs.readFileSync(world, 'utf8');
+      success('per-project', true); success('combined', true);
+      assert.equal(fs.existsSync(owner) ? fs.readFileSync(owner, 'utf8') : null, ownerBefore);
+      assert.equal(fs.readFileSync(world, 'utf8'), core, state);
+    }
+    fs.writeFileSync(owner, snapshots[0]);
+    const w = readWorld(); delete w.silent; fs.writeFileSync(world, JSON.stringify(w));
+    for (const tail of [
+      ['--set-local'], ['--set-local', ''], ['--set-local', 'combined'], ['--home', f.home, '--json'],
+      ['--set-local', 'combined', '--home', f.home], [...args(), '--json'], [...args(), '--home', f.home],
+      [...args(), '--extra'], [...args(), '--help'], ['combined', ...args()], ['--capabilities'],
+      ['--capabilities', '--json', '--home', f.home], ['--json'],
+    ]) failure(tail, 2, 'invalid-arguments');
+    for (const mode of ['bad', 'Combined', 'null', '../combined']) failure(args(mode), 2, 'invalid-mode');
+    const missing = path.join(f.dir, 'missing', 'home');
+    assert.equal(failure(args('combined', missing), 2, 'home-not-found').home, null); assert.ok(!fs.existsSync(path.dirname(missing)));
+    for (const target of [f.repo, ambient + '/..']) failure(args('combined', target), 2, 'home-not-initialized');
+    for (const target of ['.', 'C:relative', registry, ...(WINDOWS ? ['\\\\server\\share', '\\\\?\\C:\\home', '/rooted'] : [])]) failure(args('combined', target), 2, 'invalid-home');
+    for (const bad of ['{broken', JSON.stringify({ ...read(), tag: '' }), JSON.stringify({ ...read(), projects: [] }),
+      JSON.stringify({ ...read(), workerSpaceMode: 'bad' }), JSON.stringify({ ...read(), version: 2 })]) {
+      const good = fs.readFileSync(registry, 'utf8'); fs.writeFileSync(registry, bad);
+      failure(args(), 2, 'invalid-registry'); fs.writeFileSync(registry, good);
+    }
+    const outside = path.join(f.dir, 'outside.json'); fs.copyFileSync(registry, outside);
+    const outsideBefore = fs.readFileSync(outside, 'utf8'), good = fs.readFileSync(registry, 'utf8');
+    fs.unlinkSync(registry); fs.linkSync(outside, registry);
+    failure(args(), 2, 'invalid-home'); fs.unlinkSync(registry); fs.writeFileSync(registry, good);
+    // Junctions are available without Windows symlink privileges; file symlinks may not be.
+    try {
+      fs.unlinkSync(registry); fs.symlinkSync(outside, registry, 'file');
+      failure(args(), 2, 'invalid-home');
+    } catch (error) { if (!WINDOWS || !['EPERM', 'EACCES'].includes(error.code)) throw error; }
+    finally { fs.rmSync(registry, { force: true }); fs.writeFileSync(registry, good); }
+    assert.equal(fs.readFileSync(outside, 'utf8'), outsideBefore);
+    const tasks = path.join(f.home, 'tasks'), savedTasks = path.join(f.home, 'tasks-saved');
+    fs.renameSync(tasks, savedTasks); fs.symlinkSync(savedTasks, tasks, WINDOWS ? 'junction' : 'dir');
+    failure(args(), 2, 'invalid-home'); fs.unlinkSync(tasks); fs.renameSync(savedTasks, tasks);
+    const alias = path.join(f.dir, 'home-alias'); fs.symlinkSync(f.home, alias, WINDOWS ? 'junction' : 'dir');
+    const aliasResult = call(args('per-project', alias)); assert.equal(aliasResult.code, 0); assert.equal(aliasResult.value.home, slash(fs.realpathSync(f.home)));
+    for (const verb of ['spawn', 'stop', 'finish', 'end']) assert.equal(crew([verb, ...(verb === 'end' ? [] : ['existing'])], { cwd: f.home }).code, 3);
+    assert.equal(crew(['config', 'worker-space', 'combined'], { cwd: f.home }).code, 3);
+    assert.equal(crew(['config', 'something-else', ...args()], { cwd: f.home }).code, 2);
+    assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
+    assert.match(crew(['config', 'worker-space'], { cwd: f.home }).out, /worker-space: combined/);
+    const lock = path.join(f.home, 'projects.lock'); fs.writeFileSync(lock, 'held');
+    failure(args(), 3, 'registry-busy'); assert.equal(fs.readFileSync(lock, 'utf8'), 'held'); fs.unlinkSync(lock);
+    // Fault injection wraps real main/fs only in disposable fixture processes.
+    for (const [label, patch, code, reason] of [
+      ['lock-io', "const original = fs.openSync; fs.openSync = (file, ...rest) => { if (String(file).endsWith('projects.lock')) throw Object.assign(Error('denied'), {code:'EACCES'}); return original(file, ...rest); };", 4, 'io-error'],
+      ['read-io', "const original = fs.readFileSync; fs.readFileSync = (file, ...rest) => { if (String(file).endsWith('crew.json')) throw Object.assign(Error('denied'), {code:'EACCES'}); return original(file, ...rest); };", 4, 'io-error'],
+      ['publish-io', "fs.renameSync = () => { throw Object.assign(Error('full'), {code:'ENOSPC'}); };", 4, 'io-error'],
+      ['publish-defect', "fs.renameSync = () => { throw TypeError('injected defect'); };", 70, 'internal-error'],
+      ['temp-collision', "const original = fs.openSync; fs.openSync = (file, ...rest) => { if (String(file).endsWith('.tmp')) { fs.writeFileSync(file, 'foreign'); throw Object.assign(Error('collision'), {code:'EEXIST'}); } return original(file, ...rest); };", 4, 'io-error'],
+    ]) {
+      const script = path.join(f.dir, `${label}.mjs`);
+      fs.writeFileSync(script, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}; ${patch} main(process.argv.slice(2));`);
+      failure(args(), code, reason, { script }); assert.ok(!fs.existsSync(lock));
+      const temps = fs.readdirSync(f.home).filter(n => n.endsWith('.tmp'));
+      if (label === 'temp-collision') {
+        assert.equal(temps.length, 1); assert.equal(fs.readFileSync(path.join(f.home, temps[0]), 'utf8'), 'foreign'); fs.unlinkSync(path.join(f.home, temps[0]));
+      } else assert.deepEqual(temps, []);
+      assert.ok(!fs.existsSync(path.join(ambient, 'state', 'crashes')));
+    }
+    for (const persistent of [false, true]) {
+      const script = path.join(f.dir, `sharing-${persistent}.mjs`), evidence = path.join(f.dir, `sharing-${persistent}.json`);
+      fs.writeFileSync(script, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const original = fs.renameSync, clock = Date.now, attempts = [];
+fs.renameSync = (from, to) => {
+  attempts.push({from, registry:fs.readFileSync(to, 'utf8'), temp:fs.readFileSync(from, 'utf8'), lock:fs.readFileSync(${JSON.stringify(lock)}, 'utf8')});
+  fs.writeFileSync(${JSON.stringify(evidence)}, JSON.stringify(attempts));
+  if (${persistent} || attempts.length < 4) {
+    if (${persistent} && attempts.length === 2) Date.now = () => clock() + 10000;
+    throw Object.assign(Error('sharing'), {code:['EPERM','EACCES','EBUSY'][(attempts.length - 1) % 3]});
+  }
+  return original(from, to);
+}; main(process.argv.slice(2));`);
+      const before = fs.readFileSync(registry, 'utf8'), r = call(args(), { script });
+      assert.equal(r.code, WINDOWS && !persistent ? 0 : 4);
+      if (r.code) { assert.equal(r.value.error.code, 'io-error'); assert.equal(fs.readFileSync(registry, 'utf8'), before); }
+      const attempts = JSON.parse(fs.readFileSync(evidence, 'utf8'));
+      assert.equal(attempts.length, WINDOWS ? persistent ? 2 : 4 : 1);
+      for (const attempt of attempts) {
+        assert.equal(attempt.registry, before); assert.equal(attempt.from, attempts[0].from);
+        assert.equal(attempt.temp, attempts[0].temp); assert.equal(attempt.lock, attempts[0].lock);
+        assert.ok(JSON.parse(attempt.lock).token);
+      }
+      assert.ok(!fs.existsSync(lock)); assert.ok(!fs.readdirSync(f.home).some(n => n.endsWith('.tmp')));
+      assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
+    }
+    // Old initialized layouts do not need coordinator/ or a migration.
+    const rules = path.join(f.home, 'coordinator'), savedRules = path.join(f.home, 'rules-saved');
+    fs.renameSync(rules, savedRules); success('per-project', true); fs.renameSync(savedRules, rules);
+    assert.equal(fs.readFileSync(path.join(ambient, 'crew.json'), 'utf8'), ambientBefore);
+    assert.ok(readWorld().log.length >= logBefore);
+  } finally { fs.writeFileSync(world, beforeWorld); }
+};
+
 gapTests['registry-sharing'] = async () => {
   const f = gapFixture('registry-sharing'), registry = path.join(f.home, 'crew.json'), lock = path.join(f.home, 'projects.lock');
   const cases = [

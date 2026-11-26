@@ -26,6 +26,103 @@ after reservation does not, even if its terminal starts physically after the set
 command returns. Slow external operations do not hold the registry lock. Switching never
 moves, relabels or reorders already-spawned workers or creates/removes any space.
 
+## Desktop/local setter contract, version 1
+
+A desktop process running as the same local user may set **only** worker-space mode
+without the coordinator's terminal identity. This works for a home owned by another live
+session, with unknown owner liveness, or with no owner. It never queries Core, starts or
+ends a session, takes over ownership, edits projects or controls tasks. The ordinary
+positional setter above remains owner-only. Authority is the caller's existing OS file
+permissions, not a secret token or elevated helper; it is not a security boundary against
+another process already able to edit this user's files.
+
+### Discover support before writing
+
+Run on the machine whose Crew installation will perform the write:
+
+```text
+crew config worker-space --capabilities --json
+```
+
+Exit 0 returns one stdout JSON object, without finding a home or writing files:
+
+```json
+{"capability":"worker-space-local-set","version":1,"modes":["combined","per-project"],"explicitHome":true}
+```
+
+Require exit 0, valid JSON, this capability/version, both modes and `explicitHome: true`.
+Help also advertises `worker-space-local-set v1`, but a help match or release number alone
+is not sufficient. Older Crew refuses the probe; plain text, missing markers and unsupported
+versions do not authorize a write. Transport failure or timeout is unavailable, not proof
+of an unsupported binary. Never fall back to spoofed `CREW_TERMINAL`/`HC_TERMINAL_ID`, direct
+registry edits, `start`, `end`, takeover, automatic init/update or lock manipulation.
+
+### Set one explicit existing home
+
+```text
+crew config worker-space --set-local per-project --home "C:/Users/me/.crew" --json
+crew config worker-space --set-local combined --home "/home/me/.crew" --json
+```
+
+Supply each option exactly once, with separate values; option order is immaterial.
+Only `combined` and `per-project` are accepted, case-sensitively. Extra/unknown options,
+duplicates, missing/empty values and mixing a positional mode with the local form refuse.
+`--home` is confined to this interface, not a global option or permission for other commands.
+
+The path must be an existing absolute local directory. Cwd, `CREW_HOME`, default and legacy
+home discovery never substitute for it. Relative/drive-relative paths, files and Windows
+UNC/device paths refuse. Directory aliases are canonicalized and the real target must be
+an initialized home: valid version-1 `crew.json`, nonempty string tag, valid projects/mode
+and a real `tasks` directory. Existing legacy layouts qualify without migration.
+`crew.json` must be a regular, non-symlink, non-hard-linked file; `tasks` cannot be a
+symlink/junction. Missing/uninitialized/invalid homes are never created or repaired.
+
+The transaction rechecks canonical home identity, structure and registry under the existing
+`projects.lock`. Only `workerSpaceMode` may change; projects and unknown metadata are
+preserved semantically and owner/task/rules files are untouched. Publication uses an
+exclusive random temporary sibling and atomic replacement with the normal Windows sharing
+retries. No directory or unrelated file is created; normal completion removes only this
+call's transient lock/temp. Locks are never stolen. These checks prevent accidental path
+redirection, not malicious same-user filesystem swaps between individual OS calls.
+
+### Results and refusals
+
+Changed success (exit 0):
+
+```json
+{"capability":"worker-space-local-set","version":1,"ok":true,"home":"C:/Users/me/.crew","mode":"per-project","changed":true}
+```
+
+`home` is canonical and slash-normalized; `mode` is effective at the transaction's ordering
+point, not a promise that another writer cannot change it later. A matching effective mode
+returns `changed: false` without rewriting the registry. In particular, absent mode already
+means combined; requesting combined need not materialize the key. Repeated calls are safe.
+
+Refusal, for example a missing home (exit 2):
+
+```json
+{"capability":"worker-space-local-set","version":1,"ok":false,"home":null,"mode":null,"changed":false,"error":{"code":"home-not-found","message":"The explicit coordinator home does not exist."}}
+```
+
+Recognized local invocations return one stdout JSON object even for malformed arguments
+or missing `--json`. Before complete home validation `home` is null, afterward it is the
+canonical target. Refusals always use `mode: null` and never claim a verified effective mode.
+Messages are explanatory; parse stable codes, not prose. Optional stderr is diagnostic only.
+
+| Exit | Error code | Meaning |
+| --- | --- | --- |
+| 0 | none | Capability reply or successful changed/no-op setting. |
+| 2 | `invalid-arguments`, `invalid-mode` | Wrong invocation or unsupported value. |
+| 2 | `home-not-found`, `home-not-initialized`, `invalid-home`, `invalid-registry` | Absent, uninitialized, unsafe or malformed explicit target. |
+| 3 | `registry-busy` | Two-second lock wait exhausted; retry without stealing/removing another writer's lock. |
+| 4 | `io-error` | Permission, read, lock-open or publication failure. |
+| 70 | `internal-error` | Unexpected defect, not success. |
+
+Failures never write crash state to an ambient/default home. Publication/cleanup failures
+can be ambiguous if replacement completed before the failure: retain the refusal and safely
+repeat the idempotent command instead of inventing success. No failure authorizes ownership
+or initialization. Registry version stays 1; no migration is required.
+
 ## Identity and companion contract, version 1
 
 Crew launches terminals with opaque labels. Herdr adopts them into native spaces; Crew
