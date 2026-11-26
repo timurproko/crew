@@ -89,13 +89,26 @@ import fs from 'node:fs';
 const file = ${JSON.stringify(world)}, w = JSON.parse(fs.readFileSync(file, 'utf8')), a = process.argv.slice(2);
 // Polling tests read concurrently: publish complete fake-Core worlds atomically.
 w.log.push(a); const save = () => { const temp = file + '.' + process.pid; fs.writeFileSync(temp, JSON.stringify(w)); fs.renameSync(temp, file); };
+// Optional adoption model for placement tests only; it is not native Herdr evidence.
+const adopt = (address, labels) => {
+  if (!w.spaces) return;
+  const id = labels['herdr.space']; if (!id) return;
+  w.spaces[id] ??= { id, name: labels['crew.space.name'] ?? '', automatic: /^fm-[A-Za-z0-9._-]+$/.test(id), members: [] };
+  w.spaces[id].members.push(address); w.terminals[address].space = id;
+};
+const forget = address => {
+  const id = w.terminals[address]?.space, space = w.spaces?.[id];
+  if (!space) return;
+  space.members = space.members.filter(m => m !== address);
+  if (!space.members.length && space.automatic) delete w.spaces[id];
+};
 if (a[0] === 'run') { const address = 't' + (++w.seq); const labels = {}; a.forEach((v, i) => { if (v === '--label') { const [k, ...r] = a[i + 1].split('='); labels[k] = r.join('='); } });
-  w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; save(); console.log(JSON.stringify({ address })); }
+  w.terminals[address] = { address, state: 'live', labels, status: null, cwd: a[a.indexOf('--cwd') + 1] }; adopt(address, labels); save(); console.log(JSON.stringify({ address })); }
 else if (a[0] === 'get' && w.silent) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'kill' && w.unkillable) { save(); }
 else if (a[0] === 'get') { const t = w.terminals[a.at(-1)]; if (t?.steps?.length) Object.assign(t, t.steps.shift()); save(); if (!t) { console.error(JSON.stringify({ error: { kind: 'not_found' } })); process.exit(3); } console.log(JSON.stringify(t)); }
 else if (a[0] === 'kill') { const t = w.terminals[a.at(-1)]; if (t) t.state = 'finished'; if (w.writeOnKill) fs.writeFileSync(w.writeOnKill, 'written while stopping'); if (w.silentAfterKill) w.silent = true; save(); }
-else if (a[0] === 'rm') { if (!w.failRm) delete w.terminals[a.at(-1)]; if (w.silentLsAfterRm) w.silentLs = true; if (w.silentAfterRm) w.silent = true; save(); }
+else if (a[0] === 'rm') { if (!w.failRm) { forget(a.at(-1)); delete w.terminals[a.at(-1)]; } if (w.silentLsAfterRm) w.silentLs = true; if (w.silentAfterRm) w.silent = true; save(); }
 else if (a[0] === 'ls' && w.silentLs) { save(); console.error('Core transport unavailable'); process.exit(1); }
 else if (a[0] === 'ls') { save(); console.log(JSON.stringify({ terminals: Object.values(w.terminals).map(t => ({ address: t.address, agent: t.agent ?? null, cwd: t.cwd, state: t.state })) })); }
 else if (a[0] === 'read') { save(); process.stdout.write(w.terminals[a[1]]?.screen ?? ''); }
@@ -643,6 +656,276 @@ fs[method] = function(file, ...args) {
 }; main(process.argv.slice(2));`);
   return { ready, release, script };
 }
+async function workerSpaceConfigTests() {
+  const f = gapFixture('space-config'), file = path.join(f.home, 'crew.json');
+  const read = () => JSON.parse(fs.readFileSync(file, 'utf8'));
+  fs.writeFileSync(file, JSON.stringify({ ...read(), future: { kept: true } }));
+  const inspect = args => crew(args, { cwd: f.home });
+  assert.match(inspect(['config', 'worker-space']).out, /worker-space: combined/);
+  assert.equal(inspect(['config', 'worker-space', 'per-project']).code, 3);
+  for (const args of [['worker-space', 'bad'], ['worker-space', 'combined', 'extra'], ['unknown'], []]) {
+    const before = fs.readFileSync(file, 'utf8');
+    const r = f.call(['config', ...args]); assert.equal(r.code, 2, r.out);
+    assert.equal(fs.readFileSync(file, 'utf8'), before);
+  }
+  const before = readWorld().log.length;
+  for (const mode of ['per-project', 'combined']) {
+    const r = f.call(['config', 'worker-space', mode]); assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /new task admissions only; existing workers never move/);
+    assert.equal(read().workerSpaceMode, mode);
+    assert.match(inspect(['config', 'worker-space']).out, new RegExp(`worker-space: ${mode}`));
+  }
+  assert.ok(readWorld().log.slice(before).every(c => c[0] === 'get'), 'Settings only query ownership, never mutate Core');
+  assert.ok(read().projects.demo); assert.deepEqual(read().future, { kept: true });
+  assert.match(f.call(['--help']).out, /config worker-space \[combined\|per-project\]/);
+  for (const mode of [null, false, 1, {}, [], 'unknown']) {
+    fs.writeFileSync(file, JSON.stringify({ ...read(), workerSpaceMode: mode }));
+    const r = inspect(['config', 'worker-space']); assert.equal(r.code, 2, r.out); assert.match(r.out, /workerSpaceMode must be/);
+  }
+  fs.writeFileSync(file, JSON.stringify({ ...read(), workerSpaceMode: 'combined' }));
+  // A setting writer rereads rather than replacing a concurrent registration.
+  const stale = projectBarrier(f, 'before', 'config-stale');
+  const writer = projectProcess(f, ['config', 'worker-space', 'per-project'], { script: stale.script, terminal: 'owner-space-config' });
+  try {
+    await until(() => fs.existsSync(stale.ready));
+    assert.equal(inspect(['project', 'add', 'extra', f.repo]).code, 0);
+    fs.writeFileSync(stale.release, 'go'); const r = await writer.result; assert.equal(r.code, 0, r.out);
+    assert.ok(read().projects.extra); assert.equal(read().workerSpaceMode, 'per-project'); assert.deepEqual(read().future, { kept: true });
+  } finally { fs.writeFileSync(stale.release, 'go'); await writer.result; }
+  for (const phase of ['before', 'after']) {
+    const g = gapFixture(`space-admission-${phase}`), gate = projectBarrier(g, phase);
+    const pending = projectProcess(g, ['spawn', 'race', '--project', 'demo', '--agent', 'pi', 'Count.'], { script: gate.script, terminal: `owner-space-admission-${phase}` });
+    try {
+      await until(() => fs.existsSync(gate.ready));
+      assert.equal(g.call(['config', 'worker-space', 'per-project']).code, 0);
+      assert.equal(g.call(['project', 'add', 'concurrent', g.repo]).code, 0);
+      fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
+      const t = g.task('race'), mode = phase === 'before' ? 'per-project' : 'combined';
+      assert.equal(t.workerSpace.mode, mode);
+      assert.equal(readWorld().terminals[t.terminal].labels['crew.space.mode'], mode);
+      assert.ok(JSON.parse(fs.readFileSync(path.join(g.home, 'crew.json'), 'utf8')).projects.concurrent);
+    } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+  }
+}
+function workerSpaceFixture(name) {
+  const noGh = path.join(root, 'space-no-gh.mjs'); fs.writeFileSync(noGh, 'process.exit(1);');
+  const env = { CREW_GH: noGh, CREW_AGENT_PATH: '', CREW_NO_QUOTA: '1', CREW_RECOVERY_SECONDS: '0' };
+  const f = gapFixture(`spaces-${name}`, env), call = (args, more = {}) => f.call(args, more);
+  const add = (name, repo = f.repo) => { const r = call(['project', 'add', name, repo]); assert.equal(r.code, 0, r.out); };
+  const spawn = (id, project = 'demo', flags = []) => {
+    const r = call(['spawn', id, '--project', project, '--agent', 'pi', '--model', 'first', ...flags, 'Count.']);
+    assert.equal(r.code, 0, r.out); return f.task(id);
+  };
+  const done = t => {
+    fs.writeFileSync(t.report, 'Complete.');
+    const r = crew(['done', t.id], { cwd: f.home, terminal: t.terminal, env }); assert.equal(r.code, 0, r.out);
+  };
+  const mode = value => { const r = call(['config', 'worker-space', value]); assert.equal(r.code, 0, r.out); };
+  const labels = t => readWorld().terminals[f.task(t.id).terminal].labels;
+  const space = t => labels(t)['herdr.space'];
+  return { ...f, call, add, spawn, done, mode, labels, space, env };
+}
+function workerSpacePlacementTests() {
+  const f = workerSpaceFixture('placement'); f.add('other'); f.add('.xrbuild'); f.add('agentnumberone.dev');
+  const tag = JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8')).tag, combined = `fm-crew-${tag}`;
+  const a = f.spawn('old-a'), b = f.spawn('old-b', 'other');
+  assert.equal(f.space(a), combined); assert.equal(f.space(b), combined);
+  assert.equal(f.labels(a)['crew.space.name'], undefined, 'Combined title stays directory-derived');
+  const old = structuredClone(readWorld().terminals[a.terminal]);
+  const n = readWorld().log.length; f.mode('per-project');
+  const fresh = f.spawn('new-a'), other = f.spawn('new-b', 'other'), again = f.spawn('again');
+  assert.equal(f.space(fresh), `${combined}-project-demo`); assert.notEqual(f.space(fresh), f.space(other));
+  assert.equal(f.space(again), f.space(fresh)); assert.equal(f.labels(fresh)['crew.space.name'], 'demo');
+  for (const project of ['.xrbuild', 'agentnumberone.dev']) {
+    const t = f.spawn(project.startsWith('.') ? 'dot' : 'domain', project);
+    assert.equal(f.space(t), `${combined}-project-${project}`); assert.equal(f.labels(t)['crew.space.name'], project);
+    assert.equal(f.labels(t)['crew.home'], tag); assert.equal(f.labels(t)['crew.space.project'], project);
+  }
+  assert.deepEqual(readWorld().terminals[a.terminal], old);
+  f.add('not-yet'); f.mode('combined');
+  assert.equal(f.space(f.spawn('combined-existing')), combined);
+  assert.equal(f.space(f.spawn('combined-new', 'not-yet')), combined);
+  f.mode('per-project'); assert.equal(f.space(f.spawn('return-a')), f.space(fresh));
+  assert.deepEqual(readWorld().terminals[a.terminal], old);
+  assert.ok(!readWorld().log.slice(n).some(c => /label|move|space|doc/.test(c[0])), 'No regrouping operations');
+  const otherHome = workerSpaceFixture('other-home'); otherHome.mode('per-project');
+  assert.notEqual(otherHome.space(otherHome.spawn('same-project')), f.space(fresh));
+  // Fake delivery puts a dotted project's worker in an arbitrary pool directory.
+  const pooled = path.join(f.dir, 'pooled'), delivery = path.join(f.dir, 'delivery.mjs');
+  fs.mkdirSync(pooled); fs.writeFileSync(delivery, `console.log(JSON.stringify({path:${JSON.stringify(pooled)},created:true,pooled:true}));`);
+  const r = f.call(['spawn', 'pool-dot', '--project', '.xrbuild', '--agent', 'pi', 'Count.'], { CREW_TOOL_DELIVERY: delivery });
+  assert.equal(r.code, 0, r.out); assert.equal(f.task('pool-dot').worktree, slash(pooled));
+  assert.equal(f.labels(f.task('pool-dot'))['crew.space.name'], '.xrbuild');
+}
+function workerSpaceInheritanceTests() {
+  for (const initial of ['combined', 'per-project']) {
+    const f = workerSpaceFixture(`inherit-${initial}`); f.mode(initial);
+    const manual = f.spawn('manual', 'demo', ['--kind', 'ship']), automatic = f.spawn('auto');
+    const reviewSource = f.spawn('review-source', 'demo', ['--kind', 'ship']); f.done(reviewSource);
+    const oldSpace = f.space(manual), untouched = structuredClone(readWorld().terminals[reviewSource.terminal]);
+    f.mode(initial === 'combined' ? 'per-project' : 'combined');
+    let r = f.call(['review', 'review-source', '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+    assert.equal(f.space(f.task('review-source-review')), oldSpace);
+    r = f.call(['relaunch', 'manual', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+    assert.equal(f.space(manual), oldSpace); assert.equal(f.task('manual').terminals.length, 2);
+    const current = f.task('auto');
+    f.save({ ...current, chain: [{ harness: 'pi', model: 'second' }], candidates: [{ harness: 'pi', model: 'first' }, { harness: 'pi', model: 'second' }] });
+    setTerminal(current.terminal, { status: { app: 'pi', state: 'idle' }, screen: 'quota exhausted' });
+    r = f.call(['wait', 'auto', '--timeout', '0.2']); assert.equal(r.code, 124, r.out);
+    assert.notEqual(f.task('auto').terminal, current.terminal, r.out); assert.equal(f.space(automatic), oldSpace);
+    assert.deepEqual(readWorld().terminals[reviewSource.terminal], untouched);
+  }
+  const f = workerSpaceFixture('legacy');
+  const t = f.spawn('legacy', 'demo', ['--kind', 'ship']), bad = f.spawn('bad', 'demo', ['--kind', 'ship']);
+  const { workerSpace, ...legacy } = t; f.save(legacy);
+  f.mode('per-project'); f.done(t);
+  let r = f.call(['review', 'legacy', '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(f.task('legacy-review')), workerSpace.id); assert.equal(f.task('legacy').workerSpace, undefined, 'No bulk rewrite');
+  // Tell reopens the old worker, then a manual replacement persists combined placement.
+  r = f.call(['tell', 'legacy', 'Continue.']); assert.equal(r.code, 0, r.out);
+  r = f.call(['relaunch', 'legacy', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(t), workerSpace.id); assert.deepEqual(f.task('legacy').workerSpace, workerSpace);
+  for (const invalid of [null, { ...bad.workerSpace, version: 2 }, { ...bad.workerSpace, id: 'personal' }, { ...bad.workerSpace, project: 'other' }, { ...bad.workerSpace, name: 'wrong' }]) {
+    f.save({ ...bad, workerSpace: invalid }); const n = readWorld().log.length;
+    r = f.call(['relaunch', 'bad', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 2, r.out);
+    f.save({ ...bad, state: 'reported', workerSpace: invalid });
+    r = f.call(['review', 'bad', '--agent', 'pi']); assert.equal(r.code, 2, r.out); assert.match(r.out, /invalid workerSpace/);
+    assert.ok(!readWorld().log.slice(n).some(c => ['kill', 'rm', 'run'].includes(c[0])));
+  }
+}
+function workerSpaceFixTests() {
+  for (const registration of ['matching', 'unrelated', 'missing']) {
+    const f = repairFixture(`spaces-${registration}`);
+    if (registration !== 'missing') {
+      const repo = path.join(f.dir, registration === 'matching' ? 'linked-source' : 'unrelated');
+      if (registration === 'matching') git('-C', f.repo, 'worktree', 'add', '--detach', repo, 'HEAD');
+      else { fs.mkdirSync(repo); git('-C', repo, 'init', '-q'); }
+      assert.equal(f.call(['project', 'add', 'crew', repo]).code, 0);
+    }
+    assert.equal(f.call(['config', 'worker-space', 'per-project']).code, 0);
+    let r = f.call(['fix', '--agent', 'pi', '--model', 'first', 'Repair.']); assert.equal(r.code, 0, r.out);
+    const t = f.task('fix-1'), binding = t.workerSpace;
+    assert.equal(t.project, 'crew:self'); assert.equal(binding.project, registration === 'matching' ? 'crew' : 'crew:self');
+    assert.equal(binding.name, 'crew'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
+    assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
+    r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: '' }); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task(t.id).workerSpace, binding);
+    assert.equal(readWorld().terminals[f.task(t.id).terminal].labels['herdr.space'], binding.id);
+    if (registration === 'matching') {
+      r = f.call(['project', 'remove', 'crew']); assert.equal(r.code, 2, r.out); assert.match(r.out, /unfinished tasks: fix-1/);
+      const other = path.join(f.dir, 'replacement'); fs.mkdirSync(other); git('-C', other, 'init', '-q');
+      r = f.call(['project', 'add', 'crew', other, '--replace']); assert.equal(r.code, 2, r.out); assert.match(r.out, /unfinished tasks: fix-1/);
+      const file = path.join(f.home, 'tasks', t.id, 'task.json');
+      fs.writeFileSync(file, JSON.stringify({ ...f.task(t.id), state: 'closed', copyToReturn: { since: 'now' } }));
+      r = f.call(['project', 'remove', 'crew']); assert.equal(r.code, 2, r.out); assert.match(r.out, /copies of finished tasks.*fix-1/);
+    }
+  }
+}
+async function workerSpaceRepairAdmissionTest() {
+  const f = repairFixture('spaces-admission-race');
+  assert.equal(f.call(['project', 'add', 'crew', f.repo]).code, 0);
+  assert.equal(f.call(['config', 'worker-space', 'per-project']).code, 0);
+  const gate = projectBarrier(f, 'before', 'repair-registration');
+  const pending = projectProcess(f, ['fix', '--agent', 'pi', 'Repair.'], { script: gate.script, terminal: f.owner, env: { ...f.env, CREW_TOOL_ROOT: f.repo } });
+  try {
+    await until(() => fs.existsSync(gate.ready));
+    assert.equal(f.call(['project', 'remove', 'crew']).code, 0);
+    fs.writeFileSync(gate.release, 'go'); const r = await pending.result;
+    assert.equal(r.code, 2, r.out); assert.match(r.out, /registration changed during repair admission/);
+    assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'fix-1')), 'Stale repository proof cannot reserve a task or launch a terminal');
+  } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+}
+function workerSpaceLifecycleTests() {
+  const f = workerSpaceFixture('lifecycle'), w = readWorld(); w.spaces = {}; fs.writeFileSync(world, JSON.stringify(w));
+  f.add('other');
+  const legacy = f.spawn('legacy'), shared = f.space(legacy), { workerSpace, ...old } = legacy; f.save(old);
+  f.mode('per-project');
+  const first = f.spawn('first'), last = f.spawn('last'), other = f.spawn('other', 'other');
+  const project = f.space(first), otherSpace = f.space(other);
+  const finish = (t, flags = []) => { const r = f.call(['finish', t.id, ...flags]); assert.equal(r.code, 0, r.out); return r; };
+  f.done(first); assert.ok(readWorld().spaces[project], 'Reporting alone keeps the worker tab');
+  const n = readWorld().log.length; finish(first);
+  assert.deepEqual(readWorld().spaces[project].members, [last.terminal]);
+  finish(last); assert.equal(readWorld().spaces[project], undefined, 'Last finish makes only that automatic space empty');
+  assert.ok(readWorld().spaces[shared]); assert.ok(readWorld().spaces[otherSpace]);
+  const inject = (id, name, members, automatic = false) => {
+    const w = readWorld(); w.spaces[id] = { id, name, automatic, members: [...members] };
+    for (const address of members.filter(m => !m.startsWith('mod-'))) w.terminals[address] = { address, space: id, state: 'live', labels: {}, cwd: f.dir };
+    fs.writeFileSync(world, JSON.stringify(w));
+  };
+  inject('personal', 'demo', ['personal-guest']);
+  inject(`pc2/${shared}`, 'remote same suffix', ['pc2/guest'], true);
+  const foreign = readWorld(); foreign.terminals.foreign = { address: 'foreign', space: otherSpace, state: 'live', labels: {}, cwd: f.dir };
+  foreign.spaces[otherSpace].members.push('foreign'); fs.writeFileSync(world, JSON.stringify(foreign));
+  const protectedTerminals = Object.fromEntries(['personal-guest', 'pc2/guest', 'foreign'].map(a => [a, structuredClone(readWorld().terminals[a])]));
+  finish(other, ['--force']); assert.deepEqual(readWorld().spaces[otherSpace].members, ['foreign']);
+  finish(legacy); assert.equal(readWorld().spaces[shared], undefined, 'Legacy combined task still finishes after opt-in');
+  assert.ok(readWorld().spaces[`pc2/${shared}`], 'Remote matching suffix is untouched');
+  // A foreign mod tab also prevents modeled zero-tab removal.
+  const mod = f.spawn('with-mod'), modSpace = f.space(mod), mods = readWorld();
+  mods.spaces[modSpace].members.push('mod-personal'); fs.writeFileSync(world, JSON.stringify(mods));
+  finish(mod); assert.deepEqual(readWorld().spaces[modSpace].members, ['mod-personal']);
+  // Manually moved worker: finish follows terminal ownership, not its old space label.
+  const moved = f.spawn('moved'), moving = readWorld(), source = f.space(moved);
+  moving.spaces[source].members = moving.spaces[source].members.filter(a => a !== moved.terminal);
+  if (!moving.spaces[source].members.length) delete moving.spaces[source];
+  moving.spaces.personal.members.push(moved.terminal); moving.terminals[moved.terminal].space = 'personal';
+  fs.writeFileSync(world, JSON.stringify(moving)); finish(moved);
+  assert.deepEqual(readWorld().spaces.personal.members, ['personal-guest']);
+  // Unconfirmed terminal removal cannot empty a space or return a copy early.
+  const pending = f.spawn('pending', 'other'), pendingSpace = f.space(pending), failed = readWorld(); failed.failRm = true;
+  fs.writeFileSync(world, JSON.stringify(failed));
+  finish(pending); assert.ok(f.task('pending').copyToReturn); assert.ok(readWorld().spaces[pendingSpace].members.includes(pending.terminal));
+  const retry = readWorld(); delete retry.failRm; fs.writeFileSync(world, JSON.stringify(retry));
+  finish(pending); assert.ok(!f.task('pending').copyToReturn); assert.deepEqual(readWorld().spaces[pendingSpace].members, ['foreign']);
+  for (const [address, expected] of Object.entries(protectedTerminals)) assert.deepEqual(readWorld().terminals[address], expected);
+  const calls = readWorld().log.slice(n);
+  assert.ok(!calls.some(c => /space|move|label|doc/.test(c[0])), 'Crew never closes/deletes/renames a space or edits layout');
+  assert.ok(!calls.some(c => ['kill', 'rm'].includes(c[0]) && Object.hasOwn(protectedTerminals, c.at(-1))), 'Even force never closes foreign terminals');
+}
+function workerSpaceSessionTests() {
+  const f = workerSpaceFixture('sessions');
+  const legacy = f.spawn('legacy-ship', 'demo', ['--kind', 'ship']);
+  const { workerSpace: oldSpace, ...old } = legacy; f.save(old);
+  f.mode('per-project'); const project = f.spawn('project-ship', 'demo', ['--kind', 'ship']);
+  const before = fs.readFileSync(path.join(f.home, 'tasks', legacy.id, 'task.json'), 'utf8');
+  const n = readWorld().log.length;
+  const status = JSON.parse(f.call(['status', '--all', '--json']).out);
+  assert.ok(status.tasks.some(t => t.id === legacy.id)); assert.ok(status.tasks.every(t => !Object.hasOwn(t, 'workerSpace')));
+  const fleet = JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out);
+  assert.deepEqual(Object.keys(fleet).sort(), ['home', 'owner', 'prDiscovery', 'tasks', 'view']);
+  for (const t of fleet.tasks) assert.deepEqual(Object.keys(t).sort(), ['id', 'pr', 'prDiscovery', 'state', 'terminal']);
+  let r = f.call(['wait', legacy.id, '--timeout', '0.02', '--no-fallback']); assert.equal(r.code, 124, r.out);
+  assert.equal(fs.readFileSync(path.join(f.home, 'tasks', legacy.id, 'task.json'), 'utf8'), before, 'Reading old tasks does not migrate them');
+  const terminals = structuredClone(readWorld().terminals);
+  r = f.call(['end']); assert.equal(r.code, 0, r.out); assert.deepEqual(readWorld().terminals, terminals);
+  assert.ok(readWorld().log.slice(n).every(c => ['get', 'ls'].includes(c[0])), 'Status/wait/end do not mutate Core');
+  const next = 'owner-spaces-next-session', w = readWorld(); w.terminals[next] = { address: next, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+  const call = args => crew(args, { cwd: f.home, terminal: next, env: f.env });
+  r = call(['start']); assert.equal(r.code, 0, r.out);
+  assert.match(call(['config', 'worker-space']).out, /per-project/, 'End/start retains the mode');
+  r = call(['config', 'worker-space', 'combined']); assert.equal(r.code, 0, r.out);
+  for (const t of [legacy, project]) assert.deepEqual(readWorld().terminals[t.terminal], terminals[t.terminal], 'New coordinator/mode never reshuffles earlier-session workers');
+  r = call(['spawn', 'new-session', '--project', 'demo', '--agent', 'pi', 'Count.']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(f.task('new-session')), oldSpace.id);
+  f.done(project); r = call(['review', project.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(f.task(`${project.id}-review`)), project.workerSpace.id, 'Earlier-session review keeps project placement');
+  f.done(legacy); r = call(['wait', legacy.id, '--timeout', '0.02']); assert.equal(r.code, 0, r.out);
+  r = call(['tell', legacy.id, 'Continue.']); assert.equal(r.code, 0, r.out);
+  r = call(['relaunch', legacy.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(legacy), oldSpace.id);
+  for (const id of [legacy.id, project.id, `${project.id}-review`, 'new-session']) {
+    r = call(['finish', id]); assert.equal(r.code, 0, r.out); assert.equal(f.task(id).state, 'closed');
+  }
+}
+gapTests['worker-spaces'] = async () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    await workerSpaceConfigTests(); workerSpacePlacementTests(); workerSpaceInheritanceTests(); workerSpaceFixTests();
+    await workerSpaceRepairAdmissionTest(); workerSpaceLifecycleTests(); workerSpaceSessionTests();
+  } finally { fs.writeFileSync(world, before); }
+};
+
 gapTests['registry-sharing'] = async () => {
   const f = gapFixture('registry-sharing'), registry = path.join(f.home, 'crew.json'), lock = path.join(f.home, 'projects.lock');
   const cases = [

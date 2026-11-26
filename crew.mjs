@@ -200,7 +200,27 @@ function readRegistry(dir) {
       || Object.values(config.projects).some(p => !p || typeof p.path !== 'string' || !p.path)) {
     refuse(`Crew home ${slash(dir)} has an invalid version 1 registry (crew.json); nothing was changed.`);
   }
+  if (Object.hasOwn(config, 'workerSpaceMode') && !WORKER_SPACE_MODES.includes(config.workerSpaceMode)) {
+    refuse(`Crew home ${slash(dir)}: workerSpaceMode must be combined or per-project; nothing was changed.`);
+  }
   return config;
+}
+
+const WORKER_SPACE_MODES = ['combined', 'per-project'];
+function cmdConfig(args) {
+  const [key, mode, ...extra] = args;
+  if (key !== 'worker-space' || extra.length || (mode !== undefined && !WORKER_SPACE_MODES.includes(mode))) {
+    refuse('Usage: crew config worker-space [combined|per-project]');
+  }
+  const h = home();
+  if (mode === undefined) { console.log(`worker-space: ${h.config.workerSpaceMode ?? 'combined'}`); return; }
+  requireOwner(h, 'change worker-space mode');
+  withRegistry(h, () => {
+    h.config.workerSpaceMode = mode;
+    writeJson(path.join(h.dir, 'crew.json'), h.config);
+  });
+  console.log(`worker-space: ${mode}; applies to new task admissions only; existing workers never move, reviews and replacements inherit their task's space.`);
+  if (mode === 'per-project') console.log('Connected project spaces and project names need compatible Herdr support; until installed, they may not appear connected under the coordinator.');
 }
 
 // Atomic rename alone cannot serialize read-modify-write or protect task admission.
@@ -237,9 +257,10 @@ function requireUnusedProject(h, name) {
       return task;
     });
   } catch (error) { refuse(`Crew home ${slash(h.dir)}: cannot check task references (${error.message}); project ${name} was kept.`); }
-  const users = tasks.filter(t => t.project === name && t.state !== 'closed');
+  const references = tasks.filter(t => t.project === name || resolveWorkerSpace(h, t).project === name);
+  const users = references.filter(t => t.state !== 'closed');
   if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
-  const waiting = tasks.filter(t => t.project === name && t.copyToReturn);
+  const waiting = references.filter(t => t.copyToReturn);
   if (waiting.length) refuse(`Project ${name} still has working copies of finished tasks to return: ${waiting.map(t => t.id).join(' ')}. They go back once no terminal holds them (crew status --all).`);
 }
 
@@ -308,7 +329,7 @@ const launchedTerminals = (task, address, agent) => [...ownedTerminals(task).fil
 const saveTask = (h, task) => taskTransaction(h, task.id, current => {
   const prFacts = current?.prFacts;
   const terminals = [...new Map([...(current?.terminals ?? []), ...(task.terminals ?? [])].map(t => [t.address, t])).values()];
-  writeJson(taskFile(h, task.id), { ...task, ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), updated: now() });
+  writeJson(taskFile(h, task.id), { ...task, ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), ...(current && Object.hasOwn(current, 'workerSpace') ? { workerSpace: current.workerSpace } : {}), updated: now() });
 });
 
 const prTime = value => {
@@ -1348,7 +1369,7 @@ const PICK_USAGE = `[--agent ${Object.keys(AGENTS).join('|')}] [--model <id>] [-
 // Starts the terminal in which `pick` works on a task. The agent starts with one instruction
 // as its argument, so nothing is typed into it and there is no race with its startup. The
 // shell stays afterwards so the terminal survives the agent leaving; `crew finish` removes it.
-function startTerminal(h, { id, worktree, label, pick, instruction }) {
+function startTerminal(h, { id, worktree, label, pick, instruction, workerSpace }) {
   const agent = AGENTS[pick.harness];
   if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
   const { command, note } = workerLaunch(agent, instruction, pick);
@@ -1361,11 +1382,52 @@ function startTerminal(h, { id, worktree, label, pick, instruction }) {
   return { note, ...hcJson(['run', '--json', '--bg', '--keep', '--no-parent', '--no-notify', '--cwd', worktree,
     // crew.kind is what the worker is, for anything that shows terminals (Herdr's pane header).
     '--label', `crew.task=${id}`, '--label', `crew.home=${tag}`, '--label', `crew.kind=${label}`,
-    '--label', `herdr.space=fm-crew-${tag}`, '--label', `herdr.tab=${tag}-${id}`, '--label', 'herdr.right-click=menu',
+    '--label', `herdr.space=${workerSpace.id}`, '--label', `herdr.tab=${tag}-${id}`, '--label', 'herdr.right-click=menu',
+    '--label', 'crew.space.version=1', '--label', `crew.space.mode=${workerSpace.mode}`, '--label', `crew.space.project=${workerSpace.project}`,
+    ...(workerSpace.name === null ? [] : ['--label', `crew.space.name=${workerSpace.name}`]),
     '--', bashProgram(), '--login', '-i', '-c', line]) };
 }
 const kindLabel = task => (task.selfFix ? 'fix' : task.reviews ? 'review' : task.kind);
 const roleOf = kindLabel;
+
+// Placement is immutable task metadata, never evidence that Crew owns a terminal.
+function resolveWorkerSpace(h, task) {
+  if (!Object.hasOwn(task, 'workerSpace')) return makeWorkerSpace(h, 'combined', task.project);
+  const space = task.workerSpace;
+  const projectAllowed = space?.project === task.project || (task.selfFix && space?.project === 'crew');
+  if (!space || space.version !== 1 || !WORKER_SPACE_MODES.includes(space.mode) || !projectAllowed
+      || (space.project !== SELF_PROJECT && projectNameError(space.project))) {
+    refuse(`Task ${task.id} has invalid workerSpace placement; nothing was moved or stopped.`);
+  }
+  const expected = makeWorkerSpace(h, space.mode, space.project);
+  if (space.id !== expected.id || space.name !== expected.name) refuse(`Task ${task.id} has invalid workerSpace identity; nothing was moved or stopped.`);
+  return expected;
+}
+function repositoryIdentity(folder) {
+  const r = run('git', ['-C', folder, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { timeout: 2000 });
+  try { return r.code === 0 && r.stdout.trim() ? comparablePath(fs.realpathSync(r.stdout.trim())) : null; } catch { return null; }
+}
+function repairWorkerProject(h, task) {
+  const registered = registeredProject(h, 'crew');
+  const identity = registered ? repositoryIdentity(task.projectPath) : null;
+  return { path: registered?.path ?? null, project: identity && repositoryIdentity(registered.path) === identity ? 'crew' : SELF_PROJECT };
+}
+function admittedWorkerSpace(h, task, repair) {
+  if (Object.hasOwn(task, 'workerSpace')) return resolveWorkerSpace(h, task);
+  const mode = h.config.workerSpaceMode ?? 'combined';
+  if (task.selfFix && mode === 'per-project') {
+    // Identity probes stay outside the registry lock. A changed registration is
+    // not permission to reuse the old proof or to guess a new project's space.
+    if ((registeredProject(h, 'crew')?.path ?? null) !== repair.path) refuse('The crew registration changed during repair admission; retry. No task or terminal was created.');
+    return makeWorkerSpace(h, mode, repair.project);
+  }
+  return makeWorkerSpace(h, mode, task.project);
+}
+function makeWorkerSpace(h, mode, project) {
+  const base = `fm-crew-${h.config.tag}`;
+  return { version: 1, mode, id: mode === 'combined' ? base : project === SELF_PROJECT ? `${base}-self` : `${base}-project-${project}`,
+    project, name: mode === 'combined' ? null : project === SELF_PROJECT ? 'crew' : project };
+}
 
 // Creates the task, its working copy and its terminal. `extra` is kept on the task record.
 // `chosen` is who does it (`pick`), who stands behind them (`rest`) and where that came from.
@@ -1385,12 +1447,14 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
     launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks, dispatch: chosen.dispatch,
     ...(branch ? { branch } : {}), ...(delivered ? { via: 'delivery' } : {}), ...extra };
+  const repairPlacement = extra.selfFix ? repairWorkerProject(h, record) : null;
   withRegistry(h, () => {
     // The project may have been removed/replaced while selection was running.
     if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
     if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
+    record.workerSpace = admittedWorkerSpace(h, record, repairPlacement);
     fs.mkdirSync(dir, { recursive: true });
-    saveTask(h, record); // reservation prevents removal/replacement before any external work
+    saveTask(h, record); // reservation freezes placement and prevents removal/replacement before external work
   });
   fs.mkdirSync(h.worktrees, { recursive: true });
   // Slow tools run outside the transaction; this preparing task now protects the path.
@@ -1422,7 +1486,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   if (workflow) { record = { ...record, workflow: 'delivery' }; saveTask(h, record); }
   fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project), workflow, branch }));
 
-  const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, instruction: `Read the brief at ${brief} and carry it out exactly.` });
+  const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, workerSpace: record.workerSpace, instruction: `Read the brief at ${brief} and carry it out exactly.` });
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
     if (delivered) runTool('delivery', ['finish', worktree, '--force'], { cwd: project.path, timeout: 120000 });
@@ -1470,6 +1534,7 @@ function relaunch(h, task, reason, flags = null) {
 }
 function replaceWorker(h, task, reason, flags) {
   const store = value => writeJson(taskFile(h, task.id), { ...value, updated: now() });
+  task = { ...task, workerSpace: resolveWorkerSpace(h, task) };
   const before = task.launch ?? { harness: task.agent }, tried = new Set([...(task.tried ?? []), pickKey(before)]);
   const role = roleOf(task), named = flags && [...PICK_FLAGS, 'no-fallback'].some(key => flags[key] !== undefined);
   const config = dispatchConfig(h);
@@ -1489,6 +1554,8 @@ function replaceWorker(h, task, reason, flags) {
   }
   const [pick, ...rest] = usable;
   const chain = original.filter(c => pickKey(c) !== pickKey(pick) && !tried.has(pickKey(c)));
+  // Freeze legacy placement before ending its terminal; recovery cannot consult a new mode.
+  store(task);
   if (task.terminal) {
     let seen = probe(task.terminal).state;
     if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; task ${task.id} was left as it is. Try again.`, 4);
@@ -1496,7 +1563,7 @@ function replaceWorker(h, task, reason, flags) {
     if (seen !== 'absent') refuse(`Core still has terminal ${task.terminal}; task ${task.id} was not handed over.`, 6);
   }
   const instruction = `Read the brief at ${task.brief} and carry it out exactly. Another worker (${pickLabel(before)}) began this task and had to stop: ${reason}. What it did is already in this working copy: look at \`git status\` and \`git log\`, and at ${task.report} if it exists, then continue from there instead of starting again.`;
-  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, instruction });
+  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, workerSpace: task.workerSpace, instruction });
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
     store({ ...task, state: 'failed', terminal: null, terminals: address ? launchedTerminals(task, address, pick.harness) : ownedTerminals(task), error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
@@ -2356,7 +2423,7 @@ function cmdReview(args) {
   if (task.kind !== 'ship' || task.selfFix) refuse(`Task ${id} is not a ship task of a project; only those have a branch to review.`);
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; review it after its worker reported.`);
   const project = registeredProject(h, task.project) ?? refuse(`Unknown project: ${task.project}.`);
-  const opts = { kind: 'scout', project: task.project };
+  const opts = { kind: 'scout', project: task.project }, workerSpace = resolveWorkerSpace(h, task);
   // Without a choice and without a review chain in the configuration: CREW_REVIEW_AGENT, else the author's agent.
   const legacy = process.env.CREW_REVIEW_AGENT ?? task.agent;
   if (!AGENTS[legacy]) refuse(`Unknown agent: ${legacy}. Known: ${Object.keys(AGENTS).join(', ')}`);
@@ -2370,7 +2437,7 @@ function cmdReview(args) {
     '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
     '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
   ].join('\n');
-  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead } });
+  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead, workerSpace } });
   reviewLabels(h, reviewId);
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }
@@ -3147,7 +3214,7 @@ function copyWaiting(task) {
   return { worktree: task.worktree, since: task.copyToReturn.since ?? null, why, heldBy: holders?.length ? describeHolders(holders, task.worktree) : null, kept: kept?.text ?? null, pending, free: why === 'free' };
 }
 
-const COMMANDS = { init: cmdInit, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
+const COMMANDS = { init: cmdInit, config: cmdConfig, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
   home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, agents: cmdAgents, relaunch: cmdRelaunch, selfrepair: cmdSelfmerge, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
@@ -3155,6 +3222,8 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
       re-adding replaces the registration: omitted workflow and gate-skip choices are dropped
   crew project remove <name>               forget a project with no unfinished tasks
   crew start | crew end                    take or release the home for this session
+  crew config worker-space [combined|per-project]   show/change new-task grouping (default combined)
+      existing workers never move; reviews and replacements inherit their task's space; connected project names need compatible Herdr
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
       who: ${PICK_USAGE}
   crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   original rows and quota now, next choice marked
