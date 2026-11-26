@@ -251,6 +251,7 @@ function localWorkerSpaceHome(target, identity) {
     stat = fs.lstatSync(dir);
   } catch (error) {
     if (error.code === 'ENOENT') localSettingRefuse('home-not-found', 'The explicit coordinator home does not exist.');
+    if (error.code === 'ENOTDIR') localSettingRefuse('invalid-home', 'The explicit coordinator home must be a directory.');
     throw error;
   }
   if (!stat.isDirectory() || stat.isSymbolicLink() || (WINDOWS && !/^[A-Za-z]:[\\/]/.test(dir))
@@ -320,7 +321,7 @@ function cmdLocalWorkerSpace(args) {
     });
     console.log(JSON.stringify({ ...LOCAL_WORKER_SPACE, ok: true, home: slash(h.dir), mode, changed }));
   } catch (error) {
-    const reason = error instanceof LocalSettingRefusal ? error.reason : typeof error.code === 'string' ? 'io-error' : 'internal-error';
+    const reason = error instanceof LocalSettingRefusal ? error.reason : /^E[A-Z]+$/.test(error.code ?? '') ? 'io-error' : 'internal-error';
     process.exitCode = error instanceof LocalSettingRefusal ? error.exitCode : reason === 'io-error' ? 4 : 70;
     // Never send a local-setting failure to recordCrash's ambient/default home.
     console.log(JSON.stringify({ ...LOCAL_WORKER_SPACE, ok: false, home: h ? slash(h.dir) : null, mode: null, changed: false,
@@ -3309,6 +3310,7 @@ function cmdStatus(args) {
   }
   if (json) { console.log(JSON.stringify({ home: slash(h.dir), owner: owner ? { terminal: owner.terminal, live, mine } : null, tasks, ...(all ? {} : { copiesToReturn: waiting }), ...(discover ? { prDiscovery: { version: 1 } } : {}) })); return; }
   console.log(`home ${slash(h.dir)} - ${owner ? `owner ${owner.terminal}${mine ? ' (you)' : live ? ' (live, you are read-only)' : ' (gone)'}` : 'no owner'}`);
+  console.log(`worker-space: ${h.config.workerSpaceMode ?? 'combined'} (new task admissions only; existing workers keep their placement)`);
   if (!tasks.length) console.log(all ? 'no tasks' : 'no unfinished tasks');
   // A workflow task's stage is what its last report said it is; GitHub is not asked here.
   const stageOf = t => (!t.stage ? '' : t.stage === 'plan' && t.state === 'reported' ? ' (plan awaiting approval)' : ` (${t.stage})`);

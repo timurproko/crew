@@ -11,8 +11,8 @@
 
 ## 2. Coordinator observation and ordered desktop integration
 
-- [ ] 2.1 Add the effective-mode line to plain status without notification or JSON changes; verify empty/mixed homes reflect local changes and legacy full/fleet JSON retain their existing contract.
-- [ ] 2.2 Add deterministic spawn barriers proving an already reserved launch retains old labels/placement and later admissions use the changed mode; verify the setter-before-reservation case and inherited placement with focused worker-space regressions.
-- [ ] 2.3 Cover concurrent project registration and stale pre-lock setting snapshots; verify successful changes preserve all project/unknown metadata and bounded lock/refusal behavior with the focused registry regressions.
-- [ ] 2.4 Complete docs/worker-spaces.md with observation, ordering, per-machine/home application and old-Crew fallback; verify the documented contract against focused CLI output and post the final implemented command contract on herdr-app PR 88.
-- [ ] 2.5 Validate the change artifacts and final delivery body, record targeted results and known limits, and verify no disposable process or real-home mutation was introduced before implementation handoff.
+- [x] 2.1 Add the effective-mode line to plain status without notification or JSON changes; verify empty/mixed homes reflect local changes and legacy full/fleet JSON retain their existing contract.
+- [x] 2.2 Add deterministic spawn barriers proving an already reserved launch retains old labels/placement and later admissions use the changed mode; verify the setter-before-reservation case and inherited placement with focused worker-space regressions.
+- [x] 2.3 Cover concurrent project registration and stale pre-lock setting snapshots; verify successful changes preserve all project/unknown metadata and bounded lock/refusal behavior with the focused registry regressions.
+- [x] 2.4 Complete docs/worker-spaces.md with observation, ordering, per-machine/home application and old-Crew fallback; verify the documented contract against focused CLI output and post the final implemented command contract on herdr-app PR 88.
+- [x] 2.5 Validate the change artifacts and final delivery body, record targeted results and known limits, and verify no disposable process or real-home mutation was introduced before implementation handoff.

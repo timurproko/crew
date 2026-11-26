@@ -624,8 +624,8 @@ function gapFixture(name, extra = {}) {
   return { dir, home, repo, call, task, save, spawn, guest, leave };
 }
 // Concurrent CLIs with test-only filesystem barriers: no timing guesses or production hooks.
-function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), terminal = '', env = {} } = {}) {
-  const child = spawn(process.execPath, [script, ...args], { cwd: f.home, env: {
+function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), terminal = '', env = {}, cwd = f.home } = {}) {
+  const child = spawn(process.execPath, [script, ...args], { cwd, env: {
     ...process.env, HOME: path.join(f.dir, 'user'), USERPROFILE: path.join(f.dir, 'user'),
     CREW_CLAUDE_CONFIG: path.join(f.dir, 'claude.json'),
     CREW_HOME: f.home, CREW_HC: fake, CREW_TERMINAL: terminal, HC_TERMINAL_ID: '', CLAUDE_CONFIG_DIR: '', CREW_CLAUDE_ACCOUNT: '', CREW_CLAUDE_ACCOUNTS: '',
@@ -1071,6 +1071,93 @@ fs.renameSync = (from, to) => {
     fs.renameSync(rules, savedRules); success('per-project', true); fs.renameSync(savedRules, rules);
     assert.equal(fs.readFileSync(path.join(ambient, 'crew.json'), 'utf8'), ambientBefore);
     assert.ok(readWorld().log.length >= logBefore);
+  } finally { fs.writeFileSync(world, beforeWorld); }
+};
+
+gapTests['worker-space-local-ordering'] = async () => {
+  const beforeWorld = fs.readFileSync(world, 'utf8');
+  const localArgs = (home, mode) => ['config', 'worker-space', '--set-local', mode, '--home', home, '--json'];
+  const set = (f, mode) => {
+    const r = crew(localArgs(f.home, mode), { cwd: f.home }); assert.equal(r.code, 0, r.out);
+    const v = JSON.parse(r.out); assert.equal(v.ok, true); assert.equal(v.mode, mode);
+  };
+  try {
+    for (const phase of ['before', 'after']) {
+      const name = `local-order-${phase}`, f = gapFixture(name), gate = projectBarrier(f, phase);
+      const file = path.join(f.home, 'crew.json'), ownerBefore = fs.readFileSync(path.join(f.home, 'owner.json'), 'utf8');
+      const fullBefore = f.call(['status', '--json']).out, fleetBefore = f.call(['status', '--json', '--view', 'fleet']).out;
+      const coreBefore = structuredClone(readWorld().terminals);
+      set(f, 'per-project');
+      assert.equal(f.call(['status', '--json']).out, fullBefore, 'Mode adds no legacy JSON fields');
+      assert.equal(f.call(['status', '--json', '--view', 'fleet']).out, fleetBefore, 'Mode adds no fleet JSON fields');
+      const emptyStatus = f.call(['status']).out.split('\n');
+      assert.match(emptyStatus[1], /^worker-space: per-project \(new task admissions only; existing workers keep their placement\)$/);
+      assert.match(emptyStatus[2], /no unfinished tasks/);
+      set(f, 'combined');
+      const pending = projectProcess(f, ['spawn', 'race', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { script: gate.script, terminal: `owner-${name}` });
+      try {
+        await until(() => fs.existsSync(gate.ready));
+        if (phase === 'after') {
+          assert.equal(f.task('race').workerSpace.mode, 'combined');
+          assert.equal(f.task('race').state, 'preparing', 'Reservation exists before the setting changes');
+          assert.ok(!fs.existsSync(path.join(f.home, 'projects.lock')), 'Slow launch does not retain the registry lock');
+        }
+        set(f, 'per-project');
+        assert.equal(crew(['project', 'add', 'concurrent', f.repo], { cwd: f.home }).code, 0);
+        fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
+        const t = f.task('race'), expected = phase === 'before' ? 'per-project' : 'combined';
+        assert.equal(t.workerSpace.mode, expected); assert.equal(readWorld().terminals[t.terminal].labels['crew.space.mode'], expected);
+        const saved = structuredClone(t.workerSpace), terminals = structuredClone(readWorld().terminals);
+        assert.match(f.call(['status']).out, /worker-space: per-project/);
+        assert.deepEqual(readWorld().terminals, terminals, 'Status never relabels/moves a mixed population');
+        const next = f.spawn('later', ['--agent', 'pi']); assert.equal(next.workerSpace.mode, 'per-project');
+        assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).projects.concurrent);
+        assert.equal(f.call(['relaunch', 'race', '--agent', 'pi', '--model', 'replacement']).code, 0);
+        assert.deepEqual(f.task('race').workerSpace, saved); assert.equal(readWorld().terminals[f.task('race').terminal].labels['crew.space.mode'], expected);
+        const current = f.task('race'); fs.writeFileSync(current.report, 'Complete.');
+        assert.equal(crew(['done', 'race'], { cwd: f.home, terminal: current.terminal }).code, 0);
+        assert.equal(f.call(['review', 'race', '--agent', 'pi']).code, 0);
+        assert.deepEqual(f.task('race-review').workerSpace, saved);
+        assert.equal(fs.readFileSync(path.join(f.home, 'owner.json'), 'utf8'), ownerBefore);
+        for (const [address, terminal] of Object.entries(coreBefore)) assert.deepEqual(readWorld().terminals[address], terminal);
+      } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+    }
+    const f = gapFixture('local-stale'), file = path.join(f.home, 'crew.json'), gate = projectBarrier(f, 'before', 'local-stale');
+    const original = JSON.parse(fs.readFileSync(file, 'utf8')); fs.writeFileSync(file, JSON.stringify({ ...original, future: { kept: [1, 'yes'] } }));
+    const pending = projectProcess(f, localArgs(f.home, 'per-project'), { script: gate.script });
+    try {
+      await until(() => fs.existsSync(gate.ready));
+      assert.equal(crew(['project', 'add', 'new-project', f.repo], { cwd: f.home }).code, 0);
+      fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
+      const registry = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.equal(registry.workerSpaceMode, 'per-project'); assert.ok(registry.projects['new-project']); assert.ok(registry.projects.demo);
+      assert.deepEqual(registry.future, { kept: [1, 'yes'] }); assert.equal(registry.tag, original.tag);
+    } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+    // Revalidate after lock acquisition: neither malformed nor redirected registries are repaired.
+    for (const kind of ['corrupt', 'missing-tasks', 'linked-registry', 'replaced-directory']) {
+      const g = gapFixture(`local-recheck-${kind}`), barrier = projectBarrier(g, 'before');
+      const registry = path.join(g.home, 'crew.json'), before = fs.readFileSync(registry, 'utf8');
+      const writer = projectProcess(g, localArgs(g.home, 'per-project'), { script: barrier.script, cwd: g.dir });
+      let backup;
+      try {
+        await until(() => fs.existsSync(barrier.ready));
+        if (kind === 'corrupt') fs.writeFileSync(registry, '{broken');
+        if (kind === 'missing-tasks') fs.renameSync(path.join(g.home, 'tasks'), path.join(g.home, 'tasks-old'));
+        if (kind === 'linked-registry') {
+          backup = path.join(g.dir, 'outside.json'); fs.writeFileSync(backup, before); fs.unlinkSync(registry); fs.linkSync(backup, registry);
+        }
+        if (kind === 'replaced-directory') {
+          backup = `${g.home}-old`; fs.renameSync(g.home, backup); fs.mkdirSync(g.home);
+          fs.writeFileSync(registry, before); fs.mkdirSync(path.join(g.home, 'tasks'));
+        }
+        fs.writeFileSync(barrier.release, 'go'); const r = await writer.result; assert.equal(r.code, 2, r.out);
+        const v = JSON.parse(r.out); assert.equal(v.ok, false); assert.equal(v.mode, null);
+        assert.equal(v.error.code, kind === 'corrupt' ? 'invalid-registry' : kind === 'missing-tasks' ? 'home-not-initialized' : 'invalid-home');
+        assert.equal(fs.readFileSync(registry, 'utf8'), kind === 'corrupt' ? '{broken' : before);
+        assert.ok(!fs.existsSync(path.join(g.home, 'projects.lock')));
+        if (kind === 'linked-registry') assert.equal(fs.readFileSync(backup, 'utf8'), before);
+      } finally { fs.writeFileSync(barrier.release, 'go'); await writer.result; }
+    }
   } finally { fs.writeFileSync(world, beforeWorld); }
 };
 

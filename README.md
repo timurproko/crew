@@ -165,6 +165,10 @@ including while another coordinator owns it or it is unowned. No terminal identi
 query, start/end or takeover is needed or permitted by this interface. Registry transactions
 and all other ownership guards remain intact; missing/invalid homes refuse without creation.
 See the [JSON, exit-code and home-validation contract](docs/worker-spaces.md#desktoplocal-setter-contract-version-1).
+Plain `crew status` shows the effective mode for new admissions without sending a terminal
+message or restarting the coordinator; legacy full and minimal fleet JSON stay unchanged.
+Each local call confirms one home only; Herdr owns cross-machine preference application
+and must keep unsupported, offline and refused homes distinct from successful ones.
 
 A change applies to **new independent task admissions** only. Existing workers never move,
 relabel or reshuffle; reviews, relaunches and automatic hand-overs inherit their task's

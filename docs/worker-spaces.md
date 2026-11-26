@@ -123,6 +123,33 @@ can be ambiguous if replacement completed before the failure: retain the refusal
 repeat the idempotent command instead of inventing success. No failure authorizes ownership
 or initialization. Registry version stays 1; no migration is required.
 
+### Observation and multi-machine application
+
+The owner sees the effective setting on its next getter or plain `crew status`, whose line
+after the home/owner header reads, for example:
+
+```text
+worker-space: per-project (new task admissions only; existing workers keep their placement)
+```
+
+This appears even with no tasks. No terminal input, asynchronous notification, restart or
+watcher is sent. Legacy full JSON and minimal fleet JSON retain their existing shape and
+serialized fields; the mode is not injected into polling responses. New admissions already
+read the updated setting without requiring a status command.
+
+The local setter uses the same ordering point as the owner setter: a reserved spawn keeps
+its saved placement even if launch finishes later; an independent reservation ordered after
+the change uses the new mode. Reviews, relaunches and automatic handovers inherit their task.
+Concurrent project registration and setting changes preserve both successful updates.
+
+Each call applies to **one home on one machine**, never an inferred selected/global home.
+Herdr owns the global preference and invokes the probed interface through its existing
+machine transport for every authoritative known home, including several on one machine.
+Later/offline homes can receive the latest intent when reachable. A successful subset does
+not mean success everywhere; track each refusal/unavailable machine separately. Unsupported
+Crew keeps a read-only fallback. This Crew change neither installs app support nor performs
+any real-machine synchronization or automatic update.
+
 ## Identity and companion contract, version 1
 
 Crew launches terminals with opaque labels. Herdr adopts them into native spaces; Crew
@@ -231,6 +258,17 @@ and lack of space/document mutations; they are **not** native rendering, connect
 or actual native zero-tab deletion evidence. Those require compatible companion support
 and separately authorized native validation; this task does not touch the running app,
 coordinator or their spaces/tasks.
+
+The additional focused groups `--gaps=worker-space-local-setter` and
+`--gaps=worker-space-local-ordering` cover the desktop command, exact capability/results,
+live/unknown/unowned/stale owners, strict option/home checks, registry links and outside
+sentinels, no-op writes, metadata preservation, unchanged orchestration guards, error codes,
+exclusive temporary publication, Windows sharing retries, plain status/unchanged JSON,
+concurrent registration and before/after-reservation spawn/review/relaunch placement.
+They use isolated user/home paths and fake Core; deterministic filesystem barriers and
+fault injection exist only in fixture processes, not production hooks. Windows file-symlink
+coverage is skipped only if OS privileges deny creation; hard-link and junction coverage
+still runs. These are CLI/ordering proofs, not native Herdr rendering or fleet transport evidence.
 
 ## Named limits
 
