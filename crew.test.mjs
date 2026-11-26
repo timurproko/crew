@@ -2650,10 +2650,11 @@ cp.spawnSync = (command,args,options) => {
 }; syncBuiltinESMExports();
 const {main} = await import(${JSON.stringify(new URL('./crew.mjs', import.meta.url).href)}); main(process.argv.slice(2));`);
   const legacy = args => crew(args, { cwd: f.home, terminal: reader, script: guard, env: { CREW_GH: f.fakeGh } });
+  const expectedText = mode => `home ${slash(f.home)} - owner ${owner} (live, you are read-only)\nworker-space: ${mode} (new task admissions only; existing workers keep their placement)\ndraft\tworking\tship/pi\tdemo\t-\t-\nscout\tworking\tscout/pi\tdemo\t-\t-`;
   let r = legacy(['status']); assert.equal(r.code, 0, r.out);
-  assert.equal(r.out.trim(), `home ${slash(f.home)} - owner ${owner} (live, you are read-only)\ndraft\tworking\tship/pi\tdemo\t-\t-\nscout\tworking\tscout/pi\tdemo\t-\t-`);
+  assert.equal(r.out.trim(), expectedText('combined'));
   r = legacy(['status', '--json']); assert.equal(r.code, 0, r.out);
-  const original = JSON.parse(r.out);
+  const originalBytes = r.out, original = JSON.parse(r.out);
   assert.deepEqual(Object.keys(original), ['home', 'owner', 'tasks', 'copiesToReturn']);
   assert.deepEqual(original.owner, { terminal: owner, live: true, mine: false });
   assert.deepEqual(original.tasks.map(t => t.id), ['draft', 'scout']);
@@ -2674,6 +2675,11 @@ const {main} = await import(${JSON.stringify(new URL('./crew.mjs', import.meta.u
   assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 2, 'only the unrecorded ship has repo/head requests');
   assert.deepEqual(variants.map(a => legacy(a).out), beforeFacts, 'all legacy forms remain byte-identical after observation caching');
   assert.equal(f.call(['status', '--all', '--json', '--discover-prs'], reader).out, enhancedBytes, 'discovery output remains byte-identical too');
+  const changed = crew(['config', 'worker-space', '--set-local', 'per-project', '--home', f.home, '--json'], { cwd: f.home });
+  assert.equal(changed.code, 0, changed.out);
+  assert.equal(legacy(['status']).out.trim(), expectedText('per-project'));
+  assert.equal(legacy(['status', '--json']).out, originalBytes, 'Mode changes only plain status, not legacy JSON bytes');
+  assert.equal(f.call(['status', '--all', '--json', '--discover-prs'], reader).out, enhancedBytes, 'Mode cannot change discovery JSON bytes');
 };
 
 // Snapshot all authority/prose/Git bytes. Only the separate PR observation is
