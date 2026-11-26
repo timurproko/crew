@@ -1647,7 +1647,7 @@ function cmdWait(args) {
   // Handing a stopped worker's task to the next candidate changes the home, so only its owner does it.
   const handover = !flags['no-fallback'] && process.env.CREW_NO_FALLBACK !== '1' && ownerState(h).mine;
   const quiet = new Map(); // how many checks in a row found no agent in a worker's terminal
-  const observations = new Map(), timing = recoveryTimings();
+  const observations = new Map(), timing = recoveryTimings(), shipChecks = new Map();
   let nextCheck = Date.now() + Math.min(4000, timing.check);
   ids.forEach(id => loadTask(h, id));
   const deadline = Date.now() + timeout * 1000, settled = new Map(), blocked = new Map();
@@ -1657,6 +1657,36 @@ function cmdWait(args) {
     for (const id of ids) {
       if (settled.has(id)) continue;
       const task = loadTask(h, id);
+      if (task.state === 'reported' && task.kind === 'ship' && !task.selfFix && !task.gate && task.stage !== 'plan' && (task.workflow || task.pr)) {
+        const previous = shipChecks.get(id);
+        if (previous && Date.now() - previous.at < timing.check) continue;
+        let result;
+        try {
+          const context = reviewPrEvidence(task);
+          const full = !!approvedHeadOf(task) || !!task.landed;
+          result = full && context ? { ...reviewChecks(context, { light: false, workflow: !!task.workflow }), head: context.pr.head.sha, context } : reviewReadiness(task, { sync: false });
+          const latest = loadTask(h, id);
+          if (!sameWorker(latest, task) || latest.state !== 'reported' || latest.reported !== task.reported || latest.told !== task.told) continue;
+          if (result.status === 'ready') {
+            if (approvedHeadOf(task)) reviewLabels(h, id, 'check');
+            settled.set(id, result.noCi ? 'reviewed locally; no CI' : full ? 'checks passed' : 'ready for review'); continue;
+          }
+          if (result.status === 'failed') {
+            const failure = `${result.head}:${result.check.id}:${result.check.name}`;
+            if (task.checkRepair) {
+              if (task.checkRepair.pending || task.checkRepair.error) { blocked.set(id, 'automatic check repair message was not confirmed; inspect the worker'); settled.set(id, 'needs a person'); }
+              else if (task.checkRepair.failure !== failure) { blocked.set(id, `${result.reason}; automatic check repair already attempted`); settled.set(id, 'needs a person'); }
+            } else if (!handover) { blocked.set(id, result.reason); settled.set(id, 'needs a person'); }
+            else {
+              const message = `Fix failed check ${result.check.name}: ${result.check.html_url ?? 'link unavailable'} (head ${result.head}). Keep this pull request as it is; commit and hand off the repair with local build/test results.`;
+              sendTaskTell(h, task, message, { failure, head: result.head, check: result.check.name, url: result.check.html_url, at: now() });
+              console.log(`== ${id}: automatic check repair: ${result.reason}; told worker once`);
+            }
+          }
+        } catch (error) { result = { status: 'unavailable', reason: error.message }; if (task.checkRepair?.pending || /terminal|deliver|waiting for a person/.test(error.message)) { blocked.set(id, error.message); settled.set(id, 'needs a person'); } }
+        shipChecks.set(id, { ...result, at: Date.now() });
+        continue;
+      }
       if (['reported', 'stopped', 'closed', 'failed'].includes(task.state)) { settled.set(id, task.state); continue; }
       // Every few seconds ask Core whether the terminal still exists; a worker that is gone
       // without a report has failed, whatever the reason.
@@ -1723,7 +1753,7 @@ function cmdWait(args) {
   let pending = 0, stuck = 0;
   for (const id of ids) {
     const task = loadTask(h, id), state = settled.get(id);
-    if (!state) { pending++; console.log(`== ${id}: still working after ${timeout}s (terminal ${task.terminal})`); continue; }
+    if (!state) { pending++; console.log(`== ${id}: still working after ${timeout}s (terminal ${task.terminal})${shipChecks.get(id)?.reason ? `; ${shipChecks.get(id).reason}` : ''}`); continue; }
     if (blocked.has(id)) { stuck++; console.log(`== ${id}: needs a person - ${blocked.get(id)} (terminal ${task.terminal}); it is still running`); continue; }
     console.log(`== ${id}: ${state}${task.error ? ` - ${task.error}` : ''}`);
     if (fs.existsSync(task.report)) console.log(fs.readFileSync(task.report, 'utf8').trim().split(/\r?\n/).slice(0, 60).join('\n'));
@@ -2326,35 +2356,48 @@ function cmdTell(args) {
   const [id, ...words] = args, message = words.join(' ').trim();
   if (!id || !message) refuse('Usage: crew tell <id> "<message for the worker>"');
   const task = loadTask(h, id);
-  if (!['working', 'reported'].includes(task.state)) refuse(`Task ${id} is ${task.state}; there is no worker to tell. Spawn a new task instead.`);
+  try { sendTaskTell(h, task, message); } catch (error) { refuse(error.message, error.code ?? 4); }
+  console.log(`told ${id}; next: crew wait ${id}`);
+}
+function sendTaskTell(h, task, message, checkRepair) {
+  const id = task.id;
+  const no = (reason, code = 4) => { throw Object.assign(Error(reason), { code }); };
+  if (!['working', 'reported'].includes(task.state)) no(`Task ${id} is ${task.state}; there is no worker to tell. Spawn a new task instead.`, 2);
   const { state: seen, t } = probe(task.terminal);
-  if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was sent. Try again.`, 4);
-  if (seen !== 'live') refuse(`The worker terminal of ${id} is gone; spawn a new task instead.`, 6);
-  if (t.status?.state === 'blocked') refuse(`The worker of ${id} is waiting for a person (terminal ${task.terminal}); nothing was sent.`, 7);
+  if (seen === 'unknown') no(`${CORE_SILENT} terminal ${task.terminal}; nothing was sent. Try again.`, 4);
+  if (seen !== 'live') no(`The worker terminal of ${id} is gone; spawn a new task instead.`, 6);
+  if (t.status?.state === 'blocked') no(`The worker of ${id} is waiting for a person (terminal ${task.terminal}); nothing was sent.`, 7);
   const text = `Message from the coordinator about task ${id}: ${message}\nWhen you have dealt with it, rewrite ${task.report} so it holds the complete, current result, then run \`crew done ${id}\` again and stop.`;
   // The task is open again BEFORE the message goes out, so a fast worker's new report is
   // never overwritten by this command.
-  saveTask(h, { ...task, state: 'working', told: now(), tells: (task.tells ?? 0) + 1 });
+  const told = now();
+  taskTransaction(h, id, current => {
+    if (!sameWorker(current, task) || current.state !== task.state || current.reported !== task.reported || current.told !== task.told || checkRepair && current.checkRepair) no('worker or report changed; nothing was sent');
+    writeJson(taskFile(h, id), { ...current, state: 'working', told, ...(checkRepair ? { checkRepair: { ...checkRepair, pending: true } } : { tells: (current.tells ?? 0) + 1 }), updated: now() });
+  });
   const sent = hc(['send', task.terminal, text]);
-  if (sent.code !== 0) {
-    saveTask(h, { ...loadTask(h, id), state: task.state });
-    refuse(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
-  }
+  taskTransaction(h, id, current => {
+    if (!sameWorker({ ...current, state: task.state }, task) || current.told !== told) return;
+    if (sent.code !== 0 && current.state === 'working') writeJson(taskFile(h, id), { ...current, state: task.state, ...(checkRepair ? { checkRepair: { ...current.checkRepair, pending: false, error: 'message delivery failed' } } : {}), updated: now() });
+    else if (checkRepair) writeJson(taskFile(h, id), { ...current, checkRepair: { ...current.checkRepair, pending: false }, updated: now() });
+  });
+  if (sent.code !== 0) no(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
   reviewLabels(h, id, 'rework');
-  console.log(`told ${id}; next: crew wait ${id}`);
 }
 
 // review: a second pair of eyes on a ship task's branch, as an ordinary read-only task.
 function cmdReview(args) {
   const h = home();
   requireOwner(h);
-  const { flags, rest } = takeFlags(args, PICK_FLAGS, ['no-fallback']);
+  const { flags, rest } = takeFlags(args, PICK_FLAGS, ['no-fallback', 'force']);
   const id = rest[0];
-  if (!id) refuse(`Usage: crew review <id> ${PICK_USAGE}`);
+  if (!id) refuse(`Usage: crew review <id> [--force] ${PICK_USAGE}`);
   if (flags.agent !== undefined && !AGENTS[flags.agent]) refuse(`Unknown agent: ${flags.agent}. Known: ${Object.keys(AGENTS).join(', ')}`);
   const task = loadTask(h, id);
   if (task.kind !== 'ship' || task.selfFix) refuse(`Task ${id} is not a ship task of a project; only those have a branch to review.`);
-  if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; review it after its worker reported.`);
+  const ready = reviewReadiness(task, { force: flags.force });
+  if (ready.status !== 'ready' && !flags.force) refuse(`Task ${id} is not ready for review: ${ready.reason}. Use crew wait ${id}, or --force to override.`, 6);
+  if (flags.force) console.log(`crew: forced review of ${id}; readiness gate bypassed`);
   const project = registeredProject(h, task.project) ?? refuse(`Unknown project: ${task.project}.`);
   const opts = { kind: 'scout', project: task.project };
   // Without a choice and without a review chain in the configuration: CREW_REVIEW_AGENT, else the author's agent.
@@ -2362,7 +2405,7 @@ function cmdReview(args) {
   if (!AGENTS[legacy]) refuse(`Unknown agent: ${legacy}. Known: ${Object.keys(AGENTS).join(', ')}`);
   let n = 1, reviewId = `${id}-review`.slice(0, 40);
   while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
-  const reviewHead = pullRequestReviewHead(task), target = reviewHead ?? branchOf(task);
+  const reviewHead = ready.head ?? pullRequestReviewHead(task), target = reviewHead ?? branchOf(task);
   const text = [
     `Review the work of task ${id}. It is the branch \`${branchOf(task)}\` of this repository; you are on the commit it started from.`,
     '', `- Review the fixed head \`${target}\` with \`git log HEAD..${target}\` and \`git diff HEAD...${target}\`. Read the changed files whole where the diff is not enough.`,
@@ -2388,7 +2431,7 @@ function reviewHeadOf(task) {
 // pushes after the worker, so the local branch can be behind it. The ship copy is
 // fast-forwarded to that head; a copy that cannot be is refused. Without a readable open
 // pull request the local head is reviewed, and the staleness rule judges it later.
-function pullRequestReviewHead(task) {
+function pullRequestReviewHead(task, evidence) {
   const local = reviewHeadOf(task);
   const first = fs.existsSync(task.report) ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
   let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr;
@@ -2399,9 +2442,11 @@ function pullRequestReviewHead(task) {
   }
   const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pulls?\/(\d+)\/?$/.exec(url);
   if (!m) return local;
-  const read = gh(['api', '--hostname', m[1], '--method', 'GET', `repos/${m[2]}/${m[3]}/pulls/${m[4]}`], { timeout: 2000 });
-  let pr = null;
-  try { if (read.code === 0) pr = JSON.parse(read.stdout); } catch { /* unreadable: review the local head */ }
+  let pr = evidence?.pr ?? null;
+  if (!evidence) {
+    const read = gh(['api', '--hostname', m[1], '--method', 'GET', `repos/${m[2]}/${m[3]}/pulls/${m[4]}`], { timeout: 2000 });
+    try { if (read.code === 0) pr = JSON.parse(read.stdout); } catch { /* forced/local review fallback */ }
+  }
   const head = pr?.head?.sha;
   if (pr?.state !== 'open' || pr.merged_at || typeof head !== 'string' || !/^[a-f0-9]{40,64}$/.test(head) || head === local) return local;
   const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 60000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
@@ -2420,6 +2465,94 @@ function pullRequestReviewHead(task) {
   const ahead = git('merge-base', '--is-ancestor', head, local).code === 0;
   refuse(`${where}; the local copy is ${ahead ? 'ahead of the pull request: push it first' : 'diverged from the pull request: reconcile them first'}. Nothing was reviewed.`);
 }
+// An exact PR snapshot is shared by readiness/check consumers. A report link is a
+// locator, not proof of repository or branch identity.
+function reviewPrEvidence(task) {
+  let url = reviewPrUrl(task);
+  if (!url && task.workflow) {
+    const found = gh(['pr', 'view', branchOf(task), '--json', 'url', '--jq', '.url'], { cwd: task.worktree, timeout: 2000 });
+    if (found.code !== 0) throw Error('implementation PR could not be read');
+    url = found.stdout.trim();
+  }
+  if (!url) return null;
+  const api = reviewApi(url), pr = api.get(`pulls/${api.number}`);
+  const origin = run('git', ['-C', task.worktree, 'config', '--get', 'remote.origin.url'], { timeout: 2000 });
+  const repository = /[:/]([^/:]+\/[^/]+?)(?:\.git)?\/?$/.exec(origin.stdout.trim())?.[1];
+  const current = run('git', ['-C', task.worktree, 'symbolic-ref', '--short', 'HEAD'], { timeout: 2000 });
+  if (current.code !== 0 || current.stdout.trim() !== branchOf(task)) throw Error('copy is not on its recorded branch');
+  if (origin.code !== 0 || repository?.toLowerCase() !== api.repository.toLowerCase() || pr.number !== api.number || canonicalPrUrl(pr.html_url)?.toLowerCase() !== canonicalPrUrl(url)?.toLowerCase() || pr.head?.ref !== branchOf(task) || pr.head?.repo?.full_name?.toLowerCase() !== api.repository.toLowerCase() || !reviewSha(pr.head?.sha)) throw Error('PR repository, branch or head identity is unproven');
+  return { ...api, url, pr };
+}
+const lightCheck = name => /(?:^|\/\s*)(?:Readiness|OpenSpec|Name guard)$/i.test(name);
+export function reduceReviewChecks(runs, { light = true, required = [] } = {}) {
+  if (!Array.isArray(runs)) throw Error('checks unreadable');
+  const latest = new Map();
+  for (const r of runs) {
+    if (!r || typeof r.name !== 'string' || !Number.isSafeInteger(r.id) || !['queued', 'in_progress', 'completed', 'waiting', 'pending', 'requested'].includes(r.status)) throw Error('check run unreadable');
+    if (r.conclusion === 'cancelled' || light && !lightCheck(r.name)) continue;
+    const previous = latest.get(r.name);
+    const order = Date.parse(r.started_at ?? r.created_at) || 0, before = Date.parse(previous?.started_at ?? previous?.created_at) || 0;
+    if (!previous || ((!order || !before) ? r.id > previous.id : order > before || order === before && r.id > previous.id)) latest.set(r.name, r);
+  }
+  const checks = [...latest.values()];
+  const missing = required.filter(name => !checks.some(c => c.name === name || c.name.endsWith(`/ ${name}`)));
+  const failed = checks.find(c => c.status === 'completed' && !['success', 'neutral', 'skipped', null].includes(c.conclusion));
+  if (failed) return { status: 'failed', check: failed, reason: `${failed.name} failed: ${failed.html_url ?? 'check URL unavailable'}` };
+  if (missing.length || !checks.length) return { status: 'pending', reason: `missing checks: ${missing.join(', ') || (light ? 'light draft checks' : 'CI')}` };
+  const pending = checks.find(c => c.status !== 'completed' || !c.conclusion || light && c.conclusion !== 'success');
+  return pending ? { status: 'pending', reason: `${pending.name} has not passed` } : { status: 'ready', reason: 'checks passed' };
+}
+function reviewChecks(context, { light = true, workflow = false } = {}) {
+  const { pr, get } = context, checks = [], statuses = [];
+  // Explicit bounds prevent malformed pagination from turning review into a watcher.
+  for (const [suffix, key, into] of [['check-runs?filter=all', 'check_runs', checks], ['statuses?', null, statuses]]) {
+    let complete = false;
+    for (let page = 1; page <= 10; page++) {
+      const response = get(`commits/${pr.head.sha}/${suffix}${suffix.endsWith('?') ? '' : '&'}per_page=100&page=${page}`);
+      const values = key ? response?.[key] : response;
+      if (!Array.isArray(values)) throw Error('checks unreadable');
+      if (key && values.some(r => r.head_sha !== pr.head.sha)) throw Error('check run belongs to a different head');
+      into.push(...values);
+      if (values.length < 100) { complete = true; break; }
+    }
+    if (!complete) throw Error('check pagination exceeded bounded read');
+  }
+  for (const s of statuses) {
+    if (typeof s.context !== 'string' || !['pending', 'success', 'failure', 'error'].includes(s.state)) throw Error('commit status unreadable');
+    checks.push({ id: s.id, name: s.context, status: s.state === 'pending' ? 'pending' : 'completed', conclusion: s.state === 'success' ? 'success' : s.state === 'pending' ? null : 'failure', started_at: s.created_at, html_url: s.target_url });
+  }
+  const required = light && workflow ? ['Readiness', ...(/```openspec-implementation/.test(pr.body ?? '') ? ['OpenSpec'] : [])] : [];
+  const result = reduceReviewChecks(checks, { light, required });
+  if (!workflow && !checks.length) return { status: 'ready', noCi: true, reason: 'reviewed locally; no CI' };
+  return result;
+}
+export function reviewReadiness(task, { force = false, sync = true } = {}) {
+  if (force) return { status: 'ready', head: pullRequestReviewHead(task), reason: 'forced' };
+  if (task.state !== 'reported') return { status: 'pending', reason: `worker is ${task.state}; review after it reported` };
+  try {
+    const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 2000 });
+    const dirty = git('status', '--porcelain');
+    if (dirty.code !== 0 || dirty.stdout.trim()) throw Error('copy has uncommitted files or cannot be inspected');
+    const context = reviewPrEvidence(task);
+    if (!context) {
+      if (task.workflow) throw Error('implementation PR unavailable');
+      return { status: 'ready', head: reviewHeadOf(task), reason: 'local branch; no PR' };
+    }
+    const { pr } = context;
+    if (pr.state !== 'open' || pr.merged_at) throw Error('implementation PR is closed or merged');
+    // Wait only observes; the explicit review command owns the safe fast-forward.
+    const head = sync ? pullRequestReviewHead({ ...task, pr: context.url }, context) : reviewHeadOf(task);
+    if (head !== pr.head.sha || git('rev-parse', 'HEAD').stdout.trim() !== head) throw Error('local head differs from PR head; push or fast-forward the copy first');
+    const published = git('ls-remote', '--exit-code', '--heads', 'origin', branchOf(task));
+    if (published.code !== 0 || published.stdout.trim().split(/\s+/)[0] !== head) throw Error('branch publication could not be verified; push local commits first');
+    if (task.workflow) {
+      if (task.stage === 'plan') throw Error('last report is a plan, not an implementation');
+      const outcomes = /^## Implementation\s*$([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(pr.body ?? '')?.[1] ?? '';
+      if (!/^\s*- \[[xX]\]/m.test(outcomes) || /^\s*- \[ \]/m.test(outcomes)) throw Error('implementation outcomes are missing or unticked');
+    }
+    return { ...reviewChecks(context, { workflow: !!task.workflow }), head, context };
+  } catch (error) { return { status: 'unavailable', reason: error.message }; }
+}
 function staleApproval(id) {
   console.log(`crew: ${id}: approval is for an older head (or its head could not be verified); task needs another review`);
 }
@@ -2432,10 +2565,12 @@ function reviewPrUrl(task) {
 function reviewApi(url) {
   const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(url ?? '');
   if (!m) throw Error('implementation PR URL unavailable');
-  const repo = `repos/${m[2]}/${m[3]}`;
+  const repo = `repos/${m[2]}/${m[3]}`, deadline = Date.now() + 10000;
   const get = endpoint => {
-    const r = gh(['api', '--hostname', m[1], '--method', 'GET', `${repo}/${endpoint}`], { timeout: 2000 });
-    if (r.code !== 0) throw Error(lastLine(r.stderr || r.stdout) || 'GitHub unavailable');
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw Error('GitHub evidence read budget exhausted');
+    const r = gh(['api', '--hostname', m[1], '--method', 'GET', `${repo}/${endpoint}`], { timeout: Math.min(2000, remaining) });
+    if (r.code !== 0) throw Error((r.stderr || r.stdout).trim().replace(/\s+/g, ' ') || 'GitHub unavailable');
     return JSON.parse(r.stdout);
   };
   return { get, repo, number: Number(m[4]), repository: `${m[2]}/${m[3]}`, hostname: m[1] };
@@ -3255,7 +3390,7 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
       backlog: only reported scouts move here (not reviewers, except legacy treehouse); ships move at land
   crew done [<id>]                         (worker) my report is written
   crew tell <id> "<message>"               send the worker a follow-up; it reports again
-  crew review <id> [who]                   start a read-only reviewer; use its printed ID (truncated or numbered when needed)
+  crew review <id> [--force] [who]         review a checked handoff (exit 6 if too early); wait with crew wait
   crew land <id> [--title "<title>"]       push/open a plain PR, or record the workflow/gate PR
       first land requires a reported worker, existing copy and clean tracked/untracked files; an already-landed PR can return early
       plain PR text uses the first 200 report lines plus attribution; workflow draft/outcome summary is best-effort

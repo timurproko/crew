@@ -70,7 +70,7 @@ crew done [<id>]                         (worker) my report is written
 crew tools [--json]                      companion tools on this machine and what crew does with each
 crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
 crew tell <id> "<message>"               send the worker a follow-up; it reports again
-crew review <id> [who]                   start a reviewer on a ship task's branch
+crew review <id> [--force] [who]         review a checked handoff; exit 6 if too early
 crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request, or record the one its workflow or gate opened
 crew fix [who] "<problem>"               start a worker that repairs crew itself
 crew selfrepair <id>                     check that repair and open its pull request
@@ -416,6 +416,28 @@ terminals still prevent unsafe cleanup. Finish and merged-task land include one 
 saying which ignored roots or local changes/scratch were discarded, or `discarded none` when
 nothing was removed. A failed partial discard is identified as incomplete rather than reported
 as a successful return; reports and unmerged branches stay retained.
+
+### Review readiness and waiting
+
+`crew review` refuses early with exit **6** and an actionable reason; it never waits itself.
+A workflow ship must be reported as implementation, have every outcome ticked, a clean
+published copy at the exact open PR head, and passing light draft checks (Readiness, OpenSpec
+and Name guard where applicable). The safe PR-head fetch/fast-forward remains; ahead or
+diverged work is never overwritten. `--force` explicitly bypasses readiness, not ownership
+or destructive Git safeguards. Plain reported branches without a PR keep local review.
+Ready PR repairs can be reviewed while heavy CI is pending or failed: only light checks gate review.
+The latest non-cancelled attempt per check name on that exact head counts; missing or unreadable
+checks never prove readiness.
+
+`crew wait <ship id>` now holds a reported workflow implementation for those checks and prints
+`ready for review` when green. For an approved or landed PR it observes full CI instead,
+without delaying the approval label. The owner sends **one** automatic repair follow-up
+naming a failed check and its link; another failed repair attempt returns `needs a person`
+(exit **7**). The allowance and failed-attempt identity survive new wait processes; the same
+failure is not repeatedly sent or counted twice. A non-owner or `--no-fallback` never sends it.
+Unknown or pending checks stay waiting until timeout (exit **124**). Plans, scouts, reviewers,
+gate reports and plain branches without PR/CI retain their ordinary report settlement.
+Status remains read-only; these checks run only in the relevant commands.
 
 ### Advisory review labels
 

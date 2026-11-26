@@ -9,11 +9,11 @@
 
 ## 2. Review readiness and ship waits enforce checked handoffs with one automatic repair
 
-- [ ] 2.1 Add exact-PR/head/outcome/check evidence reduction and reviewReadiness while preserving clean PR-head fast-forward; fixtures must cover missing/unticked outcomes, dirty/unpushed/ahead/diverged copies, closed or unreadable PRs, and valid draft/ready heads.
-- [ ] 2.2 Normalize latest non-cancelled current-head light checks and add review --force with exit-6 diagnostics; fixtures must cover pending/failed/missing checks, cancelled duplicates, older-head successes, malformed data, ready-PR heavy failures and forced bypass without destructive Git updates.
-- [ ] 2.3 Extend wait for implementation reports and approved/landed PR checks using durable one-follow-up evidence; fixtures must prove ready-for-review settlement, first-failure tell with check/link, same-failure deduplication across waits and exit 7 on a failed repair handoff.
-- [ ] 2.4 Preserve owner/no-fallback/send-failure/same-worker race protections and existing scout/Plan/reviewer/gate/plain-no-CI settlement; fixtures must assert no unauthorized messages and unchanged timeout/recovery behavior.
-- [ ] 2.5 Update README help examples and readiness/wait exit-code descriptions; verify help and fixture output agree and status/fleet remain read-only.
+- [x] 2.1 Add exact-PR/head/outcome/check evidence reduction and reviewReadiness while preserving clean PR-head fast-forward; fixtures must cover missing/unticked outcomes, dirty/unpushed/ahead/diverged copies, closed or unreadable PRs, and valid draft/ready heads.
+- [x] 2.2 Normalize latest non-cancelled current-head light checks and add review --force with exit-6 diagnostics; fixtures must cover pending/failed/missing checks, cancelled duplicates, older-head successes, malformed data, ready-PR heavy failures and forced bypass without destructive Git updates.
+- [x] 2.3 Extend wait for implementation reports and approved/landed PR checks using durable one-follow-up evidence; fixtures must prove ready-for-review settlement, first-failure tell with check/link, same-failure deduplication across waits and exit 7 on a failed repair handoff.
+- [x] 2.4 Preserve owner/no-fallback/send-failure/same-worker race protections and existing scout/Plan/reviewer/gate/plain-no-CI settlement; fixtures must assert no unauthorized messages and unchanged timeout/recovery behavior.
+- [x] 2.5 Update README help examples and readiness/wait exit-code descriptions; verify help and fixture output agree and status/fleet remain read-only.
 
 ## 3. Delta reviewer briefs require full-head local build and test evidence
 
