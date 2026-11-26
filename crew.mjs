@@ -2423,11 +2423,88 @@ function pullRequestReviewHead(task) {
 function staleApproval(id) {
   console.log(`crew: ${id}: approval is for an older head (or its head could not be verified); task needs another review`);
 }
+const reviewSha = value => typeof value === 'string' && /^[a-f0-9]{40,64}$/.test(value);
+const approvedHeadOf = task => task.approvedHead ?? (task.reviewVerdict?.verdict === 'APPROVE' ? task.reviewVerdict.head : null);
+function reviewPrUrl(task) {
+  const first = fs.existsSync(task.report ?? '') ? fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0].trim() : '';
+  return (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr;
+}
+function reviewApi(url) {
+  const m = /^https:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)\/?$/.exec(url ?? '');
+  if (!m) throw Error('implementation PR URL unavailable');
+  const repo = `repos/${m[2]}/${m[3]}`;
+  const get = endpoint => {
+    const r = gh(['api', '--hostname', m[1], '--method', 'GET', `${repo}/${endpoint}`], { timeout: 2000 });
+    if (r.code !== 0) throw Error(lastLine(r.stderr || r.stdout) || 'GitHub unavailable');
+    return JSON.parse(r.stdout);
+  };
+  return { get, repo, number: Number(m[4]), repository: `${m[2]}/${m[3]}`, hostname: m[1] };
+}
+// Classify only the task lineage: a proven clean base merge imports already-owned base
+// history, not new worker commits. Unknown evidence always remains in the review scope.
+export function approvalCovers(task, approvedHead, head, evidence = {}) {
+  const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 2000 });
+  const result = { covered: false, mode: 'full', commits: [], excluded: [], reason: 'head could not be verified' };
+  if (!reviewSha(approvedHead) || !reviewSha(head)) return result;
+  if (approvedHead === head) return { ...result, covered: true, mode: 'delta', reason: 'approved head' };
+  if (git('merge-base', '--is-ancestor', approvedHead, head).code !== 0) return { ...result, reason: 'approved head is not an ancestor; full review required' };
+  const listed = git('rev-list', '--first-parent', '--reverse', `${approvedHead}..${head}`);
+  if (listed.code !== 0) return result;
+  result.mode = 'delta'; result.commits = listed.stdout.trim().split(/\r?\n/).filter(Boolean);
+  // Do not skip a merge which imported the approval through its second parent.
+  const lineage = git('rev-list', '--first-parent', head).stdout.split(/\r?\n/);
+  if (!lineage.includes(approvedHead)) return { ...result, mode: 'full', reason: 'approved head is outside task lineage; full review required' };
+  let api, pr, change, prefixes = [], slug = process.env.CREW_DELIVERY_APP_SLUG;
+  try {
+    if (!/^[a-zA-Z0-9-]+$/.test(slug ?? '')) throw Error('trusted delivery App slug is not configured');
+    api = evidence.api ?? reviewApi(reviewPrUrl(task)); pr = evidence.pr ?? api.get(`pulls/${api.number}`);
+    const block = /```openspec-implementation\s*\n([\s\S]*?)\n```/.exec(pr.body ?? '');
+    const association = block ? JSON.parse(block[1]) : null;
+    change = association?.change;
+    if (/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(change ?? '')) {
+      const active = `openspec/changes/${change}/`;
+      const archive = typeof association.archive === 'string' && new RegExp(`^openspec/changes/archive/\\d{4}-\\d{2}-\\d{2}-${change}/$`).test(association.archive) ? association.archive : null;
+      const roots = [active, ...(archive ? [archive] : [])];
+      prefixes = [...roots];
+      for (const root of roots) {
+        const paths = git('ls-tree', '-r', '--name-only', approvedHead, '--', `${root}specs/`);
+        if (paths.code !== 0) throw Error('change scope unreadable');
+        for (const file of paths.stdout.split(/\r?\n/)) if (file.startsWith(`${root}specs/`) && file.endsWith('/spec.md')) prefixes.push(`openspec/specs/${file.slice(`${root}specs/`.length, -'spec.md'.length)}`);
+      }
+    }
+    for (const sha of [...result.commits]) {
+      try {
+        const commit = api.get(`commits/${sha}`), login = `${slug}[bot]`;
+        if (commit.sha !== sha || commit.author?.login !== login || commit.committer?.login !== login) continue;
+        const parents = git('show', '-s', '--format=%P', sha).stdout.trim().split(' ').filter(Boolean);
+        if (parents.length === 1 && change && new RegExp(`^docs\\(openspec\\): (?:finalize|refinalize) ${change}$`).test(git('show', '-s', '--format=%s', sha).stdout.trim())) {
+          const changed = git('diff-tree', '--no-commit-id', '--name-only', '-r', sha);
+          const paths = changed.stdout.trim().split(/\r?\n/).filter(Boolean);
+          if (changed.code === 0 && paths.length && paths.every(p => prefixes.some(prefix => p.startsWith(prefix)))) result.excluded.push(sha);
+        } else if (parents.length === 2 && reviewSha(pr.base?.sha)) {
+          if (git('cat-file', '-e', `${pr.base.sha}^{commit}`).code !== 0) {
+            run('git', ['-C', task.worktree, 'fetch', '--quiet', 'origin', pr.base.sha], { timeout: 2000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+          }
+          if (git('merge-base', '--is-ancestor', parents[1], pr.base.sha).code !== 0) continue;
+          const merged = git('merge-tree', '--write-tree', ...parents);
+          if (merged.code === 0 && merged.stdout.trim() === git('show', '-s', '--format=%T', sha).stdout.trim()) result.excluded.push(sha);
+        }
+      } catch { /* a failed commit proof stays in the delta */ }
+    }
+  } catch (error) { result.reason = error.message; }
+  result.commits = result.commits.filter(sha => !result.excluded.includes(sha));
+  result.covered = result.commits.length === 0;
+  result.reason = result.covered ? 'only verified delivery commits follow approval' : 'non-covered commits need delta review';
+  return result;
+}
 function recordReviewVerdict(h, task, reviewer, verdict, currentHead, pr) {
-  const head = reviewer.reviewHead ?? null, stale = verdict === 'APPROVE' && (!head || !currentHead || head !== currentHead);
-  const reviewVerdict = { verdict, head, currentHead, stale, needsReview: verdict !== 'APPROVE' || stale, at: now(), reviewer: reviewer.id, ...(pr ? { pr } : {}) };
+  const head = reviewer.reviewHead ?? null;
+  const coverage = verdict === 'APPROVE' ? approvalCovers({ ...task, ...(pr ? { pr } : {}) }, head, currentHead) : null;
+  const stale = verdict === 'APPROVE' && !coverage.covered;
+  const reviewVerdict = { verdict, head, currentHead, stale, needsReview: verdict !== 'APPROVE' || stale, at: now(), reviewer: reviewer.id, ...(coverage ? { coverage } : {}), ...(pr ? { pr } : {}) };
   saveTask(h, { ...loadTask(h, reviewer.id), reviewVerdict });
-  saveTask(h, { ...loadTask(h, task.id), reviewVerdict });
+  const approvedHead = verdict === 'APPROVE' && reviewSha(head) ? head : approvedHeadOf(task);
+  saveTask(h, { ...loadTask(h, task.id), ...(approvedHead ? { approvedHead } : {}), reviewVerdict });
   return reviewVerdict;
 }
 // Advisory hooks only: saved launch/report, successful follow-up/handover, or plain land.
@@ -2478,8 +2555,9 @@ function reviewLabels(h, id, action = 'start') {
     let recorded;
     if (completed) recorded = recordReviewVerdict(h, task, reviewer, verdict, currentHead, url);
     if (check) {
-      const previous = task.reviewVerdict, stale = previous.verdict === 'APPROVE' && (!previous.head || !currentHead || previous.head !== currentHead);
-      recorded = { ...previous, currentHead, stale, needsReview: previous.needsReview || stale };
+      const previous = task.reviewVerdict, coverage = approvalCovers(task, approvedHeadOf(task), currentHead);
+      const stale = previous.verdict === 'APPROVE' && !coverage.covered;
+      recorded = { ...previous, currentHead, stale, coverage, needsReview: previous.needsReview || stale };
       saveTask(h, { ...loadTask(h, id), reviewVerdict: recorded });
       if (open && stale) staleApproval(id);
     }
@@ -2510,6 +2588,8 @@ function reviewLabels(h, id, action = 'start') {
     if (!Array.isArray(current) || current.some(l => typeof l?.name !== 'string')) throw new Error('PR labels unreadable');
     const assigned = index => current.some(l => [palette[index].name, ...palette[index].previousNames].includes(l.name));
     if (rework && !palette.some((_, i) => assigned(i))) return;
+    // Build means work/review remains, never a fabricated negative review verdict.
+    if ((completed || check) && recorded.stale && !currentHead) throw Error('approval head could not be verified; keeping labels unchanged');
     const needsRework = rework || completed && (verdict !== 'APPROVE' || recorded.stale) || check && recorded.needsReview;
     let desired = palette[needsRework ? 2 : completed || check ? 1 : 0].name;
     if (starting) {

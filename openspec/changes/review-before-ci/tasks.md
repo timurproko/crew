@@ -2,10 +2,10 @@
 
 ## 1. Approval coverage retains reviewed history across permitted delivery commits
 
-- [ ] 1.1 Retain approved-head evidence separately from the latest verdict, with legacy APPROVE fallback; verify later tells and CHANGES NEEDED do not erase the earlier approval.
-- [ ] 1.2 Implement approvalCovers with ancestry, trusted App author/committer identity, exact change-path finalization and clean base-merge tree proof; cover equal heads, finalize/refinalize, clean merge, human commits, spoofed identity, wrong paths, hand-edited/conflicting merges and unavailable evidence in fake-GitHub/local-Git fixtures.
-- [ ] 1.3 Apply coverage to verdict/check freshness without fabricating CHANGES NEEDED; fixtures must distinguish covered approval, descendant delta needed and force-pushed full review.
-- [ ] 1.4 Document approval coverage, explicit App trust configuration and conservative unavailable-evidence behavior in README; compare documented results with the coverage fixtures.
+- [x] 1.1 Retain approved-head evidence separately from the latest verdict, with legacy APPROVE fallback; verify later tells and CHANGES NEEDED do not erase the earlier approval.
+- [x] 1.2 Implement approvalCovers with ancestry, trusted App author/committer identity, exact change-path finalization and clean base-merge tree proof; cover equal heads, finalize/refinalize, clean merge, human commits, spoofed identity, wrong paths, hand-edited/conflicting merges and unavailable evidence in fake-GitHub/local-Git fixtures.
+- [x] 1.3 Apply coverage to verdict/check freshness without fabricating CHANGES NEEDED; fixtures must distinguish covered approval, descendant delta needed and force-pushed full review.
+- [x] 1.4 Document approval coverage, explicit App trust configuration and conservative unavailable-evidence behavior in README; compare documented results with the coverage fixtures.
 
 ## 2. Review readiness and ship waits enforce checked handoffs with one automatic repair
 
@@ -18,8 +18,8 @@
 ## 3. Delta reviewer briefs require full-head local build and test evidence
 
 - [ ] 3.1 Save automatic delta/full mode, approved base, fixed head and explicit unapproved commit list in reviewer evidence; fixtures must show human/spec changes remain visible while only individually verified permitted delivery commits are excluded.
-- [ ] 3.2 Replace optional-test and verdict-only reviewer instructions with fixed-head checkout, project build/full-suite once, exact first-line verdict, findings and a short What I checked section; generated-brief fixtures must assert commands/results are requested even on APPROVE.
-- [ ] 3.3 Add ship-brief build/full-suite command-and-result duty and document full versus delta review in README; fixtures must retain scratch/shutdown instructions and show delta APPROVE advances the approved head.
+- [ ] 3.2 Replace optional-test and verdict-only reviewer instructions with fixed-head checkout, build/full-suite once for code/test changes, exact first-line verdict, findings and What I checked; generated-brief fixtures must assert commands/results even on APPROVE and an explicit no-test-run exemption for documents/planning-only handoffs.
+- [ ] 3.3 Add ship-brief build/full-suite command/results for code/test changes and an explicit documents/planning-only no-test-run exemption; document full versus delta review in README; fixtures must retain scratch/shutdown instructions and show delta APPROVE advances the approved head.
 
 ## 4. Plain land publishes follow-up commits to the existing open pull request
 

@@ -121,12 +121,17 @@ For a reported workflow implementation ship, crew wait SHALL await passing curre
 
 ### Requirement: Review handoffs include local test evidence
 
-Ship and reviewer briefs SHALL request the project's build and full local test suite once on the handed-off head and commands with results in the report. Reviewer briefs SHALL require checking out the fixed review head, an exact first-line verdict, findings after it and a short what-I-checked section even on APPROVE. A prior ancestral approval SHALL scope review to unapproved commits while retaining full-head build and test duty.
+For handoffs changing code or tests, ship and reviewer briefs SHALL require build and the full local suite once on the handed-off head, with commands/results. Documents-only or planning-only handoffs SHALL require no test run and SHALL state that exemption. Reviewer briefs SHALL require checkout of the fixed head, an exact first-line verdict, findings and What I checked even on APPROVE. Delta reviews SHALL inspect unapproved commits, retaining full-head testing when code or tests changed.
 
 #### Scenario: Worker receives implementation instructions
 
 - **WHEN** crew prepares a ship brief
 - **THEN** the brief requests which build and full local test commands passed on the handed-off head and disclosure of unavailable commands or failures
+
+#### Scenario: Documents or planning only
+
+- **WHEN** a handoff changes only documents or planning artifacts, including a plan commit or spec text
+- **THEN** both briefs explicitly require no test run and ask the report to state the exemption
 
 #### Scenario: Reviewer approves without findings
 

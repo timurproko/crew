@@ -441,8 +441,14 @@ ahead of the PR, diverged from it, or cannot be fast-forwarded, the review is re
 nothing is launched. Without a readable open PR the local head is reviewed. A valid verdict records
 `reviewVerdict` on both the reviewer and ship task: verdict, reviewed `head`, observed
 `currentHead`, `stale`, `needsReview`, timestamp and reviewer ID (and PR link when known).
-For a PR, that same state read supplies its current head. An `APPROVE` for a different or
-unverifiable head sets Rework instead of Approved and says the task needs another review.
+For a PR, that same state read supplies its current head. Approval is retained separately
+from later findings. `CREW_DELIVERY_APP_SLUG` names the trusted delivery App (without `[bot]`):
+GitHub author and committer must both match it. Approval covers later single-parent
+`docs(openspec): finalize|refinalize <change>` commits limited to that change's active/archive
+and affected spec folders, or App-owned clean base merges whose tree matches `git merge-tree`.
+Without configured identity or verifiable proof, no bot exemption is granted. Other descendant
+commits need delta review; a force-push away needs full review. Neither invents a negative verdict.
+An unverifiable head warns instead of selecting Approved or fabricating CHANGES NEEDED.
 Before a plain branch has a PR, the local branch head supplies the comparison. Plain
 `crew land`, including a repeated land, checks the PR head against the last verdict,
 updates recorded freshness and normalizes open-PR labels to Approved or Rework. A stale

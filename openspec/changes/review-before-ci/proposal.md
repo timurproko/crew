@@ -9,7 +9,7 @@ Crew can start reviews before the worker's draft checks pass and currently treat
 - Classify approval coverage using ancestry, verified delivery-App identity, narrowly scoped finalization commits and clean base merges; retain earlier approval for delta reviews and require a full review after a force-push away.
 - Add a review-readiness gate with exit 6 and an explicit `--force` override, retaining the existing PR-head fetch and safe fast-forward.
 - Extend `crew wait` for reported implementation ships to wait for current-head checks, announce readiness, send one automatic failed-check follow-up, and return needs-a-person on another failure.
-- Require worker and reviewer briefs to request the project's build and full local test suite once on the handed-off head, with commands, results and a short reviewer what-I-checked section.
+- Require build and the full local suite once for handoffs changing code or tests, with commands/results and a short reviewer what-I-checked section. Documents-only and planning-only handoffs need no test run and state that exemption.
 - Automatically scope subsequent reviews to unapproved commits, excluding only individually verified delivery-only commits.
 - Allow plain-project land to publish follow-up commits to its existing open PR without opening another PR or rewriting history.
 - Centralize the three label roles: Review at review start, Approved immediately for a covered APPROVE, and Build for changes needed, follow-ups and non-covered changes. Keep today's manifest names until the shared rename lands; do not add a fourth state.

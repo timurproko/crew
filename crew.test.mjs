@@ -7,7 +7,7 @@ import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, autoModeGuard, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, autoModeGuard, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity, approvalCovers } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -2525,6 +2525,58 @@ else fail('unexpected fake request');`);
   const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
   return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, headReads, parent, start, done, writes, warnings, quotaReads, finishResult };
 }
+gapTests['approval-coverage'] = () => {
+  const f = reviewLabelsFixture('coverage'), task = f.parent();
+  const base = git('-C', task.worktree, 'rev-parse', 'HEAD').trim();
+  commit(task.worktree, { 'openspec/changes/example/specs/thing/spec.md': '# delta\n' }, 'change scope');
+  const approved = git('-C', task.worktree, 'rev-parse', 'HEAD').trim(), commits = {};
+  const pr = { body: '```openspec-implementation\n{"change":"example","archive":"openspec/changes/archive/2026-11-26-example/"}\n```', base: { sha: base } };
+  const api = { get: endpoint => commits[endpoint.split('/').at(-1)] ?? {} };
+  const proof = head => approvalCovers(task, approved, head, { pr, api });
+  const add = (files, subject, author = 'delivery[bot]', committer = author) => {
+    commit(task.worktree, files, subject); const sha = git('-C', task.worktree, 'rev-parse', 'HEAD').trim();
+    commits[sha] = { sha, author: { login: author }, committer: { login: committer } }; return sha;
+  };
+  const old = process.env.CREW_DELIVERY_APP_SLUG; process.env.CREW_DELIVERY_APP_SLUG = 'delivery';
+  try {
+    assert.equal(proof(approved).covered, true);
+    const finalized = add({ 'openspec/specs/thing/spec.md': '# synced\n' }, 'docs(openspec): finalize example');
+    assert.equal(proof(finalized).covered, true);
+    const refinalized = add({ 'openspec/changes/archive/2026-11-26-example/acceptance.md': 'accepted\n' }, 'docs(openspec): refinalize example');
+    assert.equal(proof(refinalized).covered, true);
+    const human = add({ 'openspec/specs/thing/spec.md': '# human spec change\n' }, 'docs(openspec): refinalize example', 'person');
+    assert.deepEqual(proof(human).commits, [human]); assert.equal(proof(human).mode, 'delta');
+    const wrong = add({ 'code.js': 'bad\n' }, 'docs(openspec): finalize example');
+    assert.ok(proof(wrong).commits.includes(wrong));
+    const spoof = add({ 'openspec/specs/thing/spec.md': '# spoof\n' }, 'docs(openspec): finalize example', 'delivery[bot]', 'person');
+    assert.ok(proof(spoof).commits.includes(spoof));
+    const other = add({ 'openspec/specs/unrelated/spec.md': '# other\n' }, 'docs(openspec): finalize example');
+    assert.ok(proof(other).commits.includes(other));
+    assert.equal(approvalCovers(task, human, finalized).mode, 'full');
+    assert.equal(proof('b'.repeat(40)).covered, false);
+    // A clean base merge imports ordinary human commits without requiring their re-review.
+    git('-C', f.repo, 'checkout', '-qb', 'base-new', base);
+    commit(f.repo, { 'base.txt': 'new base\n' }, 'base update');
+    pr.base.sha = git('-C', f.repo, 'rev-parse', 'HEAD').trim();
+    git('-C', task.worktree, 'reset', '--hard', refinalized);
+    git('-C', task.worktree, '-c', 'user.name=Maintainer', '-c', 'user.email=maintainer@example.test', 'merge', '--no-ff', '-m', 'base merge', pr.base.sha);
+    const merge = git('-C', task.worktree, 'rev-parse', 'HEAD').trim(); commits[merge] = { sha: merge, author: { login: 'delivery[bot]' }, committer: { login: 'delivery[bot]' } };
+    assert.equal(proof(merge).covered, true);
+    // A hand-edited merge tree is not exempt even with the correct App identity.
+    fs.writeFileSync(path.join(task.worktree, 'hand.txt'), 'hand edit'); git('-C', task.worktree, 'add', '.');
+    git('-C', task.worktree, '-c', 'user.name=Maintainer', '-c', 'user.email=maintainer@example.test', 'commit', '--amend', '--no-edit');
+    const edited = git('-C', task.worktree, 'rev-parse', 'HEAD').trim(); commits[edited] = { ...commits[merge], sha: edited };
+    assert.equal(proof(edited).covered, false);
+    delete process.env.CREW_DELIVERY_APP_SLUG; assert.equal(proof(refinalized).covered, false);
+  } finally { if (old === undefined) delete process.env.CREW_DELIVERY_APP_SLUG; else process.env.CREW_DELIVERY_APP_SLUG = old; }
+  // Latest findings never destroy the last approved head.
+  f.control({ head: git('-C', task.worktree, 'rev-parse', 'HEAD').trim() });
+  const a = f.start().task; assert.equal(f.done(a, 'APPROVE').code, 0);
+  const at = f.task('ship').approvedHead; const b = f.start('ship', '-2').task;
+  assert.equal(f.done(b, 'CHANGES NEEDED').code, 0); assert.equal(f.task('ship').approvedHead, at);
+  assert.equal(f.call(['tell', 'ship', 'fix']).code, 0); assert.equal(f.task('ship').approvedHead, at);
+};
+
 gapTests['review-label-abandon'] = () => {
   const f = reviewLabelsFixture('abandon');
   for (const [id, prior, expected] of [['rework', f.changes, f.changes], ['approved', f.approved, f.approved], ['none', null, null], ['legacy', f.oldChanges, f.changes]]) {
