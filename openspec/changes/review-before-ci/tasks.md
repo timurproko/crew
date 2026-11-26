@@ -29,10 +29,10 @@
 
 ## 5. One role table drives immediate Approved and Build transitions without a CI-wait state
 
-- [ ] 5.1 Centralize stable role keys, fallback names and aliases for Build/Review/Approved; manifest fixtures must prove today's names and a future Build rename work across every relevant hook without adding a fourth role.
-- [ ] 5.2 Select Review on start, Approved immediately for covered APPROVE and Build on CHANGES NEEDED, successful follow-up/relaunch or proven non-covered commits; fixtures must assert CI-pending approval is Approved and stale evidence is never rewritten as a negative verdict.
-- [ ] 5.3 Preserve opt-out, bounded manifest fallback, aliases, unrelated labels, removal-before-add, closed/merged no-writes and abandonment/concurrency safeguards; rerun existing label fixtures and add unavailable-head/covered-bot regression cases.
-- [ ] 5.4 Update README label lifecycle descriptions to distinguish approval from checks and retain later-task boundaries; validate the OpenSpec change and final PR body, with no dispatch/chip/workflow changes in the diff.
+- [x] 5.1 Centralize stable role keys, fallback names and aliases for Build/Review/Approved; manifest fixtures must prove today's names and a future Build rename work across every relevant hook without adding a fourth role.
+- [x] 5.2 Select Review on start, Approved immediately for covered APPROVE and Build on CHANGES NEEDED, successful follow-up/relaunch or proven non-covered commits; fixtures must assert CI-pending approval is Approved and stale evidence is never rewritten as a negative verdict.
+- [x] 5.3 Preserve opt-out, bounded manifest fallback, aliases, unrelated labels, removal-before-add, closed/merged no-writes and abandonment/concurrency safeguards; rerun existing label fixtures and add unavailable-head/covered-bot regression cases.
+- [x] 5.4 Update README label lifecycle descriptions to distinguish approval from checks and retain later-task boundaries; validate the OpenSpec change and final PR body, with no dispatch/chip/workflow changes in the diff.
 
 ## Workflow follow-up
 

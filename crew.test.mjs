@@ -2554,6 +2554,10 @@ gapTests['review-readiness'] = () => {
     [{checksDenied:false,prState:'closed'}, /closed/],
     [{prState:'open',head:'b'.repeat(40)}, /could not be fetched|head/],
     [{head,checks:[{...run(5,'Readiness'),head_sha:'b'.repeat(40)}]}, /different head/],
+    [{checks:[run(6,'Readiness')],statuses:[{id:7,context:'Name guard',state:'failure',created_at:'2026-11-26T10:00:00Z',target_url:'https://checks.test/status'}]}, /Name guard failed/],
+    [{statuses:[],checks:[{id:8,name:'Readiness',status:'mystery'}]}, /unreadable/],
+    [{checks:[{...run(9,'Readiness'),conclusion:'made_up'}]}, /unreadable/],
+    [{checks:Array.from({length:100},(_,i)=>run(100+i,'Readiness'))}, /pagination|budget/],
   ]) { f.control(patch); const r=call(); assert.equal(r.code,6,r.out); assert.match(r.out,pattern); assert.ok(!fs.existsSync(path.join(f.home,'tasks','ship-review'))); }
   f.control({head,checks:[run(6,'Readiness'),run(7,'Readiness','cancelled'),run(8,'Heavy suite','failure')]});
   fs.writeFileSync(path.join(task.worktree,'dirty.txt'),'dirty'); assert.equal(call().code,6); fs.unlinkSync(path.join(task.worktree,'dirty.txt'));
@@ -2566,6 +2570,8 @@ gapTests['review-readiness'] = () => {
   assert.equal(git('--git-dir',remote,'rev-parse',task.branch).trim(),newer);
   assert.equal(reduceReviewChecks([run(1,'Readiness'),run(2,'Readiness','cancelled')]).status,'ready');
   assert.equal(reduceReviewChecks([run(1,'Readiness'),run(2,'Readiness','failure')]).status,'failed');
+  assert.equal(reduceReviewChecks([{...run(1,'Readiness'),started_at:'2026-11-26T10:00:00Z'},run(2,'Readiness',null,'queued')]).status,'pending','A newly queued run cannot be hidden by an older successful run');
+  assert.throws(()=>reduceReviewChecks([{...run(1,'Readiness','failure'),html_url:null}]),/URL unavailable/);
 };
 gapTests['ship-check-wait'] = () => {
   const f = reviewLabelsFixture('check-wait'), task = f.parent('ship', {workflow:'delivery',stage:'implementation'}); reviewRemote(f,task);
@@ -2593,6 +2599,27 @@ gapTests['ship-check-wait'] = () => {
   f.save({...f.task('ship'),checkRepair:undefined}); r=wait(); assert.equal(r.code,124,r.out);
   assert.equal(f.task('ship').state,'reported','fast report is not overwritten by automatic tell');
   assert.equal(f.task('ship').checkRepair.pending,false);
+};
+
+gapTests['review-role-coverage'] = () => {
+  const f=reviewLabelsFixture('role-coverage',{CREW_DELIVERY_APP_SLUG:'delivery'}), ship=f.parent('ship',{workflow:'delivery',stage:'implementation'});
+  commit(ship.worktree,{'openspec/changes/example/specs/thing/spec.md':'# change\n'},'scope'); const a=git('-C',ship.worktree,'rev-parse','HEAD').trim();
+  const manifest=structuredClone(f.manifest); manifest.labels['review-changes-needed']={name:'Build',previousNames:[f.changes,f.oldChanges]};
+  f.control({head:a,manifest,defined:[f.under,f.approved,'Build']});
+  const reviewer=f.start().task; assert.deepEqual(f.control().labels,['unrelated',f.under]);
+  commit(ship.worktree,{'openspec/specs/thing/spec.md':'# synced\n'},'docs(openspec): finalize example'); const final=git('-C',ship.worktree,'rev-parse','HEAD').trim();
+  f.control({head:final,body:'## Implementation\n- [x] Delivered behavior here.\n\n```openspec-implementation\n{"change":"example","archive":"openspec/changes/archive/2026-11-26-example/"}\n```',commits:{[final]:{sha:final,author:{login:'delivery[bot]'},committer:{login:'delivery[bot]'}}},checks:[{id:2,name:'Heavy suite',status:'in_progress',conclusion:null}]});
+  let r=f.done(reviewer,'APPROVE\n\n## What I checked\nCommands and results.'); assert.equal(r.code,0,r.out); assert.equal(f.task('ship').reviewVerdict.stale,false);
+  assert.deepEqual(f.control().labels,['unrelated',f.approved],'Covered approval is immediate even while full CI is pending');
+  reviewRemote(f,ship); const wait=()=>f.call(['wait','ship','--timeout','1'],{CREW_RECOVERY_SECONDS:'0.01'});
+  assert.equal(wait().code,124); assert.deepEqual(f.control().labels,['unrelated',f.approved]);
+  commit(ship.worktree,{'new.js':'unreviewed behavior'},'fix code'); const human=git('-C',ship.worktree,'rev-parse','HEAD').trim(); git('-C',ship.worktree,'push','-q','origin',ship.branch);
+  f.control({head:human,checks:[{id:3,name:'Readiness',status:'completed',conclusion:'success'},{id:4,name:'OpenSpec',status:'completed',conclusion:'success'},{id:5,name:'Heavy suite',status:'in_progress',conclusion:null}]});
+  r=wait(); assert.equal(r.code,0,r.out); assert.match(r.out,/ready for review/); assert.deepEqual(f.control().labels,['unrelated','Build']);
+  assert.equal(f.task('ship').reviewVerdict.verdict,'APPROVE'); assert.equal(f.task('ship').approvedHead,a);
+  const delta=f.start('ship','-2').task; assert.deepEqual(delta.reviewCommits,[human]); assert.equal(f.done(delta,'CHANGES NEEDED\nFix new.js').code,0);
+  assert.deepEqual(f.control().labels,['unrelated','Build']); assert.equal(f.task('ship').approvedHead,a);
+  r=f.call(['tell','ship','fix findings']); assert.equal(r.code,0,r.out); assert.deepEqual(f.control().labels,['unrelated','Build']);
 };
 
 gapTests['plain-land-repairs'] = () => {
@@ -2633,6 +2660,8 @@ gapTests['review-delta-brief'] = () => {
   for(const text of ['DELTA review',`${a}..${human}`,'git checkout --detach','full local test suite once','What I checked','even on APPROVE','needs no test run','plan commit or spec text','test the entire current head']) assert.ok(brief.includes(text),text);
   assert.equal(f.done(next,'APPROVE\n\n## What I checked\nSpec-only delta; no test run required.').code,0); assert.equal(f.task('ship').approvedHead,human);
   assert.equal(f.task('ship').reviewVerdict.needsReview,false);
+  git('-C',ship.worktree,'reset','--hard',a); f.control({head:a});
+  const replaced=f.start('ship','-3').task; assert.equal(replaced.reviewMode,'full'); assert.equal(replaced.reviewBase,null);
 };
 
 gapTests['approval-coverage'] = () => {
@@ -2677,6 +2706,13 @@ gapTests['approval-coverage'] = () => {
     git('-C', task.worktree, '-c', 'user.name=Maintainer', '-c', 'user.email=maintainer@example.test', 'commit', '--amend', '--no-edit');
     const edited = git('-C', task.worktree, 'rev-parse', 'HEAD').trim(); commits[edited] = { ...commits[merge], sha: edited };
     assert.equal(proof(edited).covered, false);
+    commit(f.repo, { 'conflict.txt': 'base side\n' }, 'base conflict'); pr.base.sha=git('-C',f.repo,'rev-parse','HEAD').trim();
+    git('-C',task.worktree,'reset','--hard',refinalized); commit(task.worktree,{'conflict.txt':'task side\n'},'task conflict');
+    const conflicting=spawnSync('git',['-C',task.worktree,'-c','user.name=Maintainer','-c','user.email=maintainer@example.test','merge','--no-commit',pr.base.sha],{encoding:'utf8'});
+    assert.equal(conflicting.status,1); fs.writeFileSync(path.join(task.worktree,'conflict.txt'),'hand resolution\n'); git('-C',task.worktree,'add','.');
+    git('-C',task.worktree,'-c','user.name=Maintainer','-c','user.email=maintainer@example.test','commit','--no-edit');
+    const conflictMerge=git('-C',task.worktree,'rev-parse','HEAD').trim(); commits[conflictMerge]={...commits[merge],sha:conflictMerge};
+    assert.ok(!proof(conflictMerge).excluded.includes(conflictMerge),'A conflict resolution is never a clean base merge');
     delete process.env.CREW_DELIVERY_APP_SLUG; assert.equal(proof(refinalized).covered, false);
   } finally { if (old === undefined) delete process.env.CREW_DELIVERY_APP_SLUG; else process.env.CREW_DELIVERY_APP_SLUG = old; }
   // Latest findings never destroy the last approved head.
@@ -2931,21 +2967,22 @@ gapTests['review-label-current-head'] = () => {
   assert.equal(f.task('ship').reviewVerdict.needsReview, true);
   assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
 
-  f.parent('moved'); const moved = f.start('moved').task, reviewed = f.control().head;
-  f.control({ head: 'b'.repeat(40) }); at = f.calls().length;
+  const movedShip = f.parent('moved'); const moved = f.start('moved').task, reviewed = f.control().head;
+  const movedHead = commit(movedShip.worktree, { 'later.js': 'new code' }, 'later code');
+  f.control({ head: movedHead }); at = f.calls().length;
   r = f.done(moved, 'APPROVE'); assert.equal(r.code, 0, r.out);
   assert.deepEqual(f.control().labels, ['unrelated', f.changes]);
   assert.match(r.out, /approval is for an older head.*needs another review/i);
-  assert.deepEqual(Object.fromEntries(['head', 'currentHead', 'stale', 'needsReview'].map(key => [key, f.task('moved').reviewVerdict[key]])), { head: reviewed, currentHead: 'b'.repeat(40), stale: true, needsReview: true });
+  assert.deepEqual(Object.fromEntries(['head', 'currentHead', 'stale', 'needsReview'].map(key => [key, f.task('moved').reviewVerdict[key]])), { head: reviewed, currentHead: movedHead, stale: true, needsReview: true });
   assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
   const shown = JSON.parse(f.call(['status', '--json']).out).tasks.find(t => t.id === 'moved');
   assert.equal(shown.reviewVerdict.stale, true, 'Status exposes recorded review freshness without network reads');
+  reviewRemote(f, movedShip);
   f.save({ ...f.task('moved'), pr: 'https://github.com/acme/demo/pull/42' }); at = f.calls().length;
   r = f.call(['land', 'moved']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /approval is for an older head.*needs another review/i);
-  assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 1);
+  assert.equal(f.calls().slice(at).filter(c => c.endpoint === 'repos/acme/demo/pulls/42').length, 2);
 
-  git('-C', f.repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git');
   f.parent('discovered', {}, 'Done.'); f.control({ labels: ['unrelated', f.approved] });
   r = f.call(['tell', 'discovered', 'Continue.']); assert.equal(r.code, 0, r.out);
   assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'A plain PR can be discovered before land records its URL');
@@ -2986,7 +3023,7 @@ gapTests['review-label-current-head'] = () => {
   f.parent('missing-head'); const missing = f.start('missing-head').task;
   f.control({ prResponse: { state: 'open' } }); r = f.done(missing, 'APPROVE');
   assert.equal(r.code, 0, r.out); assert.match(r.out, /head could not be verified.*needs another review/);
-  assert.deepEqual(f.control().labels, ['unrelated', f.changes]);
+  assert.deepEqual(f.control().labels, ['unrelated', f.under], 'Unknown head is not a negative verdict and does not invent Build');
 };
 gapTests['review-label-plain-land-head'] = () => {
   const f = reviewLabelsFixture('plain-land-head'), remote = path.join(f.dir, 'origin.git');
@@ -3594,7 +3631,7 @@ console.log('https://example.invalid/acme/demo/pull/7');
   let sent = readWorld().log.filter(a => a[0] === 'send').at(-1);
   assert.equal(sent[1], s1.terminal); assert.ok(sent[2].includes('Keep the first line.') && sent[2].includes('crew done s1'), sent[2]);
   // Nothing is reviewed or delivered before the worker reported, and a scout has no branch.
-  for (const verb of ['review', 'land']) { assert.equal(own([verb]).code, 2); assert.equal(own([verb, 's1']).code, 2, verb); assert.equal(own([verb, 's2']).code, 2, verb); assert.equal(own([verb, 's1'], 'c1').code, 3); }
+  for (const verb of ['review', 'land']) { assert.equal(own([verb]).code, 2); assert.equal(own([verb, 's1']).code, verb === 'review' ? 6 : 2, verb); assert.equal(own([verb, 's2']).code, 2, verb); assert.equal(own([verb, 's1'], 'c1').code, 3); }
   commit(s1copy, { 'README.md': 'one\ntwo\nthree\n' }, 'Add a third line');
   fs.writeFileSync(s1.report, '# Done\nAdded a line.\n'); assert.equal(crew(['done', 's1'], { terminal: s1.terminal }).code, 0);
   // A follow-up reopens a reported task; the same worker reports again.
@@ -3632,7 +3669,10 @@ console.log('https://example.invalid/acme/demo/pull/7');
   assert.equal(JSON.parse(r.out).tasks.find(t => t.id === 's1').pr, 'https://example.invalid/acme/demo/pull/7');
   r = own(['status']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /^s1\t[^\r\n]*\thttps:\/\/example\.invalid\/acme\/demo\/pull\/7\r?$/m);
-  assert.match(own(['land', 's1', '--title', 'x']).out, /already has a pull request/);
+  const creationsBefore = JSON.parse(fs.readFileSync(ghLog, 'utf8')).filter(c => c.a[0] === 'pr' && c.a[1] === 'create').length;
+  const unprovenRepeat = own(['land', 's1', '--title', 'x']);
+  assert.equal(unprovenRepeat.code, 6, unprovenRepeat.out); assert.match(unprovenRepeat.out, /GitHub evidence unreadable/);
+  assert.equal(JSON.parse(fs.readFileSync(ghLog, 'utf8')).filter(c => c.a[0] === 'pr' && c.a[1] === 'create').length, creationsBefore, 'An unproven repeat never opens another PR');
   for (const id of ['s1-review', 's1-review-2', 's2', 's1']) assert.equal(own(['finish', id, '--force']).code, 0, id);
   assert.ok(git('-C', project, 'branch', '--list', 'feature/s1').includes('feature/s1'), 'A branch whose pull request is not merged stays');
   // A squash merge leaves no ancestry: GitHub's merged pull request with this exact head counts.

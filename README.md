@@ -486,13 +486,17 @@ the retained approved-to-current range and an explicit list of unapproved commit
 only individually verified permitted delivery commits, not all spec paths. Code/test deltas
 still test the entire current head; replaced history gets full review.
 Plain
-`crew land`, including a repeated land, checks the PR head against the last verdict,
-updates recorded freshness and normalizes open-PR labels to Approved or Rework. A stale
-approval warns and selects Rework. Status JSON exposes the saved
+`crew land`, including a repeated land, checks the PR head against retained approval,
+updates freshness and normalizes open-PR labels. The three semantic roles are **Build**,
+**Review**, **Approved**, from one table: today's Build-role manifest name is still `🤖 Rework`
+until the shared rename lands. Covered approval selects Approved immediately, even with
+pending CI; non-covered work selects Build and needs delta/full review, never a fabricated
+CHANGES NEEDED verdict. GitHub's checks show CI and its required check blocks merging.
+There is no fourth stage or approval-waiting-for-CI chip. Status JSON exposes the saved
 verdict; plain status says `needs another review` when recorded, without new GitHub reads.
 
 After a successful `crew tell` or `crew relaunch` of a ship task, existing managed
-assignments (including an active Review) are best-effort replaced by the current Rework
+assignments (including an active Review) are best-effort replaced by the current Build-role
 name on an open PR. Recorded verdicts are marked as needing another review. No PR, no
 managed assignment, or a merged/closed PR causes no label writes. Every label-setting hook
 removes the other managed roles and historical aliases, even when added by hand; if a

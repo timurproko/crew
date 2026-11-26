@@ -1666,12 +1666,14 @@ function cmdWait(args) {
         let result;
         try {
           const context = reviewPrEvidence(task);
-          const full = !!approvedHeadOf(task) || !!task.landed;
+          const approved = approvedHeadOf(task);
+          const covered = approved && context ? approvalCovers(task, approved, context.pr.head.sha, { api: context, pr: context.pr }).covered : false;
+          const full = approved ? covered && !task.reviewVerdict?.needsReview : !!task.landed;
           result = full && context ? { ...reviewChecks(context, { light: false, workflow: !!task.workflow }), head: context.pr.head.sha, context } : reviewReadiness(task, { sync: false });
           const latest = loadTask(h, id);
           if (!sameWorker(latest, task) || latest.state !== 'reported' || latest.reported !== task.reported || latest.told !== task.told) continue;
+          if (approvedHeadOf(task) && result.context && task.reviewVerdict?.currentHead !== result.head) reviewLabels(h, id, 'check');
           if (result.status === 'ready') {
-            if (approvedHeadOf(task)) reviewLabels(h, id, 'check');
             settled.set(id, result.noCi ? 'reviewed locally; no CI' : full ? 'checks passed' : 'ready for review'); continue;
           }
           if (result.status === 'failed') {
@@ -2409,11 +2411,12 @@ function cmdReview(args) {
   let n = 1, reviewId = `${id}-review`.slice(0, 40);
   while (fs.existsSync(taskDir(h, reviewId))) reviewId = `${id.slice(0, 30)}-review-${++n}`;
   const reviewHead = ready.head ?? pullRequestReviewHead(task), target = reviewHead ?? branchOf(task);
+  if (!reviewSha(reviewHead)) refuse(`Task ${id} has no verifiable fixed head to review.`, 6);
   const approvedHead = approvedHeadOf(task), coverage = approvalCovers(task, approvedHead, reviewHead);
   const delta = !!approvedHead && coverage.mode === 'delta';
   const text = [
     `Review the work of task ${id}. It is the branch \`${branchOf(task)}\` of this repository; you are on the commit it started from.`,
-    '', `- Review the fixed head \`${target}\` with \`git log HEAD..${target}\` and \`git diff HEAD...${target}\`. Read the changed files whole where the diff is not enough.`,
+    '', delta ? `- The fixed head is \`${target}\`. Review only the delta scope below; use earlier files only as context.` : `- Review the fixed head \`${target}\` with \`git log HEAD..${target}\` and \`git diff HEAD...${target}\`. Read the changed files whole where the diff is not enough.`,
     ...(delta ? [
       `- This is a DELTA review of \`${approvedHead}..${target}\`, not a re-review of approved work. Inspect \`git log ${approvedHead}..${target}\`.`,
       `- Unapproved task commits (review each with \`git show --format=fuller --first-parent <sha>\`): ${coverage.commits.join(', ') || 'none; approval still covers this head'}.`,
@@ -2501,7 +2504,7 @@ export function reduceReviewChecks(runs, { light = true, required = [] } = {}) {
   if (!Array.isArray(runs)) throw Error('checks unreadable');
   const latest = new Map();
   for (const r of runs) {
-    if (!r || typeof r.name !== 'string' || !Number.isSafeInteger(r.id) || !['queued', 'in_progress', 'completed', 'waiting', 'pending', 'requested'].includes(r.status)) throw Error('check run unreadable');
+    if (!r || typeof r.name !== 'string' || !r.name || !Number.isSafeInteger(r.id) || r.id < 0 || !['queued', 'in_progress', 'completed', 'waiting', 'pending', 'requested'].includes(r.status) || r.conclusion != null && !['success', 'failure', 'neutral', 'skipped', 'cancelled', 'timed_out', 'action_required', 'stale', 'startup_failure'].includes(r.conclusion)) throw Error('check run unreadable');
     if (r.conclusion === 'cancelled' || light && !lightCheck(r.name)) continue;
     const previous = latest.get(r.name);
     const order = Date.parse(r.started_at ?? r.created_at) || 0, before = Date.parse(previous?.started_at ?? previous?.created_at) || 0;
@@ -2510,7 +2513,10 @@ export function reduceReviewChecks(runs, { light = true, required = [] } = {}) {
   const checks = [...latest.values()];
   const missing = required.filter(name => !checks.some(c => c.name === name || c.name.endsWith(`/ ${name}`)));
   const failed = checks.find(c => c.status === 'completed' && !['success', 'neutral', 'skipped', null].includes(c.conclusion));
-  if (failed) return { status: 'failed', check: failed, reason: `${failed.name} failed: ${failed.html_url ?? 'check URL unavailable'}` };
+  if (failed) {
+    if (typeof failed.html_url !== 'string' || !/^https?:\/\//.test(failed.html_url)) throw Error(`failed check ${failed.name} URL unavailable`);
+    return { status: 'failed', check: failed, reason: `${failed.name} failed: ${failed.html_url}` };
+  }
   if (missing.length || !checks.length) return { status: 'pending', reason: `missing checks: ${missing.join(', ') || (light ? 'light draft checks' : 'CI')}` };
   const pending = checks.find(c => c.status !== 'completed' || !c.conclusion || light && c.conclusion !== 'success');
   return pending ? { status: 'pending', reason: `${pending.name} has not passed` } : { status: 'ready', reason: 'checks passed' };
@@ -2536,6 +2542,7 @@ function reviewChecks(context, { light = true, workflow = false } = {}) {
   }
   const required = light && workflow ? ['Readiness', ...(/```openspec-implementation/.test(pr.body ?? '') ? ['OpenSpec'] : [])] : [];
   const result = reduceReviewChecks(checks, { light, required });
+  if (!workflow && light && checks.length && !checks.some(c => lightCheck(c.name))) return { status: 'ready', reason: 'no light draft checks; full CI does not gate review' };
   if (!workflow && !checks.length) return { status: 'ready', noCi: true, reason: 'reviewed locally; no CI' };
   return result;
 }
@@ -2559,7 +2566,7 @@ export function reviewReadiness(task, { force = false, sync = true } = {}) {
     const published = git('ls-remote', '--exit-code', '--heads', 'origin', branchOf(task));
     if (published.code !== 0 || published.stdout.trim().split(/\s+/)[0] !== head) throw Error('branch publication could not be verified; push local commits first');
     if (task.workflow) {
-      if (task.stage === 'plan') throw Error('last report is a plan, not an implementation');
+      if (task.stage === 'plan' || task.stage !== 'implementation' && !/^Implementation:/i.test(fs.readFileSync(task.report, 'utf8').split(/\r?\n/)[0])) throw Error('last report is not an implementation');
       const outcomes = /^## Implementation\s*$([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(pr.body ?? '')?.[1] ?? '';
       if (!/^\s*- \[[xX]\]/m.test(outcomes) || /^\s*- \[ \]/m.test(outcomes)) throw Error('implementation outcomes are missing or unticked');
     }
@@ -2584,7 +2591,7 @@ function reviewApi(url) {
     if (remaining <= 0) throw Error('GitHub evidence read budget exhausted');
     const r = gh(['api', '--hostname', m[1], '--method', 'GET', `${repo}/${endpoint}`], { timeout: Math.min(2000, remaining) });
     if (r.code !== 0) throw Error((r.stderr || r.stdout).trim().replace(/\s+/g, ' ') || 'GitHub unavailable');
-    return JSON.parse(r.stdout);
+    try { return JSON.parse(r.stdout); } catch { throw Error('GitHub evidence unreadable'); }
   };
   return { get, repo, number: Number(m[4]), repository: `${m[2]}/${m[3]}`, hostname: m[1] };
 }
@@ -2592,10 +2599,15 @@ function reviewApi(url) {
 // history, not new worker commits. Unknown evidence always remains in the review scope.
 export function approvalCovers(task, approvedHead, head, evidence = {}) {
   const git = (...a) => run('git', ['-C', task.worktree, ...a], { timeout: 2000 });
-  const result = { covered: false, mode: 'full', commits: [], excluded: [], reason: 'head could not be verified' };
+  const result = { covered: false, verified: false, mode: 'full', commits: [], excluded: [], reason: 'head could not be verified' };
   if (!reviewSha(approvedHead) || !reviewSha(head)) return result;
-  if (approvedHead === head) return { ...result, covered: true, mode: 'delta', reason: 'approved head' };
-  if (git('merge-base', '--is-ancestor', approvedHead, head).code !== 0) return { ...result, reason: 'approved head is not an ancestor; full review required' };
+  if (approvedHead === head) return { ...result, covered: true, verified: true, mode: 'delta', reason: 'approved head' };
+  if (git('cat-file', '-e', `${head}^{commit}`).code !== 0) {
+    try { const api = evidence.api ?? reviewApi(reviewPrUrl(task)); run('git', ['-C', task.worktree, 'fetch', '--quiet', 'origin', `refs/pull/${api.number}/head`], { timeout: 2000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }); } catch { /* unknown remains unverified */ }
+  }
+  const ancestor = git('merge-base', '--is-ancestor', approvedHead, head);
+  if (ancestor.code !== 0) return { ...result, verified: ancestor.code === 1, reason: ancestor.code === 1 ? 'approved head is not an ancestor; full review required' : result.reason };
+  result.verified = true;
   const listed = git('rev-list', '--first-parent', '--reverse', `${approvedHead}..${head}`);
   if (listed.code !== 0) return result;
   result.mode = 'delta'; result.commits = listed.stdout.trim().split(/\r?\n/).filter(Boolean);
@@ -2655,6 +2667,13 @@ function recordReviewVerdict(h, task, reviewer, verdict, currentHead, pr) {
   saveTask(h, { ...loadTask(h, task.id), ...(approvedHead ? { approvedHead } : {}), reviewVerdict });
   return reviewVerdict;
 }
+// Stable semantic roles. Display names and aliases are resolved once per hook;
+// the shared manifest can rename Build without changing any transition logic.
+const REVIEW_ROLES = [
+  { role: 'review', key: 'under-review', name: '\u{1F916} Review', previousNames: ['\u{1F916} Under review'] },
+  { role: 'approved', key: 'review-approved', name: '\u{1F916} Approved', previousNames: [] },
+  { role: 'build', key: 'review-changes-needed', name: '\u{1F916} Rework', previousNames: ['\u{1F916} Changes needed'] },
+];
 // Advisory hooks only: saved launch/report, successful follow-up/handover, or plain land.
 // Each PR state/head read is bounded and attempted once, with no label retries or leases.
 function reviewLabels(h, id, action = 'start') {
@@ -2676,7 +2695,7 @@ function reviewLabels(h, id, action = 'start') {
     if (task.stage === 'plan' || /^Plan:/i.test(first)) return;
     if (completed) recordReviewVerdict(h, task, reviewer, verdict, reviewHeadOf(task));
     if (check && !task.reviewVerdict) return;
-    if (rework && task.reviewVerdict) saveTask(h, { ...loadTask(h, id), reviewVerdict: { ...task.reviewVerdict, needsReview: true } });
+    if (rework && task.reviewVerdict) saveTask(h, { ...loadTask(h, id), reviewVerdict: { ...task.reviewVerdict, needsReview: true, invalidated: true } });
     let url = (/^Implementation:/i.test(first) || task.gate ? PR_LINK.exec(first)?.[0] : null) ?? task.pr ?? task.reviewVerdict?.pr ?? (abandon ? reviewer.reviewLabelBefore?.pr : null);
     if (!url && rework && run('git', ['-C', task.worktree, 'remote', 'get-url', 'origin'], { timeout: 2000 }).code !== 0) return;
     if (!url) {
@@ -2705,7 +2724,7 @@ function reviewLabels(h, id, action = 'start') {
     if (check) {
       const previous = task.reviewVerdict, coverage = approvalCovers(task, approvedHeadOf(task), currentHead);
       const stale = previous.verdict === 'APPROVE' && !coverage.covered;
-      recorded = { ...previous, currentHead, stale, coverage, needsReview: previous.needsReview || stale };
+      recorded = { ...previous, currentHead, stale, coverage, needsReview: previous.verdict !== 'APPROVE' || previous.invalidated === true || !coverage.covered };
       saveTask(h, { ...loadTask(h, id), reviewVerdict: recorded });
       if (open && stale) staleApproval(id);
     }
@@ -2716,12 +2735,8 @@ function reviewLabels(h, id, action = 'start') {
     const pages = JSON.parse(api('GET', `${repo}/actions/variables`, ['--paginate', '--slurp']));
     if (!Array.isArray(pages) || !pages.length || pages.some(p => !Array.isArray(p?.variables) || p.variables.some(v => typeof v.name !== 'string' || typeof v.value !== 'string'))) throw new Error('repository variables unreadable');
     if (pages.flatMap(p => p.variables).some(v => v.name === 'DELIVERY_LABELS_ENABLED' && v.value.toLowerCase() === 'false')) throw new Error('repository opted out with DELIVERY_LABELS_ENABLED=false');
-    const keys = ['under-review', 'review-approved', 'review-changes-needed'];
-    let palette = [
-      { name: '\u{1F916} Review', previousNames: ['\u{1F916} Under review'] },
-      { name: '\u{1F916} Approved', previousNames: [] },
-      { name: '\u{1F916} Rework', previousNames: ['\u{1F916} Changes needed'] },
-    ];
+    const keys = REVIEW_ROLES.map(role => role.key);
+    let palette = REVIEW_ROLES;
     try {
       const source = process.env.CREW_REVIEW_LABELS_REPO ?? 'timurproko/MyWorkflows';
       if (!/^[\w.-]+\/[\w.-]+$/.test(source)) throw new Error('invalid CREW_REVIEW_LABELS_REPO');
@@ -2737,9 +2752,10 @@ function reviewLabels(h, id, action = 'start') {
     const assigned = index => current.some(l => [palette[index].name, ...palette[index].previousNames].includes(l.name));
     if (rework && !palette.some((_, i) => assigned(i))) return;
     // Build means work/review remains, never a fabricated negative review verdict.
-    if ((completed || check) && recorded.stale && !currentHead) throw Error('approval head could not be verified; keeping labels unchanged');
-    const needsRework = rework || completed && (verdict !== 'APPROVE' || recorded.stale) || check && recorded.needsReview;
-    let desired = palette[needsRework ? 2 : completed || check ? 1 : 0].name;
+    if ((completed || check) && recorded.stale && (!currentHead || recorded.coverage?.verified === false)) throw Error('approval head could not be verified; keeping labels unchanged');
+    const needsBuild = rework || completed && (verdict !== 'APPROVE' || recorded.stale) || check && recorded.needsReview;
+    const role = needsBuild ? 'build' : completed || check ? 'approved' : 'review';
+    let desired = palette[REVIEW_ROLES.findIndex(r => r.role === role)].name;
     if (starting) {
       // Save stable roles before removing anything, including labels added by hand.
       const prior = [1, 2].filter(assigned);
