@@ -71,7 +71,7 @@ crew done [<id>]                         (worker) my report is written
 crew tools [--json]                      companion tools on this machine and what crew does with each
 crew backlog [tasks-axi command...]      the durable list of work in this home (tasks-axi)
 crew tell <id> "<message>"               send the worker a follow-up; it reports again
-crew review <id> [--force] [who]         review a checked handoff; exit 6 if too early
+crew review <id> [who]                   review a reported ship in parallel with CI
 crew land <id> [--title "<title>"]       push a ship task's branch and open a pull request, or record the one its workflow or gate opened
 crew fix [who] "<problem>"               start a worker that repairs crew itself
 crew selfrepair <id>                     check that repair and open its pull request
@@ -452,36 +452,31 @@ saying which ignored roots or local changes/scratch were discarded, or `discarde
 nothing was removed. A failed partial discard is identified as incomplete rather than reported
 as a successful return; reports and unmerged branches stay retained.
 
-### Review readiness and waiting
+### Parallel CI and review
 
-`crew review` refuses early with exit **6** and an actionable reason; it never waits itself.
-A workflow ship must be reported as implementation, have every outcome ticked, a clean
-published copy at the exact open PR head, and passing light draft checks (Readiness, OpenSpec
-and Name guard where applicable). The safe PR-head fetch/fast-forward remains; ahead or
-diverged work is never overwritten. `--force` explicitly bypasses readiness, not ownership
-or destructive Git safeguards. Plain reported branches without a PR keep local review.
-Ready PR repairs can be reviewed while heavy CI is pending or failed: only light checks gate review.
-The latest non-cancelled attempt per check name on that exact head counts. A cancelled-only
-applicable check (including Name guard) remains missing, not silently optional. Every applicable
-light check needs actual success; skipped, neutral, pending, missing or unreadable results do
-not prove readiness. An optional light name never observed is not invented as a requirement.
+Workers run only useful targeted tests, push through the project's publication path and
+report immediately, without waiting for CI or the delivery bot. As soon as implementation
+reports, publish/record the PR with `crew land` and start `crew review`: CI and review run
+together. Review requires a reported worker, not passing checks or ticked outcomes. It keeps
+the safe PR-head fast-forward and refuses ahead/diverged copies rather than overwriting work.
+`crew wait` returns at the report as before; it does not read checks, send failed-check tells
+or hold a reported ship for CI. Existing provider/quota/idle recovery is unchanged.
 
-`crew wait <ship id>` now holds a reported workflow implementation for those checks and prints
-`ready for review` when green. A clean copy safely behind the PR is assessed against that
-published head without moving the checkout; review then performs the guarded fast-forward.
-Ahead, diverged and dirty copies remain blocked. For a covered approval or landed PR, wait
-observes full CI without delaying the approval label. Workflow full-CI completion requires
-promotion out of draft and a successful current-head **CI required** gate plus passing
-applicable light checks. Draft-guard suite/gate skips never prove full CI. A ready PR's
-non-required suite may skip by path selection only while that required gate actually succeeds;
-a skipped or absent required gate stays pending. Check runs do not expose the skip predicate,
-so Crew uses this gate evidence rather than guessing why a job skipped. The owner sends **one** automatic repair follow-up
-naming a failed check and its link; another failed repair attempt returns `needs a person`
-(exit **7**). The allowance and failed-attempt identity survive new wait processes; the same
-failure is not repeatedly sent or counted twice. A non-owner or `--no-fallback` never sends it.
-Unknown or pending checks stay waiting until timeout (exit **124**). Plans, scouts, reviewers,
-gate reports and plain branches without PR/CI retain their ordinary report settlement.
-Status remains read-only; these checks run only in the relevant commands.
+The coordinator gathers CI failures and review findings, then sends both in one `crew tell`
+so one fix push covers them. Every finding is **BLOCKING** (the change does not do what it
+claims, can lose data, or can get stuck) or **FOLLOW-UP** (wording, edge cases, polish).
+Only BLOCKING findings cause CHANGES NEEDED and another round; queue FOLLOW-UP items with
+`crew backlog add <id> "<finding>"` without holding the merge. The next review covers only the
+fix, not unchanged work. After two rounds that still fail, tell the person.
+
+A PR is ready to merge when review approved its head, or later head changes are covered
+by the delivery-App rule below, and required checks are green. The Approved label alone
+is not proof of green CI. Do not add scope to an open PR; start a new task. Dispatching the
+delivery bot after approval is not part of this flow.
+
+These rules are in the coordinator template installed into a Crew home. `crew update`
+installs the new tool; the next `crew start` automatically rewrites the home's coordinator
+instructions when the template differs, with no manual editing of existing homes.
 
 ### Advisory review labels
 
@@ -515,14 +510,13 @@ and affected spec folders, or App-owned clean base merges whose tree matches `gi
 Without configured identity or verifiable proof, no bot exemption is granted. Other descendant
 commits need delta review; a force-push away needs full review. Neither invents a negative verdict.
 An unverifiable head warns instead of selecting Approved or fabricating CHANGES NEEDED.
-Before a plain branch has a PR, the local branch head supplies the comparison. Reviewers check out the fixed head and report a first-line verdict followed by findings
-and a short **What I checked** section even on APPROVE. For handoffs changing code or tests,
-workers and reviewers run the project's build and full local test suite once on the handed-off
-head and list commands/results. Documents-only and planning-only handoffs (including plan
-commits and spec text) need no test run; the report states that exemption. Delta review uses
-the retained approved-to-current range and an explicit list of unapproved commits, excluding
-only individually verified permitted delivery commits, not all spec paths. Code/test deltas
-still test the entire current head; replaced history gets full review.
+Before a plain branch has a PR, the local branch head supplies the comparison. Reviewers
+check out the fixed head, read the diff and run targeted tests where useful, never a full
+local suite. Reports begin APPROVE or CHANGES NEEDED, then include a short **What I checked**
+section even on APPROVE. Every finding is BLOCKING or FOLLOW-UP; only a BLOCKING finding
+justifies CHANGES NEEDED. Delta review uses the last reviewed-to-current range (or retained
+approval as fallback) and rechecks prior blockers against only the fix, excluding individually
+verified delivery commits, not all spec paths. Rewritten approved history gets full review.
 Plain
 `crew land`, including a repeated land, checks the PR head against retained approval,
 updates freshness and normalizes open-PR labels. The three semantic roles are **Build**,

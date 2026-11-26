@@ -7,7 +7,7 @@ import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, autoModeGuard, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity, approvalCovers, reduceReviewChecks } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, autoModeGuard, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity, approvalCovers } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -31,14 +31,14 @@ assert.equal(bashPath('D:\\Git\\x y'), '/d/Git/x y'); assert.equal(bashPath('/ho
 assert.deepEqual(Object.keys(AGENTS), ['a1', 'pi', 'claude']);
 const brief = briefText({ id: 't1', kind: 'scout', task: 'Count lines.', worktree: 'W', project: 'p', report: 'R' });
 assert.match(brief, /read-only investigation/); assert.match(brief, /crew done t1/); assert.match(brief, /`R`/);
-assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' }), /commit them/);
+assert.match(briefText({ id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' }), /commit and push them/);
 // Delivery instructions stay distinct; all briefs share external scratch and instance hygiene.
 // A scout's brief does not change for a workflow project; the gate wins over it.
 {
   const ship = { id: 't1', kind: 'ship', task: 'x', worktree: 'W', project: 'p', report: 'R' };
-  const ends = '- For a hand-off that changes code or tests, run the project build and full local test suite once on the head you hand off, following README/docs. List the exact build and test commands and results in your report, including failures or unavailable commands. A hand-off that changes only documents or planning artifacts (including a plan commit or spec text) needs no test run; state that exemption in the report.\n- When you are finished, write your result to `R` in Markdown, with the answer in the first lines.\n- Then run `crew done t1` and stop. Do not start any other work.\n- If you cannot finish, write what blocked you to the same file and still run the command.\n';
+  const ends = '- Run only targeted tests for what you touched, where useful, and list commands/results in your report. Do not run the full local test suite. Push through the project publication path, then report at once; do not wait for CI or the delivery bot. CI and review run in parallel, and the coordinator will combine failures and BLOCKING findings into one fix round.\n- When you are finished, write your result to `R` in Markdown, with the answer in the first lines.\n- Then run `crew done t1` and stop. Do not start any other work.\n- If you cannot finish, write what blocked you to the same file and still run the command.\n';
   const start = '# Task t1 (ship)\n\nx\n\n## Rules\n- Work only inside `W`. It is your own copy of the project `p`; nobody else uses it.\n- Output exception: keep proof pictures and scratch outside the working copy, in your crew task folder `.`. This folder is allowed for reports and disposable output, not project edits.\n- Stop every disposable app instance or server you started before writing your report and running `crew done`.\n';
-  assert.equal(briefText(ship), `${start}- Make your changes on the branch already checked out here and commit them. Do not push or open a pull request unless the task says so.\n${ends}`);
+  assert.equal(briefText(ship), `${start}- Make your changes on the branch already checked out here, commit and push them. Do not open or merge a pull request yourself; crew land handles its publication.\n${ends}`);
   const gated = `${start}- Make your changes on the branch already checked out here and commit them.\n- This project is delivered through the no-mistakes gate, which reviews, tests, pushes and opens the pull request itself. After committing, run \`no-mistakes axi run --yes --intent-file I --skip ci\` here and do what it prints (\`no-mistakes axi --help\`) until it reports an outcome. A wait that runs out is not a failure: run the same command again to go on. Do not push or open a pull request any other way.\n- The gate ends when the pull request is open. Its checks are not watched here: the person reads them on the pull request.\n- Put the pull request link the gate gives you in the first lines of your report. If the gate stops on something only a person can decide, say exactly what in the report.\n${ends}`;
   assert.equal(briefText({ ...ship, gate: 'I', gateSkip: ['ci'] }), gated);
   assert.equal(briefText({ ...ship, gate: 'I', gateSkip: ['ci'], workflow: true, branch: 'fix/t1' }), gated);
@@ -1333,8 +1333,7 @@ gapTests['owned-terminals'] = () => {
 
 gapTests['owned-review'] = () => {
   const f = leftoversFixture('review'), t = f.spawn('author'), bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
-  // This terminal-ownership fixture has no check-run service; readiness has its own fixtures.
-  let r = f.call(['review', t.id, '--agent', 'pi', '--force']); assert.equal(r.code, 0, r.out);
+  let r = f.call(['review', t.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out);
   const review = f.task('author-review'), old = structuredClone(readWorld().terminals[review.terminal]);
   assert.deepEqual(review.terminals.map(t => t.address), [review.terminal]);
   r = f.call(['relaunch', review.id, '--agent', 'pi', '--model', 'next-reviewer'], { CREW_AGENT_PATH: bin }); assert.equal(r.code, 0, r.out);
@@ -2810,7 +2809,7 @@ else fail('unexpected fake request');`);
   const headRead = (c, i) => c.saved === undefined && starts.some(([from, to]) => i >= from && i < to);
   const calls = () => allCalls().filter((c, i) => !headRead(c, i)), headReads = () => allCalls().filter(headRead);
   const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim(), branch: t.branch }); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
-  const start = (id = 'ship', suffix = '') => { const review = `${id}-review${suffix}`; control({ watch: review }); const from = allCalls().length, r = f.call(['review', id, '--agent', 'pi', '--force']); starts.push([from, allCalls().length]); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
+  const start = (id = 'ship', suffix = '') => { const review = `${id}-review${suffix}`; control({ watch: review }); const from = allCalls().length, r = f.call(['review', id, '--agent', 'pi']); starts.push([from, allCalls().length]); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
   const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
   const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
   const warnings = r => r.out.split(/\r?\n/).filter(line => line.startsWith('crew: review labels:'));
@@ -2823,142 +2822,46 @@ function reviewRemote(f, task) {
   git('-C', task.worktree, 'push', '-q', 'origin', `HEAD:refs/heads/${task.branch}`);
   return remote;
 }
-gapTests['review-readiness'] = () => {
-  const f = reviewLabelsFixture('readiness'), task = f.parent('ship', { workflow: 'delivery', stage: 'implementation' });
-  const remote = reviewRemote(f, task), head = git('-C', task.worktree, 'rev-parse', 'HEAD').trim();
-  const call = () => f.call(['review', task.id, '--agent', 'pi']);
-  const run = (id, name, conclusion = 'success', status = 'completed') => ({id,name,conclusion,status,head_sha:head,html_url:`https://checks.test/${id}`});
-  for (const [patch, pattern] of [
-    [{body:'## Implementation\n- [ ] unfinished behavior\n'}, /outcomes/],
-    [{body:'no outcomes'}, /outcomes/],
-    [{body:'## Implementation\n- [x] completed behavior\n',checks:[]}, /missing checks/],
-    [{checks:[run(2,'Readiness',null,'in_progress')]}, /not passed/],
-    [{checks:[run(3,'Readiness','failure')]}, /failed/],
-    [{checks:[run(4,'Readiness','success','completed')],checksDenied:true}, /checks unavailable/],
-    [{checksDenied:false,prState:'closed'}, /closed/],
-    [{prState:'open',head:'b'.repeat(40)}, /could not be fetched|head/],
-    [{head,checks:[{...run(5,'Readiness'),head_sha:'b'.repeat(40)}]}, /different head/],
-    [{checks:[run(6,'Readiness')],statuses:[{id:7,context:'Name guard',state:'failure',created_at:'2026-11-26T10:00:00Z',target_url:'https://checks.test/status'}]}, /Name guard failed/],
-    [{statuses:[],checks:[{id:8,name:'Readiness',status:'mystery'}]}, /unreadable/],
-    [{checks:[{...run(9,'Readiness'),conclusion:'made_up'}]}, /unreadable/],
-    [{checks:Array.from({length:100},(_,i)=>run(100+i,'Readiness'))}, /pagination|budget/],
-  ]) { f.control(patch); const r=call(); assert.equal(r.code,6,r.out); assert.match(r.out,pattern); assert.ok(!fs.existsSync(path.join(f.home,'tasks','ship-review'))); }
-  f.control({head,checks:[run(6,'Readiness'),run(7,'Readiness','cancelled'),run(8,'Heavy suite','failure')]});
-  fs.writeFileSync(path.join(task.worktree,'dirty.txt'),'dirty'); assert.equal(call().code,6); fs.unlinkSync(path.join(task.worktree,'dirty.txt'));
-  f.save({...f.task('ship'),state:'working'}); assert.equal(call().code,6); f.save({...f.task('ship'),state:'reported'});
-  let r=call(); assert.equal(r.code,0,r.out); assert.equal(f.task('ship-review').reviewHead,head);
-  f.control({checks:[run(9,'Readiness'),run(10,'Readiness','failure')]}); assert.equal(call().code,6);
-  r=f.call(['review','ship','--force','--agent','pi']); assert.equal(r.code,0,r.out);
-  commit(task.worktree,{'next.txt':'next'},'next'); const newer=git('-C',task.worktree,'rev-parse','HEAD').trim(); f.control({head:newer,checks:[{...run(11,'Readiness'),head_sha:newer}]});
-  assert.equal(call().code,6); git('-C',task.worktree,'push','-q','origin',task.branch); assert.equal(call().code,0);
-  assert.equal(git('--git-dir',remote,'rev-parse',task.branch).trim(),newer);
-  assert.equal(reduceReviewChecks([run(1,'Readiness'),run(2,'Readiness','cancelled')]).status,'ready');
-  assert.equal(reduceReviewChecks([run(1,'Readiness'),run(2,'Readiness','failure')]).status,'failed');
-  assert.equal(reduceReviewChecks([{...run(1,'Readiness'),started_at:'2026-11-26T10:00:00Z'},run(2,'Readiness',null,'queued')]).status,'pending','A newly queued run cannot be hidden by an older successful run');
-  assert.throws(()=>reduceReviewChecks([{...run(1,'Readiness','failure'),html_url:null}]),/URL unavailable/);
+gapTests['coordinator-parallel-loop'] = () => {
+  const f=gapFixture('parallel-coordinator'), file=path.join(f.home,'coordinator','AGENTS.md');
+  const expected=fs.readFileSync(file,'utf8'), text=expected.replace(/\s+/g,' ');
+  for(const part of ['start review at once','CI and review run together','wait for neither CI nor the delivery bot','send them together','Only BLOCKING findings','crew backlog add','covers only the fix','After two rounds that still fail','required checks are green','Do not add scope to an open pull request; start a new task','not a full local suite']) assert.ok(text.includes(part),part);
+  fs.writeFileSync(file,'old coordinator instructions');
+  const r=f.call(['start']); assert.equal(r.code,0,r.out); assert.match(r.out,/coordinator rules changed/);
+  assert.equal(fs.readFileSync(file,'utf8'),expected,'Existing homes receive the new baseline at crew start');
 };
-gapTests['wait-safe-fast-forward'] = () => {
-  const f=reviewLabelsFixture('wait-fast-forward'), task=f.parent('ship',{workflow:'delivery',stage:'implementation'});
-  const remote=reviewRemote(f,task), base=git('-C',task.worktree,'rev-parse','HEAD').trim();
-  const bot=path.join(f.dir,'bot'); git('clone','-q','--branch',task.branch,remote,bot);
-  const head=commit(bot,{'spec.txt':'bot finalization'},'docs: bot head');
-  git('-C',bot,'push','-q','origin',`HEAD:refs/heads/${task.branch}`,'HEAD:refs/pull/42/head');
-  f.control({head,draft:true});
-  const wait=()=>f.call(['wait','ship','--timeout','0.01','--no-fallback']);
-  let r=wait(); assert.equal(r.code,0,r.out); assert.match(r.out,/ready for review/);
-  assert.equal(git('-C',task.worktree,'rev-parse','HEAD').trim(),base,'Waiting only assesses safe fast-forward, never moves the ship checkout');
-  const coreBefore=readWorld().log.length;
-  r=f.call(['wait','ship','--timeout','0.01','--no-fallback'],{CREW_TERMINAL:'read-only-inspector'}); assert.equal(r.code,0,r.out);
-  assert.ok(!readWorld().log.slice(coreBefore).some(a=>['run','kill','rm','send','label'].includes(a[0])),'Non-owner wait sends no messages and changes no terminal');
-  assert.equal(git('-C',task.worktree,'rev-parse','HEAD').trim(),base);
-  const before=f.calls().length;
-  r=f.call(['review','ship','--agent','pi']); assert.equal(r.code,0,r.out); assert.match(r.out,/fast-forwarded/);
-  assert.equal(f.task('ship-review').reviewHead,head); assert.equal(git('-C',task.worktree,'rev-parse','HEAD').trim(),head);
-  assert.equal(f.calls().slice(before).filter(c=>c.endpoint==='repos/acme/demo/pulls/42').length,2,'One gate snapshot and one advisory label snapshot');
-  git('-C',task.worktree,'reset','--hard',base); fs.writeFileSync(path.join(task.worktree,'dirty.txt'),'not disposable');
-  r=wait(); assert.equal(r.code,124,r.out); assert.match(r.out,/uncommitted/); fs.unlinkSync(path.join(task.worktree,'dirty.txt'));
-  commit(task.worktree,{'local.txt':'unpublished'},'unpublished work');
-  const local=git('-C',task.worktree,'rev-parse','HEAD').trim(); r=wait(); assert.equal(r.code,124,r.out); assert.match(r.out,/cannot be safely fast-forwarded/);
-  assert.equal(git('-C',task.worktree,'rev-parse','HEAD').trim(),local,'Diverged work stays untouched');
+gapTests['review-fix-only'] = () => {
+  const f=reviewLabelsFixture('fix-only'), task=f.parent(), head=f.control().head;
+  const first=f.start().task; assert.equal(f.done(first,'CHANGES NEEDED\n\n## What I checked\nBLOCKING README.md: claimed behavior missing.').code,0);
+  assert.equal(f.task('ship').approvedHead,undefined);
+  const fix=commit(task.worktree,{'fix.js':'export const works=true;'},'fix blocker'); f.control({head:fix});
+  const next=f.start('ship','-2').task;
+  assert.equal(next.reviewMode,'delta'); assert.equal(next.reviewBase,head); assert.deepEqual(next.reviewCommits,[fix]);
+  assert.ok(fs.readFileSync(next.brief,'utf8').includes(slash(first.report)),'Fix-only review can recheck the previous blocker report');
+  assert.equal(f.done(next,'APPROVE\n\n## What I checked\nTargeted fix inspected.\nFOLLOW-UP README.md: wording can be polished.').code,0);
+  assert.equal(f.task('ship').approvedHead,fix); assert.deepEqual(f.control().labels,['unrelated',f.approved],'Follow-ups do not manufacture a negative verdict');
 };
-gapTests['review-check-truth-table'] = () => {
-  const f=reviewLabelsFixture('check-truth-table'), task=f.parent('ship',{workflow:'delivery',stage:'implementation'}); reviewRemote(f,task);
-  const head=git('-C',task.worktree,'rev-parse','HEAD').trim();
-  const run=(id,name,conclusion='success',status='completed')=>({id,name,conclusion,status,head_sha:head,html_url:`https://checks.test/${id}`});
-  const baseline=()=>[run(1,'Readiness'),run(2,'OpenSpec'),run(3,'Name guard'),run(4,'Crew tests (linux)'),run(5,'CI required')];
-  const replace=(name,...attempts)=>[...baseline().filter(c=>c.name!==name),...attempts];
-  // Every row runs through the real GitHub collection, gate and both wait modes,
-  // in draft and ready PR states. Failure waits disable automatic tells for exit 7;
-  // ship-check-wait independently covers the one-tell/second-failure lifecycle.
-  const cases=[
-    {name:'success',checks:baseline(),gate:0,light:0,full:0},
-    {name:'failure',checks:replace('Name guard',run(10,'Name guard','failure')),gate:6,light:7,full:7},
-    {name:'cancelled-only',checks:replace('Name guard',run(10,'Name guard','cancelled')),gate:6,light:124,full:124},
-    {name:'cancelled then success',checks:replace('Name guard',run(10,'Name guard','cancelled'),run(11,'Name guard')),gate:0,light:0,full:0},
-    {name:'success then cancelled',checks:replace('Name guard',run(10,'Name guard'),run(11,'Name guard','cancelled')),gate:0,light:0,full:0},
-    {name:'failure then cancelled',checks:replace('Name guard',run(10,'Name guard','failure'),run(11,'Name guard','cancelled')),gate:6,light:7,full:7},
-    {name:'skipped by draft guard',checks:baseline().map(c=>/Crew tests|CI required/.test(c.name)?{...c,conclusion:'skipped'}:c),gate:0,light:0,full:124},
-    {name:'skipped by path selection',checks:replace('Crew tests (linux)',run(10,'Crew tests (linux)','skipped')),gate:0,light:0,full:0},
-    {name:'pending',checks:replace('Name guard',run(10,'Name guard',null,'queued')),gate:6,light:124,full:124},
-    {name:'absent required light',checks:baseline().filter(c=>c.name!=='OpenSpec'),gate:6,light:124,full:124},
-    {name:'absent full-CI gate',checks:baseline().filter(c=>c.name!=='CI required'),gate:0,light:0,full:124},
-    {name:'cancelled-only full-CI gate',checks:replace('CI required',run(10,'CI required','cancelled')),gate:0,light:0,full:124},
-    {name:'skipped light path selection',checks:replace('Name guard',run(10,'Name guard','skipped')),gate:6,light:124,full:124},
-    {name:'absent optional light',checks:baseline().filter(c=>c.name!=='Name guard'),gate:0,light:0,full:0},
-    {name:'no checks',checks:[],gate:6,light:124,full:124},
-    {name:'heavy suite failure',checks:replace('Crew tests (linux)',run(10,'Crew tests (linux)','failure')),gate:0,light:0,full:7},
-    {name:'legacy status pending',checks:baseline(),statuses:[{id:100,context:'CI required',state:'pending',created_at:'2026-11-26T10:00:00Z',target_url:'https://checks.test/status'}],gate:0,light:0,full:124},
-    {name:'legacy status failure',checks:baseline(),statuses:[{id:100,context:'Name guard',state:'error',created_at:'2026-11-26T10:00:00Z',target_url:'https://checks.test/status'}],gate:6,light:7,full:7},
-  ];
-  const body='## Implementation\n- [x] Delivered behavior and tests.\n\n```openspec-implementation\n{"version":3,"change":"example"}\n```';
-  for(const draft of [true,false]) for(const row of cases) {
-    f.control({draft,body,checks:row.checks,statuses:row.statuses??[],labels:['unrelated']}); f.save({...task,approvedHead:undefined,reviewVerdict:undefined});
-    const label=`${draft?'draft':'ready'} / ${row.name}`;
-    let r=f.call(['review','ship','--agent','pi']); assert.equal(r.code,row.gate,`${label} gate: ${r.out}`);
-    r=f.call(['wait','ship','--timeout','0.01','--no-fallback']); assert.equal(r.code,row.light,`${label} light wait: ${r.out}`);
-    if(row.light===0) assert.match(r.out,/ready for review/);
-    f.save({...task,approvedHead:head,reviewVerdict:{verdict:'APPROVE',head,currentHead:head,stale:false,needsReview:false}});
-    f.control({labels:['unrelated',f.approved]});
-    r=f.call(['wait','ship','--timeout','0.01','--no-fallback']);
-    const expected=draft&&row.full===0?124:row.full;
-    assert.equal(r.code,expected,`${label} full wait: ${r.out}`);
-    if(expected===0) assert.match(r.out,/checks passed/);
-    if(draft&&expected===124) assert.match(r.out,/draft.*promotion/);
-    assert.deepEqual(f.control().labels,['unrelated',f.approved],`${label}: CI never postpones or demotes approval by itself`);
-    assert.equal(f.task('ship').checkRepair,undefined,'No-fallback never sends a repair');
+gapTests['reported-review-no-ci-gate'] = () => {
+  const f=reviewLabelsFixture('reported-review'), task=f.parent('ship',{workflow:'delivery',stage:'implementation'});
+  const call=()=>f.call(['review','ship','--agent','pi']);
+  f.save({...task,state:'working'}); assert.equal(call().code,2); f.save(task);
+  for(const draft of [true,false]) for(const conclusion of ['success','failure','cancelled','skipped',null]) {
+    f.control({draft,body:'## Implementation\n- [ ] Unfinished outcome text.\n',checksDenied:true,checks:[{id:1,name:'Name guard',status:conclusion?'completed':'queued',conclusion}]});
+    const r=call(); assert.equal(r.code,0,`${draft}/${conclusion}: ${r.out}`);
   }
-  // Required CI success, not the check-run skipped conclusion, proves path skips.
-  for(const name of ['CI required','Name guard']) assert.equal(reduceReviewChecks([run(20,name,'cancelled')],{light:name==='Name guard',required:[name]}).status,'pending');
+  assert.ok(!f.calls().some(c=>/check-runs|\/statuses\?|actions\/runs/.test(c.endpoint??'')),'Review never reads checks');
 };
-
-gapTests['ship-check-wait'] = () => {
-  const f = reviewLabelsFixture('check-wait'), task = f.parent('ship', {workflow:'delivery',stage:'implementation'}); reviewRemote(f,task);
-  const wait = extra => f.call(['wait','ship','--timeout','1'],{CREW_RECOVERY_SECONDS:'0.01',...extra});
-  let r=wait(); assert.equal(r.code,0,r.out); assert.match(r.out,/ready for review/);
-  f.control({checks:[{id:2,name:'Readiness',status:'in_progress',conclusion:null}]}); r=wait(); assert.equal(r.code,124,r.out);
-  f.control({checks:[{id:3,name:'Readiness',status:'completed',conclusion:'failure'}]});
-  r=wait({CREW_NO_FALLBACK:'1'}); assert.equal(r.code,7,r.out); assert.equal(f.task('ship').checkRepair,undefined);
-  r=wait(); assert.equal(r.code,124,r.out); assert.match(r.out,/automatic check repair/);
-  assert.equal(f.task('ship').state,'working'); assert.equal(f.task('ship').checkRepair.check,'Readiness');
-  assert.ok(JSON.stringify(readWorld().log.filter(a=>a[0]==='send')).includes('https://checks.test/3'));
-  f.save({...f.task('ship'),state:'reported',reported:'new-report'});
-  r=wait(); assert.equal(r.code,124,r.out); assert.equal(f.task('ship').checkRepair.failure,`${f.control().head}:3:Readiness`);
-  f.control({checks:[{id:4,name:'Readiness',status:'completed',conclusion:'failure'}]}); r=wait(); assert.equal(r.code,7,r.out); assert.match(r.out,/already attempted/);
-  f.save({...f.task('ship'),checkRepair:undefined,approvedHead:f.control().head});
-  f.control({checks:[{id:5,name:'Readiness',status:'completed',conclusion:'success'},{id:6,name:'Heavy suite',status:'completed',conclusion:'failure'}]});
-  r=wait(); assert.equal(r.code,124,r.out); assert.equal(f.task('ship').checkRepair.check,'Heavy suite');
-  f.save({...f.task('ship'),state:'reported',checkRepair:undefined});
-  const sentBefore=readWorld().log.filter(a=>a[0]==='send').length;
-  r=wait({CREW_TERMINAL:'read-only-inspector'}); assert.equal(r.code,7,r.out);
-  assert.equal(readWorld().log.filter(a=>a[0]==='send').length,sentBefore);
-  setTerminal(task.terminal,{sendError:true}); r=wait(); assert.equal(r.code,7,r.out); assert.equal(f.task('ship').state,'reported');
-  assert.equal(f.task('ship').checkRepair.error,'message delivery failed');
-  setTerminal(task.terminal,{sendError:false,reportOnSend:path.join(f.home,'tasks','ship','task.json')});
-  f.save({...f.task('ship'),checkRepair:undefined}); r=wait(); assert.equal(r.code,124,r.out);
-  assert.equal(f.task('ship').state,'reported','fast report is not overwritten by automatic tell');
-  assert.equal(f.task('ship').checkRepair.pending,false);
+gapTests['reported-wait-no-ci'] = () => {
+  const f=reviewLabelsFixture('reported-wait'), task=f.parent('ship',{workflow:'delivery',stage:'implementation',checkRepair:{pending:true}});
+  const before=f.calls().length, core=readWorld().log.length, record=JSON.stringify(f.task('ship'));
+  f.control({network:true});
+  for(const flags of [[],['--no-fallback']]) {
+    const r=f.call(['wait','ship','--timeout','0.01',...flags]); assert.equal(r.code,0,r.out); assert.match(r.out,/ship: reported/);
+  }
+  assert.equal(f.calls().length,before,'Reported wait makes no GitHub requests even with a legacy repair record');
+  assert.equal(JSON.stringify(f.task('ship')),record,'Reported wait never reopens or rewrites the task');
+  assert.ok(!readWorld().log.slice(core).some(a=>['send','run','kill','rm','label'].includes(a[0])));
 };
-
 gapTests['review-role-coverage'] = () => {
   const f=reviewLabelsFixture('role-coverage',{CREW_DELIVERY_APP_SLUG:'delivery'}), ship=f.parent('ship',{workflow:'delivery',stage:'implementation'});
   commit(ship.worktree,{'openspec/changes/example/specs/thing/spec.md':'# change\n'},'scope'); const a=git('-C',ship.worktree,'rev-parse','HEAD').trim();
@@ -2970,14 +2873,18 @@ gapTests['review-role-coverage'] = () => {
   let r=f.done(reviewer,'APPROVE\n\n## What I checked\nCommands and results.'); assert.equal(r.code,0,r.out); assert.equal(f.task('ship').reviewVerdict.stale,false);
   assert.deepEqual(f.control().labels,['unrelated',f.approved],'Covered approval is immediate even while full CI is pending');
   reviewRemote(f,ship); const wait=()=>f.call(['wait','ship','--timeout','1'],{CREW_RECOVERY_SECONDS:'0.01'});
-  assert.equal(wait().code,124); assert.deepEqual(f.control().labels,['unrelated',f.approved]);
+  assert.equal(wait().code,0); assert.deepEqual(f.control().labels,['unrelated',f.approved]);
   commit(ship.worktree,{'new.js':'unreviewed behavior'},'fix code'); const human=git('-C',ship.worktree,'rev-parse','HEAD').trim(); git('-C',ship.worktree,'push','-q','origin',ship.branch);
   f.control({head:human,checks:[{id:3,name:'Readiness',status:'completed',conclusion:'success'},{id:4,name:'OpenSpec',status:'completed',conclusion:'success'},{id:5,name:'Heavy suite',status:'in_progress',conclusion:null}]});
-  r=wait(); assert.equal(r.code,0,r.out); assert.match(r.out,/ready for review/); assert.deepEqual(f.control().labels,['unrelated','Build']);
+  r=wait(); assert.equal(r.code,0,r.out); assert.match(r.out,/ship: reported/); assert.deepEqual(f.control().labels,['unrelated',f.approved],'Wait does not observe commits or change labels');
   assert.equal(f.task('ship').reviewVerdict.verdict,'APPROVE'); assert.equal(f.task('ship').approvedHead,a);
-  const delta=f.start('ship','-2').task; assert.deepEqual(delta.reviewCommits,[human]); assert.equal(f.done(delta,'CHANGES NEEDED\nFix new.js').code,0);
+  const delta=f.start('ship','-2').task; assert.deepEqual(delta.reviewCommits,[human]); assert.equal(f.done(delta,'CHANGES NEEDED\nBLOCKING new.js: fix the behavior.').code,0);
   assert.deepEqual(f.control().labels,['unrelated','Build']); assert.equal(f.task('ship').approvedHead,a);
   r=f.call(['tell','ship','fix findings']); assert.equal(r.code,0,r.out); assert.deepEqual(f.control().labels,['unrelated','Build']);
+  const fix=commit(ship.worktree,{'new.js':'fixed behavior'},'fix findings'); f.control({head:fix}); f.save({...f.task('ship'),state:'reported'});
+  const second=f.start('ship','-3').task;
+  assert.equal(second.reviewBase,human,'A second review covers only the fix after the last negative verdict');
+  assert.deepEqual(second.reviewCommits,[fix]); assert.equal(f.task('ship').approvedHead,a);
 };
 
 gapTests['plain-land-repairs'] = () => {
@@ -3017,7 +2924,7 @@ gapTests['review-delta-brief'] = () => {
   assert.equal(next.reviewMode,'delta'); assert.equal(next.reviewBase,a); assert.deepEqual(next.reviewCommits,[human]); assert.deepEqual(next.reviewExcluded,[bot]);
   assert.deepEqual(next.workerSpace,ship.workerSpace,'Delta reviewer inherits the ship placement after the home mode changes');
   const brief=fs.readFileSync(next.brief,'utf8');
-  for(const text of ['DELTA review',`${a}..${human}`,'git checkout --detach','full local test suite once','What I checked','even on APPROVE','needs no test run','plan commit or spec text','test the entire current head']) assert.ok(brief.includes(text),text);
+  for(const text of ['DELTA review',`${a}..${human}`,'git checkout --detach','targeted tests where useful','Do not run the full local test suite','What I checked','even on APPROVE','EVERY finding','BLOCKING','FOLLOW-UP','only if at least one finding is BLOCKING','do not hold the merge']) assert.ok(brief.includes(text),text);
   assert.equal(f.done(next,'APPROVE\n\n## What I checked\nSpec-only delta; no test run required.').code,0); assert.equal(f.task('ship').approvedHead,human);
   assert.equal(f.task('ship').reviewVerdict.needsReview,false);
   git('-C',ship.worktree,'reset','--hard',a); f.control({head:a});
@@ -3435,7 +3342,7 @@ gapTests['review-pull-request-head'] = () => {
   const diverged = f.parent('diverged'); commit(diverged.worktree, { 'change.txt': 'worker\n' }, 'worker change');
   f.control({ head: botPush(diverged, { 'openspec.txt': 'finalized\n' }) });
   const local = commit(diverged.worktree, { 'change.txt': 'unpushed\n' }, 'local change');
-  let refused = f.call(['review', 'diverged', '--agent', 'pi', '--force']);
+  let refused = f.call(['review', 'diverged', '--agent', 'pi']);
   assert.equal(refused.code, 2, refused.out); assert.match(refused.out, /diverged from the pull request/);
   assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'diverged-review')), 'A refused review launches nothing');
   assert.equal(git('-C', diverged.worktree, 'rev-parse', 'HEAD').trim(), local, 'A diverged copy is left alone');
@@ -3443,7 +3350,7 @@ gapTests['review-pull-request-head'] = () => {
   const ahead = f.parent('ahead'); commit(ahead.worktree, { 'change.txt': 'worker\n' }, 'worker change');
   const before = botPush(ahead, { 'openspec.txt': 'finalized\n' }); git('-C', ahead.worktree, 'fetch', '-q', 'origin', 'refs/pull/42/head'); git('-C', ahead.worktree, 'merge', '--ff-only', '-q', before);
   commit(ahead.worktree, { 'change.txt': 'unpushed\n' }, 'local change'); f.control({ head: before });
-  refused = f.call(['review', 'ahead', '--agent', 'pi', '--force']);
+  refused = f.call(['review', 'ahead', '--agent', 'pi']);
   assert.equal(refused.code, 2, refused.out); assert.match(refused.out, /ahead of the pull request: push it first/);
 };
 gapTests['plain-land-lifecycle-facts'] = () => {
@@ -3991,7 +3898,7 @@ console.log('https://example.invalid/acme/demo/pull/7');
   let sent = readWorld().log.filter(a => a[0] === 'send').at(-1);
   assert.equal(sent[1], s1.terminal); assert.ok(sent[2].includes('Keep the first line.') && sent[2].includes('crew done s1'), sent[2]);
   // Nothing is reviewed or delivered before the worker reported, and a scout has no branch.
-  for (const verb of ['review', 'land']) { assert.equal(own([verb]).code, 2); assert.equal(own([verb, 's1']).code, verb === 'review' ? 6 : 2, verb); assert.equal(own([verb, 's2']).code, 2, verb); assert.equal(own([verb, 's1'], 'c1').code, 3); }
+  for (const verb of ['review', 'land']) { assert.equal(own([verb]).code, 2); assert.equal(own([verb, 's1']).code, 2, verb); assert.equal(own([verb, 's2']).code, 2, verb); assert.equal(own([verb, 's1'], 'c1').code, 3); }
   commit(s1copy, { 'README.md': 'one\ntwo\nthree\n' }, 'Add a third line');
   fs.writeFileSync(s1.report, '# Done\nAdded a line.\n'); assert.equal(crew(['done', 's1'], { terminal: s1.terminal }).code, 0);
   // A follow-up reopens a reported task; the same worker reports again.

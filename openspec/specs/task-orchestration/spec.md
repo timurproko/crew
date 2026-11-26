@@ -287,7 +287,7 @@ After saving an exact first-line verdict, crew SHALL immediately select Approved
 
 #### Scenario: Non-covered work needs delta review
 
-- **WHEN** crew observes non-covered commits after an approval
+- **WHEN** a relevant verdict or publication command observes non-covered commits after an approval
 - **THEN** it selects the Build role, retains the prior APPROVE and says another review is needed rather than recording CHANGES NEEDED
 
 ### Requirement: Review label swaps remain advisory and definition preserving
@@ -316,7 +316,7 @@ Crew SHALL use signed-in gh credentials and existing shared label definitions on
 
 ### Requirement: Minimal review labels have explicit lifecycle limitations
 
-Crew SHALL use only Build, Review and Approved roles, with names from the shared manifest, and no approval-waiting-for-CI state. Tell, relaunch, check observation and plain land SHALL update relevant open-PR roles best-effort; status SHALL remain read-only. No background sweep, lease or pending-label protocol SHALL be added. Abandoned reviews SHALL retain existing last-local-reviewer restoration safeguards. Closed/merged PRs SHALL receive no new role assignments.
+Crew SHALL use only Build, Review and Approved roles, with names from the shared manifest, and no approval-waiting-for-CI state. Tell, relaunch, verdict processing and plain land SHALL update relevant open-PR roles best-effort; status and reported-task wait SHALL remain read-only. No background sweep, lease or pending-label protocol SHALL be added. Abandoned reviews SHALL retain existing last-local-reviewer restoration safeguards. Closed/merged PRs SHALL receive no new role assignments.
 
 #### Scenario: Reviewer stops without a valid verdict
 
@@ -764,147 +764,77 @@ Crew SHALL retain the last approved head independently of later findings. Approv
 - **WHEN** commit identity, ancestry, path scope or merge-tree evidence is unavailable or malformed
 - **THEN** crew does not claim approval covers the current head
 
-### Requirement: Review starts require a ready handoff
+### Requirement: Review and wait follow report-time handoffs
 
-Crew SHALL refuse a premature review with exit 6 and a specific reason unless explicitly forced. For a workflow implementation PR, readiness SHALL require a reported task, an open exact PR, a clean published local head equal to the PR head, all implementation outcomes ticked and passing light draft checks on that head. Crew SHALL keep its safe PR-head fast-forward and SHALL NOT wait inside review.
+Crew SHALL permit review once a ship worker reports without reading or waiting for CI checks or implementation outcomes. Review SHALL keep the existing safe fast-forward to the exact PR head and refuse ahead or diverged copies. Crew wait SHALL settle reported tasks immediately without querying CI, sending failed-check follow-ups or introducing a check-failure escalation.
 
-#### Scenario: Worker has not reported
+#### Scenario: Review runs alongside CI
 
-- **WHEN** review is requested before the ship worker reports
-- **THEN** crew refuses with exit 6 without launching a reviewer
+- **WHEN** a ship worker reports while its PR checks are pending, failed, cancelled, skipped, absent or unavailable
+- **THEN** crew may start its review without a CI-readiness gate, retaining the safe fixed-head synchronization
 
-#### Scenario: Draft is ready for review
+#### Scenario: Worker is still working
 
-- **WHEN** the worker reported implementation, all outcomes are ticked, local and PR heads match with no unpushed work, and the current head's light draft checks pass
-- **THEN** crew launches review without requiring promotion or full CI success
+- **WHEN** review is requested before the worker reports
+- **THEN** crew refuses because the report is not ready, not because of checks
 
-#### Scenario: Ready PR needs another review
+#### Scenario: Reported ship settles immediately
 
-- **WHEN** a ready PR contains new non-covered commits and its current head has passed light checks while full CI is pending or failed
-- **THEN** crew permits review of the new commits without converting the PR to draft
+- **WHEN** wait observes a reported ship regardless of PR or CI state
+- **THEN** it returns the report without GitHub check reads, checkout movement, automatic failed-check tells or check-based needs-a-person escalation
 
-#### Scenario: Ship copy can be safely updated
+### Requirement: Review handoffs use targeted tests and classified findings
 
-- **WHEN** the local copy is clean and strictly behind the exact PR head
-- **THEN** crew fetches and fast-forwards it before assessing readiness and fixes the reviewer target to that PR head
+Worker briefs SHALL request only useful targeted tests, publication and immediate reporting without waiting for CI or a delivery bot. Reviewer briefs SHALL require the fixed head, targeted tests where useful, an exact first-line verdict and What I checked even on APPROVE. Every finding SHALL be BLOCKING or FOLLOW-UP; CHANGES NEEDED SHALL require at least one BLOCKING finding. Neither brief SHALL require a full local suite.
 
-#### Scenario: Handoff is incomplete or unverifiable
-
-- **WHEN** outcomes are missing or unticked, local work is dirty, commits are unpushed, heads diverge, required light checks are missing, pending or failed, or the PR/check read is unavailable
-- **THEN** crew refuses with exit 6 and identifies what must be completed before review
-
-#### Scenario: Duplicate cancelled checks exist
-
-- **WHEN** multiple check runs have the same name on the target head
-- **THEN** crew uses the latest non-cancelled run per check name and does not let cancelled duplicates supersede useful results
-
-#### Scenario: Cancelled-only applicable light check
-
-- **WHEN** Readiness succeeds but the only current-head Name guard attempt is cancelled
-- **THEN** crew retains Name guard as applicable, refuses review until a non-cancelled successful attempt exists, and does not let a longer wait manufacture success
-
-#### Scenario: Skipped applicable light check
-
-- **WHEN** an applicable light check is skipped in either draft or ready state
-- **THEN** crew requires actual light-check success regardless of whether the skip came from draft guards or path selection
-
-#### Scenario: Coordinator explicitly forces a review
-
-- **WHEN** the owner requests review with --force despite an unmet readiness condition
-- **THEN** crew identifies the bypass and permits review without bypassing ownership, ship-task identity or destructive Git protections
-
-#### Scenario: Plain local branch has no PR
-
-- **WHEN** a reported plain ship has no PR or no origin
-- **THEN** crew permits a fixed local-head review without requiring workflow outcomes or nonexistent remote checks
-
-### Requirement: Ship waits settle on checks with one repair follow-up
-
-For a reported workflow implementation, crew wait SHALL settle as ready for review after current-head light checks pass. Full-CI completion SHALL require a ready PR and a successful current-head CI required gate, without delaying Approved. Only the owner SHALL send one failed-check repair follow-up naming the check and URL. Another failed repair handoff SHALL settle as needs-a-person with exit 7; timeout SHALL remain 124.
-
-#### Scenario: Light checks finish after report
-
-- **WHEN** a reported implementation ship has pending light checks which later pass on its current head
-- **THEN** wait remains active until it prints ready for review without launching a reviewer
-
-#### Scenario: Published PR is safely ahead of the ship copy
-
-- **WHEN** the reported implementation's copy is clean and strictly behind its exact published PR head, and that head's light checks pass
-- **THEN** wait settles as ready for review without moving the checkout, and the subsequent review performs the guarded fast-forward
-
-#### Scenario: Approved draft has skipped heavy suites
-
-- **WHEN** an approved draft has passing light checks but draft guards skipped its heavy suites and required CI gate
-- **THEN** wait remains pending for promotion and real required-gate success without delaying or demoting Approved
-
-#### Scenario: Ready PR has an optional path-selected suite skip
-
-- **WHEN** a ready PR's non-required suite is skipped, all applicable light checks pass and the current-head CI required gate succeeds
-- **THEN** wait may report full CI passed, but a skipped or absent required gate never supplies that proof
-
-#### Scenario: First failed check reopens work
-
-- **WHEN** wait sees a failed applicable check and no automatic check-repair follow-up has been sent
-- **THEN** it sends one follow-up with the failing check name and link, reopens the ship and continues waiting for a new handoff
-
-#### Scenario: Repeated polling is not another failure
-
-- **WHEN** another wait invocation sees the same failed head and check-run identity after the automatic follow-up
-- **THEN** it sends no duplicate message and does not count that unchanged observation as a failed repair
-
-#### Scenario: Repair handoff fails again
-
-- **WHEN** the worker hands off again and a newer applicable check attempt fails after the single automatic repair follow-up
-- **THEN** wait settles as needs-a-person with exit 7 and identifies the failed check and attempted repair
-
-#### Scenario: Failure follows approval on a ready PR
-
-- **WHEN** full CI fails after approval
-- **THEN** wait sends its allowed repair follow-up on that ready PR, preserves the approved-head evidence and requires delta review for the fix commits rather than converting the PR to draft
-
-#### Scenario: Checks are inaccessible or no check applies
-
-- **WHEN** GitHub evidence is unavailable for a workflow ship, or checks remain pending
-- **THEN** wait does not claim readiness and times out conservatively unless a known blocker needs a person
-
-#### Scenario: Reader or disabled automation cannot tell
-
-- **WHEN** a non-owner waits or --no-fallback disables automatic recovery
-- **THEN** wait never sends a follow-up and reports a failed-check blocker for a person
-
-#### Scenario: Other report types retain their behavior
-
-- **WHEN** a scout, reviewer, Plan report or gate task reports, or a plain branch has no PR or applicable CI
-- **THEN** wait retains ordinary report settlement without inventing a remote-check gate
-
-### Requirement: Review handoffs include local test evidence
-
-For handoffs changing code or tests, ship and reviewer briefs SHALL require build and the full local suite once on the handed-off head, with commands/results. Documents-only or planning-only handoffs SHALL require no test run and SHALL state that exemption. Reviewer briefs SHALL require checkout of the fixed head, an exact first-line verdict, findings and What I checked even on APPROVE. Delta reviews SHALL inspect unapproved commits, retaining full-head testing when code or tests changed.
-
-#### Scenario: Worker receives implementation instructions
+#### Scenario: Worker hands off work
 
 - **WHEN** crew prepares a ship brief
-- **THEN** the brief requests build and full local test commands/results for code/test changes, or an explicit no-test-run exemption for documents/planning-only work, and disclosure of unavailable commands or failures
+- **THEN** it requests targeted commands/results and reporting as soon as the work is pushed, allowing CI and review to proceed in parallel
 
-#### Scenario: Documents or planning only
+#### Scenario: Reviewer has only follow-ups
 
-- **WHEN** a handoff changes only documents or planning artifacts, including a plan commit or spec text
-- **THEN** both briefs explicitly require no test run and ask the report to state the exemption
+- **WHEN** findings concern wording, edge cases or polish rather than failure of the claimed behavior, data loss or getting stuck
+- **THEN** the brief requires FOLLOW-UP findings under APPROVE and a short What I checked section, with follow-ups queued by the coordinator rather than holding the merge
 
-#### Scenario: Reviewer approves without findings
+#### Scenario: Reviewer finds a blocker
 
-- **WHEN** crew prepares the reviewer brief
-- **THEN** it requires APPROVE or CHANGES NEEDED as the first line and a what-I-checked section listing head, build/test commands and results even when there are no defects
+- **WHEN** the change does not do what it claims, can lose data or can get stuck
+- **THEN** the brief requires a BLOCKING finding and CHANGES NEEDED, with file/line, impact and reproduction details
 
 #### Scenario: Delta review excludes only proven delivery work
 
-- **WHEN** the current head descends from a retained approved head and new unapproved work exists
-- **THEN** the brief identifies the approved-to-current range and unapproved commits, excludes only verified permitted delivery commits and requires testing the entire current head when code or tests changed
+- **WHEN** the current head descends from the last reviewed head or retained approval and a fix needs review
+- **THEN** the brief identifies only that fix range and unapproved commits, links prior blockers for rechecking, excludes only verified permitted delivery commits and requests targeted tests where useful
+
+#### Scenario: First review requested changes
+
+- **WHEN** the first review reports BLOCKING findings and the worker pushes a descendant fix without any earlier APPROVE
+- **THEN** the second review covers only that fix while rechecking prior blockers rather than re-reviewing unchanged work
 
 #### Scenario: Unapproved spec changes remain visible
 
 - **WHEN** a human or unverified commit changes specs after an approval
 - **THEN** that change remains in the delta review rather than being excluded by a blanket spec-path filter
+
+### Requirement: Coordinator instructions use the parallel fix loop
+
+Crew's installed coordinator instructions SHALL start review at the worker report alongside CI, combine CI failures and BLOCKING findings into one fix request, queue FOLLOW-UP findings with crew backlog add and escalate after two failing rounds. Merge readiness SHALL require covered review approval and green required checks. New scope SHALL start a new task. Existing homes SHALL pick up changed instructions at crew start after updating the tool.
+
+#### Scenario: Implementation is reported
+
+- **WHEN** a coordinator follows the installed template after a worker reports pushed implementation
+- **THEN** it starts review without waiting for CI or the delivery bot and combines resulting failures and blockers in one fix round
+
+#### Scenario: Only follow-ups remain
+
+- **WHEN** a review approves with FOLLOW-UP findings and required checks are green
+- **THEN** the coordinator queues follow-ups without holding the merge, and asks the person after two rounds that still fail
+
+#### Scenario: Existing home starts the new tool
+
+- **WHEN** an existing home starts Crew after crew update installs a changed coordinator template
+- **THEN** crew start rewrites its coordinator instructions with the current loop without manual edits
 
 ### Requirement: Plain land publishes repairs to its existing PR
 

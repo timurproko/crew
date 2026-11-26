@@ -2,43 +2,30 @@
 
 ## 1. Approval coverage retains reviewed history across permitted delivery commits
 
-- [x] 1.1 Retain approved-head evidence separately from the latest verdict, with legacy APPROVE fallback; verify later tells and CHANGES NEEDED do not erase the earlier approval.
-- [x] 1.2 Implement approvalCovers with ancestry, trusted App author/committer identity, exact change-path finalization and clean base-merge tree proof; cover equal heads, finalize/refinalize, clean merge, human commits, spoofed identity, wrong paths, hand-edited/conflicting merges and unavailable evidence in fake-GitHub/local-Git fixtures.
-- [x] 1.3 Apply coverage to verdict/check freshness without fabricating CHANGES NEEDED; fixtures must distinguish covered approval, descendant delta needed and force-pushed full review.
-- [x] 1.4 Document approval coverage, explicit App trust configuration and conservative unavailable-evidence behavior in README; compare documented results with the coverage fixtures.
+- [x] 1.1 Retain approvedHead independently of later findings; coverage fixtures verify tells and negative verdicts do not erase it.
+- [x] 1.2 Verify ancestry, App identity, exact change-path finalization and clean base merge trees; approval-coverage fixtures cover valid, spoofed, conflicting, human, unavailable and replaced-history cases.
+- [x] 1.3 Preserve freshness without manufacturing CHANGES NEEDED; document conservative trust configuration and delta/full behavior in README.
 
-## 2. Review readiness and ship waits enforce checked handoffs with one automatic repair
+## 2. Report-time delta reviews use targeted tests and classified findings
 
-- [x] 2.1 Add exact-PR/head/outcome/check evidence reduction and reviewReadiness while preserving clean PR-head fast-forward; fixtures must cover missing/unticked outcomes, dirty/unpushed/ahead/diverged copies, closed or unreadable PRs, and valid draft/ready heads.
-- [x] 2.2 Normalize latest non-cancelled current-head light checks and add review --force with exit-6 diagnostics; fixtures must cover pending/failed/missing checks, cancelled duplicates, older-head successes, malformed data, ready-PR heavy failures and forced bypass without destructive Git updates.
-- [x] 2.3 Extend wait for implementation reports and approved/landed PR checks using durable one-follow-up evidence; fixtures must prove ready-for-review settlement, first-failure tell with check/link, same-failure deduplication across waits and exit 7 on a failed repair handoff.
-- [x] 2.4 Preserve owner/no-fallback/send-failure/same-worker race protections and existing scout/Plan/reviewer/gate/plain-no-CI settlement; fixtures must assert no unauthorized messages and unchanged timeout/recovery behavior.
-- [x] 2.5 Update README help examples and readiness/wait exit-code descriptions; verify help and fixture output agree and status/fleet remain read-only.
+- [x] 2.1 Remove reviewReadiness and check/outcome gates; reported-review-no-ci-gate verifies review starts during pending/failed/cancelled/skipped/absent CI while existing head synchronization tests retain safe fast-forward and ahead/diverged refusal.
+- [x] 2.2 Remove reported-ship CI holding, automatic failed-check tells and escalation; reported-wait-no-ci verifies immediate settlement without GitHub, terminal or task mutations, including inert legacy repair records.
+- [x] 2.3 Keep explicit delta base/head/commit evidence and make subsequent reviews cover only the fix after either verdict; delta/fix fixtures retain worker-space inheritance and approved-history rewrite protection.
+- [x] 2.4 Replace full-suite duties with targeted tests and immediate worker reporting; brief fixtures require What I checked and BLOCKING/FOLLOW-UP classification with CHANGES NEEDED only for blockers.
+- [x] 2.5 Update the installed coordinator template and README to parallel CI/review, combined fixes, queued follow-ups, two-round escalation, approval-plus-green merge readiness and no new PR scope; template fixtures verify existing-home refresh at start.
 
-- [x] 2.6 Repair wait assessment for safely behind copies, require promotion and actual full-CI gate success, and preserve cancelled-only applicable names; verify wait-safe-fast-forward and review-check-truth-table cover all requested states in draft/ready gate and light/full wait paths.
+## 3. Plain land publishes follow-up commits to the existing open pull request
 
-## 3. Delta reviewer briefs require full-head local build and test evidence
+- [x] 3.1 Verify reported/clean-copy, exact open PR and remote history before ordinary push; local-remote fixtures prove head advancement without duplicate PR creation or force.
+- [x] 3.2 Preserve no-op publication, guarded merged cleanup and coverage refresh; fixtures retain dirty/closed/diverged/refused-push protections and README describes repairs.
 
-- [x] 3.1 Save automatic delta/full mode, approved base, fixed head and explicit unapproved commit list in reviewer evidence; fixtures must show human/spec changes remain visible while only individually verified permitted delivery commits are excluded.
-- [x] 3.2 Replace optional-test and verdict-only reviewer instructions with fixed-head checkout, build/full-suite once for code/test changes, exact first-line verdict, findings and What I checked; generated-brief fixtures must assert commands/results even on APPROVE and an explicit no-test-run exemption for documents/planning-only handoffs.
-- [x] 3.3 Add ship-brief build/full-suite command/results for code/test changes and an explicit documents/planning-only no-test-run exemption; document full versus delta review in README; fixtures must retain scratch/shutdown instructions and show delta APPROVE advances the approved head.
+## 4. One role table drives immediate Approved and Build transitions
 
-## 4. Plain land publishes follow-up commits to the existing open pull request
-
-- [x] 4.1 Route existing plain PRs through reported/clean-copy and exact open-PR identity checks, then ordinary push without creating another PR; local-remote/fake-GitHub fixtures must prove the remote head advances and the URL is unchanged.
-- [x] 4.2 Retain no-op idempotency and guarded merged cleanup while refusing dirty, wrong-identity, closed, divergent and failed-publication cases; fixtures must assert no force-push, duplicate PR or workflow/gate push.
-- [x] 4.3 Refresh coverage after publication and document repair land in README; fixtures must show new human commits require delta review and an unchanged covered head stays approved.
-
-## 5. One role table drives immediate Approved and Build transitions without a CI-wait state
-
-- [x] 5.1 Centralize stable role keys, fallback names and aliases for Build/Review/Approved; manifest fixtures must prove today's names and a future Build rename work across every relevant hook without adding a fourth role.
-- [x] 5.2 Select Review on start, Approved immediately for covered APPROVE and Build on CHANGES NEEDED, successful follow-up/relaunch or proven non-covered commits; fixtures must assert CI-pending approval is Approved and stale evidence is never rewritten as a negative verdict.
-- [x] 5.3 Preserve opt-out, bounded manifest fallback, aliases, unrelated labels, removal-before-add, closed/merged no-writes and abandonment/concurrency safeguards; rerun existing label fixtures and add unavailable-head/covered-bot regression cases.
-- [x] 5.4 Update README label lifecycle descriptions to distinguish approval from checks and retain later-task boundaries; validate the OpenSpec change and final PR body, with no dispatch/chip/workflow changes in the diff.
+- [x] 4.1 Centralize stable role keys, fallback names and aliases; manifest/rename fixtures cover today's names and future Build names without a fourth role.
+- [x] 4.2 Preserve Review on launch, immediate Approved on covered approval and Build for actual changes/follow-ups; coverage and label fixtures retain prior approval evidence without a fabricated negative verdict.
+- [x] 4.3 Preserve opt-out, warnings, aliases, unrelated labels, removal-before-add, closed/merged no-writes and abandonment/concurrency safeguards.
 
 ## Workflow follow-up
 
-- Run `node --test scripts/ci-required.test.mjs` and `node crew.test.mjs` once on the implementation handoff head and record commands/results; there is no separate build step for this dependency-free Node CLI.
-- Push completed outcomes individually with their tasks and README changes, updating the matching PR checkbox after each push.
-- At implementation handoff, preserve the delivery bot's finalization commit and report only after every check on the final head passes. Do not mark ready or merge.
-- Bot dispatch after APPROVE, shared default promotion gating, shared label rename and Herdr terminal/chip integration are separate later tasks.
+- Only targeted local checks precede the push. CI and review run together after immediate reporting; the coordinator combines failures/blockers into one subsequent fix push.
+- Delivery-bot dispatch after approval is cancelled. No full local suite, check watcher or new promotion gate is part of this change.
