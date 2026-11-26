@@ -23,17 +23,31 @@ No restart is needed. The change affects **new independent tasks**, not existing
 The ordering point is the registry-locked **task reservation**, before worktree allocation
 and Core launch. A setting change before reservation affects that task; a setting change
 after reservation does not, even if its terminal starts physically after the setting
-command returns. Independent per-project admission fingerprints the registry and task placement/
-terminal references before bounded read-only Core inspection, then rechecks that footprint under
-the registry lock. A concurrent reservation, completion or replacement refreshes the observation;
-no stale preflight can reserve a different identity. Unpublished preparing workers and active
-task writers constrain selection but never count as positive occupancy. Both task.json.lock
-and task.json.lifecycle.lock participate in the footprint and pending check: observation-only
-automatic hand-overs hold only the former, including while the old terminal is absent. Contenders wait
-outside the lock, then retry or refuse with worker-space-busy before creating their own task/copy.
-Core reads share a ten-second admission budget with at most two seconds per probe; unpublished
-launches have a two-second grace before safe retry refusal. Failed reservations do not establish
-occupancy. Legacy/direct-file writers cannot participate in this protocol.
+command returns. Placement uses a home-wide `worker-spaces.lock` gate, not comparisons of task
+records and lock-file existence. **Invariant:** admission owns the gate continuously while reading
+tasks, observing Core, selecting placement and reserving the task; every participating task writer
+and terminal start/stop/replacement owns that same gate. A replacement owns it from before removing
+the old terminal until the replacement is published (or failure is saved). Admission therefore
+cannot observe a temporary empty space, nor can a replacement finish between its task and Core
+reads. Automatic observation-only hand-over, manual relaunch, finish/cleanup retries, review and
+ordinary launches all participate. Task transactions acquire the gate before their per-task locks;
+admission acquires it before the short registry transaction. Registry-only settings and project
+edits do not need it and remain usable during slow Core calls.
+
+Copy allocation stays outside both gate and registry lock. A saved preparing reservation with no
+published terminal constrains later admission but is not positive occupancy; contenders release
+the gate between retries so the launch can publish. Stop/finish refuse a still-preparing task,
+even with force, rather than return its copy while allocation can still publish a terminal.
+Actual Core start and publication share one gate interval. Already-admitted launches allow up to
+ten minutes to reacquire the gate for publication/failure recording, matching the copy allocator's
+existing long wait instead of stranding preparation on brief contention. Failed reservations do
+not establish occupancy. Core reads share a ten-second
+admission budget with at most two seconds per probe. Gate contention and preparing launches cause
+bounded wait/retry or worker-space-busy refusal, before the contender creates a task or copy;
+background observation writers yield immediately, and done retains its existing longer report wait.
+An interrupted owner may leave worker-spaces.lock behind: never steal it or delete it based on
+PID/age guesses. This intentionally serializes terminal transitions within a home, so slow cleanup
+can require another command to retry. Legacy binaries and direct-file writers cannot participate.
 
 Slow external operations do not hold the registry lock. Switching never
 moves, relabels or reorders already-spawned workers or creates/removes any space.
@@ -322,13 +336,15 @@ coordinator or their spaces/tasks.
 preference, mixed/finished/empty/shell occupancy, dotted projects, verified repair alias joins,
 foreign/remote/other-home exclusions and conservative malformed/unavailable evidence. Its
 fixture-only barriers cover same/different-project contenders, first launches, failed launches,
-post-Core stale preflights, terminal publication and both sides of a mode-switch reservation.
+gate-held admission decisions, terminal publication and both sides of a mode-switch reservation.
 An external-process guard asserts that no Core/Git/copy call runs under projects.lock.
-`--gaps=join-project-space-handover` isolates the automatic hand-over race: a fixture pauses
-after old-terminal removal while only task.json.lock exists. Admissions during replacement,
-including preflights begun before that lock appeared, refuse without creating a task or terminal;
-after publication their retry joins the inherited space. This regression also runs in the
-broader join-project-space group.
+`--gaps=join-project-space-handover` pauses automatic hand-over after old-terminal removal and
+proves admission cannot enter; conversely, pauses after admission task reads and at reservation
+prove hand-over cannot enter the reviewer's former lock-release window. A later retry joins the
+inherited identity. `--gaps=join-project-space-gate` covers manual relaunch, stop, finish and reviewer
+publication gaps, plus replacement releasing its gate while an admission waits to acquire it;
+that admission cannot read task state until it owns the gate. Both groups also run inside the
+broader join-project-space group, alongside two-spawn and gate-free copy-preparation contention.
 
 The additional focused groups `--gaps=worker-space-local-setter` and
 `--gaps=worker-space-local-ordering` cover the desktop command, exact capability/results,

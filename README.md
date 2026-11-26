@@ -186,9 +186,13 @@ inherited review or replacement can still return to combined; if it becomes mixe
 independent per-project admissions skip it rather than moving anyone. Switching back sends new tasks
 into combined even if their project already has its own space. During a spawn, placement
 is frozen when its task is reserved: an already-admitted launch can start after a switch
-using its saved placement. Per-project occupancy is rechecked against task reservations after
-Core inspection; unpublished launches cause a bounded wait or retry refusal, not another space
-request. Core/copy operations never hold the registry lock.
+using its saved placement. A shared per-home placement gate covers task reads, Core observation,
+the decision and reservation. Task writers and terminal transitions use that same gate, including
+the whole replacement gap, so admission cannot see a transient empty space. Copy allocation stays
+outside the gate; unpublished reservations cause bounded wait/retry rather than a duplicate space
+request. Registry-only settings/registration remain independent and Core/copy operations never hold
+the registry lock. Slow terminal transitions can require another command to retry; locks are never
+stolen.
 
 **Herdr dependency:** per-project grouping requests separate automatic spaces, but connected
 nesting under the coordinator and exact project names require the compatible Herdr companion

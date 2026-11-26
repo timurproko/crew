@@ -401,10 +401,43 @@ function reviveRelaunchedTask(h, task) {
   return { ...kept, state: 'working', terminal: matches[0].address };
 }
 const sameWorker = (a, b) => a && b && a.state === b.state && a.terminal === b.terminal && a.relaunched === b.relaunched;
-// Lifecycle intent prevents successive polls from taking the task lock ahead of
-// done/finish/land/tell/spawn. An already-started atomic write cannot be preempted:
-// allow its supported one-second Windows replacement window plus scheduling margin.
-function taskTransaction(h, id, action, { observation = false, waitMs = 2000 } = {}) {
+// Placement invariant: while this gate is held, no other participating command can
+// reserve a task, publish task state, or start/stop/replace a task terminal.
+// Admission holds it continuously across task reads, Core observation, decision
+// and registry reservation. Replacement holds it across the entire terminal gap.
+// Lock order is placement gate -> registry (if needed) -> task transaction;
+// registry-only settings/registration stay independent. Never steal this lock.
+const placementGates = new Set();
+function withPlacementGate(h, action, { observation = false, waitMs = 2000 } = {}) {
+  const lock = path.join(h.dir, 'worker-spaces.lock');
+  if (placementGates.has(lock)) return action(); // synchronous nested task writes
+  const deadline = Date.now() + waitMs;
+  let fd;
+  for (;;) {
+    try { fd = fs.openSync(lock, 'wx'); break; }
+    catch (error) {
+      if (error.code !== 'EEXIST') refuse(`worker-space-unavailable: cannot acquire placement gate (${error.code}); retry.`, 4);
+      if (observation) return; // polling must yield to a placement/lifecycle writer
+      if (Date.now() >= deadline) refuse(`worker-space-busy: placement gate is held at ${slash(lock)}; retry after its writer completes. Never remove a lock while its writer may be running.`, 4);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
+  try {
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token: randomUUID() }));
+    placementGates.add(lock);
+    return action();
+  } finally {
+    placementGates.delete(lock);
+    fs.closeSync(fd);
+    fs.unlinkSync(lock);
+  }
+}
+function taskTransaction(h, id, action, options = {}) {
+  return withPlacementGate(h, () => lockedTaskTransaction(h, id, action, options), options);
+}
+// Per-task lifecycle intent still gives foreground writes priority over polls.
+// An already-started atomic replacement retains its supported sharing-retry window.
+function lockedTaskTransaction(h, id, action, { observation = false, waitMs = 2000 } = {}) {
   const lock = `${taskFile(h, id)}.lock`, priority = `${taskFile(h, id)}.lifecycle.lock`;
   const deadline = Date.now() + waitMs;
   const acquire = (file, wait) => {
@@ -438,11 +471,11 @@ function ownedTerminals(task) {
   return [...records.values()];
 }
 const launchedTerminals = (task, address, agent) => [...ownedTerminals(task).filter(t => t.address !== address), { address, agent, started: now() }];
-const saveTask = (h, task) => taskTransaction(h, task.id, current => {
+const saveTask = (h, task, options) => taskTransaction(h, task.id, current => {
   const prFacts = current?.prFacts;
   const terminals = [...new Map([...(current?.terminals ?? []), ...(task.terminals ?? [])].map(t => [t.address, t])).values()];
   writeJson(taskFile(h, task.id), { ...task, ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), ...(current && Object.hasOwn(current, 'workerSpace') ? { workerSpace: current.workerSpace } : {}), ...(current && Object.hasOwn(current, 'reviewRound') ? { reviewRound: current.reviewRound, lastFinding: current.lastFinding, reviewChanges: current.reviewChanges } : {}), updated: now() });
-});
+}, options);
 
 const prTime = value => {
   if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value)) return null;
@@ -1568,18 +1601,6 @@ function workerSpaceTasks(h) {
   } catch (error) { refuse(`worker-space-unavailable: cannot read task occupancy (${error.message}); retry. Nothing was launched.`, 4); }
 }
 const unfinishedSpaceWorker = task => ['preparing', 'working'].includes(task.state);
-function workerSpaceSnapshot(h) {
-  const tasks = workerSpaceTasks(h);
-  // Exclude prose, PR facts and timestamps; only admission-relevant mutations
-  // invalidate an observation. Automatic handover is an observation transaction:
-  // it holds task.json.lock but not the manual writer's lifecycle intent lock.
-  const writers = tasks.map(t => ['.lock', '.lifecycle.lock'].map(suffix => fs.existsSync(`${taskFile(h, t.id)}${suffix}`)));
-  const footprint = JSON.stringify([h.config, tasks.map((t, i) => [t.id, t.project, t.state, t.terminal,
-    t.terminals, t.workerSpace, t.selfFix, writers[i]])]);
-  const pending = tasks.some((t, i) => unfinishedSpaceWorker(t) &&
-    ((t.state === 'preparing' && !t.terminal) || writers[i].some(Boolean)));
-  return { tasks, footprint, pending };
-}
 function workerSpaceOccupancy(h, tasks, deadline) {
   const options = () => {
     const left = deadline - Date.now();
@@ -1670,33 +1691,33 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   const repairPlacement = extra.selfFix ? repairWorkerProject(h, record) : null;
   const deadline = Date.now() + 10000, pendingDeadline = Date.now() + 2000;
   for (;;) {
-    h.config = readRegistry(h.dir);
-    if (extra.selfFix && h.config.workerSpaceMode === 'per-project'
-        && (registeredProject(h, 'crew')?.path ?? null) !== repairPlacement.path) {
-      refuse('The crew registration changed during repair admission; retry. No task or terminal was created.');
-    }
-    const independent = !Object.hasOwn(record, 'workerSpace');
-    const snapshot = independent && h.config.workerSpaceMode === 'per-project' ? workerSpaceSnapshot(h) : null;
-    let reserved = false;
-    if (!snapshot?.pending) {
-      const occupancy = snapshot ? workerSpaceOccupancy(h, snapshot.tasks, deadline) : null;
-      reserved = withRegistry(h, () => {
-        // The project may have been removed/replaced while selection was running.
+    let pending = false;
+    const reserved = withPlacementGate(h, () => {
+      h.config = readRegistry(h.dir);
+      if (extra.selfFix && h.config.workerSpaceMode === 'per-project'
+          && (registeredProject(h, 'crew')?.path ?? null) !== repairPlacement.path) {
+        refuse('The crew registration changed during repair admission; retry. No task or terminal was created.');
+      }
+      const independent = !Object.hasOwn(record, 'workerSpace');
+      const tasks = independent && h.config.workerSpaceMode === 'per-project' ? workerSpaceTasks(h) : null;
+      pending = tasks?.some(t => t.state === 'preparing' && !t.terminal) ?? false;
+      if (pending) return false; // release the gate so this launch can publish
+      const occupancy = tasks ? workerSpaceOccupancy(h, tasks, deadline) : null;
+      return withRegistry(h, () => {
+        // Only registry writers can race us: every task writer and terminal
+        // transition needs the placement gate we still hold. No lock snapshots.
         if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
         if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
-        // No Core/Git operations under this lock. New reservations or lifecycle
-        // changes invalidate the preflight; a combined switch needs no occupancy.
-        if (independent && h.config.workerSpaceMode === 'per-project'
-            && (!snapshot || workerSpaceSnapshot(h).footprint !== snapshot.footprint)) return false;
+        if (independent && h.config.workerSpaceMode === 'per-project' && !tasks) return false;
         record.workerSpace = admittedWorkerSpace(h, record, repairPlacement, occupancy);
         fs.mkdirSync(dir, { recursive: true });
-        saveTask(h, record); // reservation freezes placement before external work
+        saveTask(h, record); // reservation and decision share the same gate
         return true;
       });
-    }
+    });
     if (reserved) break;
-    if (Date.now() >= deadline || (snapshot?.pending && Date.now() >= pendingDeadline)) {
-      refuse('worker-space-busy: occupancy changed or a worker is still being published; retry. Nothing was launched.', 4);
+    if (Date.now() >= deadline || (pending && Date.now() >= pendingDeadline)) {
+      refuse('worker-space-busy: a worker is still being published; retry. Nothing was launched.', 4);
     }
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
   }
@@ -1704,9 +1725,12 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // Slow tools run outside the transaction; this preparing task now protects the path.
   const gated = opts.kind === 'ship' && !extra.selfFix && toolPath('no-mistakes') && run('git', ['-C', project.path, 'remote', 'get-url', 'no-mistakes']).code === 0;
   const intent = gated ? slash(path.join(dir, 'intent.md')) : null;
-  if (gated) { record = { ...record, gate: 'no-mistakes' }; saveTask(h, record); }
+  // Once reserved, finish/stop cannot revoke this allocation. Wait through other
+  // terminal transitions rather than abandon a preparing task on brief contention.
+  const publicationWait = { waitMs: 600000 };
+  if (gated) { record = { ...record, gate: 'no-mistakes' }; saveTask(h, record, publicationWait); }
 
-  const failed = why => { saveTask(h, { ...record, state: 'failed', error: why.slice(0, 400) }); refuse(`Could not create the working copy: ${why}`, 5); };
+  const failed = why => { saveTask(h, { ...record, state: 'failed', error: why.slice(0, 400) }, publicationWait); refuse(`Could not create the working copy: ${why}`, 5); };
   if (delivered) {
     const got = runTool('delivery', ['start', ...(branch ? [branch] : ['--detach', id]), '--json'], { cwd: project.path, timeout: 600000 });
     let started = null;
@@ -1716,7 +1740,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     if (started.created !== true) failed(`${branch ?? id} already has a working copy at ${slash(started.path)}; it was left alone`);
     worktree = slash(started.path);
     record = { ...record, worktree, ...(started.pooled ? { pooled: true } : {}) };
-    saveTask(h, record);
+    saveTask(h, record, publicationWait);
   } else {
     const wt = branch
       ? run('git', ['-C', project.path, 'worktree', 'add', '-b', branch, worktree, 'HEAD'])
@@ -1727,27 +1751,28 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // Decided once, in the copy the worker gets, and kept on the task so land and status agree
   // with what the worker was told. The gate, where there is one, delivers instead.
   const workflow = opts.kind === 'ship' && !extra.selfFix && !gated && followsWorkflow(project, worktree);
-  if (workflow) { record = { ...record, workflow: 'delivery' }; saveTask(h, record); }
+  if (workflow) { record = { ...record, workflow: 'delivery' }; saveTask(h, record, publicationWait); }
   fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project), workflow, branch }));
 
-  const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, workerSpace: record.workerSpace, instruction: `Read the brief at ${brief} and carry it out exactly.` });
-  const address = started.value?.address;
-  if (started.code !== 0 || !address) {
-    if (delivered) runTool('delivery', ['finish', worktree, '--force'], { cwd: project.path, timeout: 120000 });
-    else run('git', ['-C', project.path, 'worktree', 'remove', '--force', worktree]);
-    saveTask(h, { ...record, state: 'failed', ...(address ? { terminals: launchedTerminals(record, address, pick.harness) } : {}), error: JSON.stringify(started.value).slice(0, 400) });
-    refuse(`Core did not start the worker terminal: ${JSON.stringify(started.value)}`, 5);
-  }
-  // The worker is already running and may have reported before this line (a fast failure
-  // report, or a slow answer from Core). Add the terminal to what is on disk now rather than
-  // writing the record this command started with over a report or cancellation.
-  const current = readJson(taskFile(h, id)) ?? record;
-  saveTask(h, { ...current, state: current.state === 'preparing' ? 'working' : current.state, terminal: address, terminals: launchedTerminals(current, address, pick.harness), spawned: now() });
-  const launched = loadTask(h, id);
-  publishTaskTerminal(launched, reviewPrUrl(launched));
-  const detail = pickLabel(pick) !== pick.harness || chosen.available ? `; ${pickLabel(pick)}${chosen.available ? `, ${chosen.available} more can take over` : ''}` : '';
-  console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}${started.note}`);
-  backlogMove(h, id, 'start');
+  withPlacementGate(h, () => {
+    const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, workerSpace: record.workerSpace, instruction: `Read the brief at ${brief} and carry it out exactly.` });
+    const address = started.value?.address;
+    if (started.code !== 0 || !address) {
+      if (delivered) runTool('delivery', ['finish', worktree, '--force'], { cwd: project.path, timeout: 120000 });
+      else run('git', ['-C', project.path, 'worktree', 'remove', '--force', worktree]);
+      saveTask(h, { ...record, state: 'failed', ...(address ? { terminals: launchedTerminals(record, address, pick.harness) } : {}), error: JSON.stringify(started.value).slice(0, 400) });
+      refuse(`Core did not start the worker terminal: ${JSON.stringify(started.value)}`, 5);
+    }
+    // Publish ownership before releasing the gate: a fast worker's done command
+    // waits for this address. Reread rather than overwrite earlier cancellation.
+    const current = readJson(taskFile(h, id)) ?? record;
+    saveTask(h, { ...current, state: current.state === 'preparing' ? 'working' : current.state, terminal: address, terminals: launchedTerminals(current, address, pick.harness), spawned: now() });
+    const launched = loadTask(h, id);
+    publishTaskTerminal(launched, reviewPrUrl(launched));
+    const detail = pickLabel(pick) !== pick.harness || chosen.available ? `; ${pickLabel(pick)}${chosen.available ? `, ${chosen.available} more can take over` : ''}` : '';
+    console.log(`spawned ${id}: ${opts.agent} ${opts.kind} in terminal ${address}, working copy ${worktree}${record.pooled ? ' (pool slot)' : ''}${gated ? '; delivered through no-mistakes' : ''}${workflow ? '; follows the repository\'s delivery workflow (plan first as a draft pull request)' : ''}${detail}${started.note}`);
+    backlogMove(h, id, 'start');
+  }, publicationWait);
 }
 
 // relaunch: the same task, the same working copy, another agent. This is the fallback while
@@ -2130,12 +2155,15 @@ function cmdStop(args) {
   requireOwner(h, 'stop work');
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   if (!id) refuse('Usage: crew stop <id> [--force]');
-  const task = loadTask(h, id);
-  const result = stopWorker(task, { force });
-  if (result.stopped && task.state !== 'closed') saveTask(h, { ...loadTask(h, id), state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now() });
-  if (result.stopped) reviewLabels(h, id, 'abandon');
-  console.log(`${result.stopped ? 'stopped' : 'not stopped'} ${id}: ${result.how}`);
-  if (!result.stopped) process.exitCode = 6;
+  return withPlacementGate(h, () => {
+    const task = loadTask(h, id);
+    if (task.state === 'preparing') refuse(`Task ${id} is still preparing; retry after its launch publishes. Nothing was stopped.`, 6);
+    const result = stopWorker(task, { force });
+    if (result.stopped && task.state !== 'closed') saveTask(h, { ...loadTask(h, id), state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now() });
+    if (result.stopped) reviewLabels(h, id, 'abandon');
+    console.log(`${result.stopped ? 'stopped' : 'not stopped'} ${id}: ${result.how}`);
+    if (!result.stopped) process.exitCode = 6;
+  });
 }
 
 // A ship task's branch outlives its working copy on purpose: it holds the commits.
@@ -2493,7 +2521,7 @@ function removeOneStoppedTerminal(task) {
 // now (`crew finish <id> --force` on the closed task). A --force given at finish covered only
 // what was there then. { state: returned | gone | held | silent | kept | failed, line }.
 function returnWaiting(h, task, options = {}) {
-  const back = tryReturnWaiting(h, task, options);
+  const back = withPlacementGate(h, () => tryReturnWaiting(h, task, options));
   return { ...back, line: back.line + discardSummary(back.disposal) };
 }
 function tryReturnWaiting(h, task, { force = false } = {}) {
@@ -2544,12 +2572,18 @@ function tryReturnWaiting(h, task, { force = false } = {}) {
   return { state: 'returned', disposal: { ...back, unseen: Boolean(check.unseen) || back.unseen }, line: `returned the working copy of finished task ${task.id}${back.said}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}` };
 }
 
-function cmdFinish(args, { scratchProof } = {}) {
+function cmdFinish(args, options = {}) {
   const h = home();
   requireOwner(h, 'finish work');
+  return withPlacementGate(h, () => finishTask(h, args, options));
+}
+function finishTask(h, args, { scratchProof } = {}) {
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   if (!id) refuse('Usage: crew finish <id> [--force]');
   const task = loadTask(h, id);
+  // Copy allocation is outside the placement gate. Do not close its reservation
+  // and let a later launch resurrect a finished task or publish into a freed copy.
+  if (task.state === 'preparing') refuse(`Task ${id} is still preparing; retry after its launch publishes. Nothing was finished.`, 6);
   if (task.state === 'closed') {
     reviewLabels(h, id, 'abandon');
     // A closed task whose copy still waits: --force is the person's word to discard what was

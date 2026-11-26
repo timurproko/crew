@@ -1089,18 +1089,25 @@ fs.readFileSync = (file, ...args) => {
   return { ready, release, script };
 }
 async function joinProjectSpaceRaceTests() {
-  for (const scenario of ['combined', 'empty', 'different', 'publication', 'failure']) {
+  for (const scenario of ['combined', 'empty', 'different', 'publication', 'failure', 'copy']) {
     const f = joinSpaceFixture(`join-race-${scenario}`); f.add('other');
     const old = ['combined', 'different', 'publication'].includes(scenario) ? f.spawn('old') : null;
     f.mode('per-project');
-    const gate = scenario === 'publication' ? joinPublicationBarrier(f) : projectBarrier(f, 'after');
+    const gate = scenario === 'publication' ? joinPublicationBarrier(f) : scenario === 'copy' ? joinCoreBarrier(f, 'copy', 'worktree', 'add') : projectBarrier(f, 'after');
     const pending = projectProcess(f, ['spawn', 'race', '--project', 'demo', '--agent', 'pi', 'Count.'], {
-      script: joinOutsideRegistryScript(f, gate), terminal: `owner-spaces-join-race-${scenario}`, env: f.env,
+      script: scenario === 'copy' ? gate.script : joinOutsideRegistryScript(f, gate), terminal: `owner-spaces-join-race-${scenario}`, env: f.env,
     });
     try {
       await until(() => fs.existsSync(gate.ready));
       const reserved = f.task('race'); assert.equal(reserved.state, 'preparing'); assert.equal(reserved.terminal, null);
       assert.ok(!fs.existsSync(path.join(f.home, 'projects.lock')));
+      if (scenario === 'copy') {
+        assert.ok(!fs.existsSync(path.join(f.home, 'worker-spaces.lock')), 'Copy allocation leaves the placement gate free');
+        for (const verb of ['finish', 'stop']) {
+          const refused = f.call([verb, 'race', '--force']); assert.equal(refused.code, 6, refused.out);
+          assert.match(refused.out, /still preparing/); assert.equal(f.task('race').state, 'preparing');
+        }
+      }
       assert.equal(f.call(['project', 'add', 'while-launching', f.repo]).code, 0, 'Slow launch does not block registry edits');
       const nextProject = scenario === 'different' ? 'other' : 'demo';
       let r = f.call(['spawn', 'contender', '--project', nextProject, '--agent', 'pi', 'Count.']);
@@ -1117,7 +1124,7 @@ async function joinProjectSpaceRaceTests() {
       if (old) assert.equal(f.task('race').workerSpace.id, old.workerSpace.id);
     } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
   }
-  // A preflight taken before another reservation must be refreshed, not frozen.
+  // A second admission cannot interleave with a decision already under the gate.
   const f = joinSpaceFixture('join-stale'); f.add('other'); const old = f.spawn('old'); f.mode('per-project');
   const gate = projectBarrier(f, 'before');
   const pending = projectProcess(f, ['spawn', 'stale', '--project', 'demo', '--agent', 'pi', 'Count.'], {
@@ -1125,9 +1132,15 @@ async function joinProjectSpaceRaceTests() {
   });
   try {
     await until(() => fs.existsSync(gate.ready));
+    f.mode('combined');
+    const refused = f.call(['spawn', 'new-q', '--project', 'other', '--agent', 'pi', 'Count.']);
+    assert.equal(refused.code, 4, refused.out); assert.match(refused.out, /worker-space-busy/);
+    assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'new-q')));
+    f.mode('per-project'); fs.writeFileSync(gate.release, 'go');
+    const r = await pending.result; assert.equal(r.code, 0, r.out);
+    assert.equal(f.task('stale').workerSpace.id, old.workerSpace.id);
     f.mode('combined'); f.spawn('new-q', 'other'); f.mode('per-project');
-    fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
-    assert.notEqual(f.task('stale').workerSpace.id, old.workerSpace.id, 'Stale exclusive observation cannot survive a new Q reservation');
+    assert.notEqual(f.spawn('after-mixed').workerSpace.id, old.workerSpace.id, 'A later Q reservation is seen by the next gated decision');
   } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
   // Current mode is chosen at reservation, including a switch after Core inspection.
   for (const phase of ['before', 'after']) {
@@ -1190,22 +1203,33 @@ const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'cr
   return { ready, release, script };
 }
 async function joinProjectSpaceHandoverRaceTests(scope = 'integrated') {
-  for (const phase of ['during', 'preflight']) {
+  for (const phase of ['during', 'preflight', 'reservation']) {
     const f = joinSpaceFixture(`join-handover-${scope}-${phase}`), old = f.spawn('old');
     f.save({ ...old, chain: [{ harness: 'pi', model: 'second' }], candidates: [{ harness: 'pi', model: 'first' }, { harness: 'pi', model: 'second' }] });
     setTerminal(old.terminal, { status: { app: 'pi', state: 'idle' }, screen: 'quota exhausted' }); f.mode('per-project');
     const owner = `owner-spaces-join-handover-${scope}-${phase}`, removal = joinCoreBarrier(f, 'handover', 'rm', old.terminal, true);
-    const preflight = phase === 'preflight' ? joinCoreBarrier(f, 'preflight', 'ls') : null;
+    const preflight = phase === 'preflight' ? joinCoreBarrier(f, 'preflight', 'ls') : phase === 'reservation' ? projectBarrier(f, 'before') : null;
     let admission, handover;
     const args = ['spawn', 'new', '--project', 'demo', '--agent', 'pi', 'Count.'];
     try {
-      // Freeze admission after its task snapshot, before its Core inventory. The
-      // handover changes only the task lock, not the placement/terminal footprint.
+      // Freeze admission after task reads or at final reservation. The former
+      // lock-release exploit is impossible: handover cannot enter this interval.
       if (preflight) {
         admission = projectProcess(f, args, { script: preflight.script, terminal: owner, env: f.env });
         await until(() => fs.existsSync(preflight.ready));
       }
       handover = projectProcess(f, ['wait', 'old', '--timeout', '0.2'], { script: removal.script, terminal: owner, env: f.env });
+      if (preflight) {
+        const yielded = await handover.result; assert.equal(yielded.code, 124, yielded.out);
+        assert.ok(!fs.existsSync(removal.ready), 'Automatic replacement yields while admission owns the gate');
+        assert.equal(f.task(old.id).terminal, old.terminal); assert.equal(readWorld().terminals[old.terminal].state, 'live');
+        assert.ok(fs.existsSync(path.join(f.home, 'worker-spaces.lock')));
+        fs.writeFileSync(preflight.release, 'go'); const admitted = await admission.result; assert.equal(admitted.code, 0, admitted.out);
+        assert.equal(f.task('new').workerSpace.id, old.workerSpace.id);
+        const later = f.call(['wait', 'old', '--timeout', '0.2']); assert.equal(later.code, 124, later.out);
+        assert.notEqual(f.task(old.id).terminal, old.terminal); assert.equal(f.task(old.id).workerSpace.id, old.workerSpace.id);
+        continue;
+      }
       await until(() => fs.existsSync(removal.ready));
       const file = path.join(f.home, 'tasks', old.id, 'task.json');
       assert.ok(fs.existsSync(`${file}.lock`), 'Automatic handover owns the task transaction lock');
@@ -1231,6 +1255,86 @@ async function joinProjectSpaceHandoverRaceTests(scope = 'integrated') {
     }
   }
 }
+async function joinPlacementGateTests(scope = 'integrated') {
+  for (const action of ['relaunch', 'finish', 'stop', 'review']) {
+    const f = joinSpaceFixture(`join-gate-${scope}-${action}`), old = f.spawn('old', 'demo', action === 'review' ? ['--kind', 'ship'] : []);
+    if (action === 'review') f.done(old);
+    f.mode('per-project');
+    const barrier = joinCoreBarrier(f, action, action === 'review' ? 'run' : action === 'stop' ? 'kill' : 'rm', action === 'review' ? null : old.terminal, true);
+    const args = action === 'relaunch' ? ['relaunch', 'old', '--agent', 'pi', '--model', 'second']
+      : action === 'review' ? ['review', 'old', '--agent', 'pi'] : [action, 'old'];
+    const writer = projectProcess(f, args, { script: barrier.script, terminal: `owner-spaces-join-gate-${scope}-${action}`, env: f.env });
+    try {
+      await until(() => fs.existsSync(barrier.ready));
+      assert.ok(fs.existsSync(path.join(f.home, 'worker-spaces.lock')), `${action} holds the placement gate across Core changes`);
+      assert.ok(!fs.existsSync(path.join(f.home, 'projects.lock')), 'Slow terminal transitions leave registry edits available');
+      const refused = f.call(['spawn', 'new', '--project', 'demo', '--agent', 'pi', 'Count.']);
+      assert.equal(refused.code, 4, refused.out); assert.match(refused.out, /worker-space-busy/);
+      assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'new')));
+      fs.writeFileSync(barrier.release, 'go'); const result = await writer.result; assert.equal(result.code, 0, result.out);
+      const next = f.spawn('new');
+      if (action === 'finish' || action === 'stop') {
+        assert.equal(f.task('old').state, action === 'finish' ? 'closed' : 'stopped'); assert.equal(next.workerSpace.mode, 'per-project');
+        if (action === 'finish') assert.ok(!readWorld().terminals[old.terminal], 'Finish leaves no worker whose space could be duplicated');
+        else assert.equal(readWorld().terminals[old.terminal].state, 'finished');
+      } else {
+        const current = f.task(action === 'review' ? 'old-review' : 'old');
+        assert.equal(current.workerSpace.id, old.workerSpace.id); assert.equal(next.workerSpace.id, old.workerSpace.id);
+        assert.equal(readWorld().terminals[current.terminal].state, 'live');
+      }
+    } finally { fs.writeFileSync(barrier.release, 'go'); await writer.result; }
+  }
+  // The reviewer's disappearing-writer interleaving, moved to the actual atomic
+  // gate boundary: admission cannot read task records until the writer releases.
+  const f = joinSpaceFixture(`join-gate-${scope}-release`), old = f.spawn('old');
+  f.save({ ...old, chain: [{ harness: 'pi', model: 'second' }], candidates: [{ harness: 'pi', model: 'first' }, { harness: 'pi', model: 'second' }] });
+  setTerminal(old.terminal, { status: { app: 'pi', state: 'idle' }, screen: 'quota exhausted' }); f.mode('per-project');
+  const gateFile = path.join(f.home, 'worker-spaces.lock'), task = path.join(f.home, 'tasks', 'old', 'task.json');
+  const removal = joinCoreBarrier(f, 'remove', 'rm', old.terminal, true);
+  const ready = path.join(f.dir, 'acquire-ready'), release = path.join(f.dir, 'acquire-release'), script = path.join(f.dir, 'acquire.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs';
+const open = fs.openSync, read = fs.readFileSync; let paused = false;
+fs.openSync = (file, ...args) => {
+  try { return open(file, ...args); } catch (error) {
+    if (!paused && String(file) === ${JSON.stringify(gateFile)} && error.code === 'EEXIST') {
+      paused = true; fs.writeFileSync(${JSON.stringify(ready)}, 'ready'); const deadline = Date.now() + 15000;
+      while (!fs.existsSync(${JSON.stringify(release)})) { if (Date.now() > deadline) throw Error('Acquire timeout'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
+    }
+    throw error;
+  }
+};
+fs.readFileSync = (file, ...args) => {
+  if (String(file) === ${JSON.stringify(task)} && JSON.parse(read(${JSON.stringify(gateFile)}, 'utf8')).pid !== process.pid) throw Error('Admission read task state before owning placement gate');
+  return read(file, ...args);
+};
+const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
+  const owner = `owner-spaces-join-gate-${scope}-release`;
+  const handover = projectProcess(f, ['wait', 'old', '--timeout', '0.2'], { script: removal.script, terminal: owner, env: f.env });
+  let admission;
+  try {
+    await until(() => fs.existsSync(removal.ready));
+    admission = projectProcess(f, ['spawn', 'new', '--project', 'demo', '--agent', 'pi', 'Count.'], { script, terminal: owner, env: f.env });
+    await until(() => fs.existsSync(ready));
+    fs.writeFileSync(removal.release, 'go'); const moved = await handover.result; assert.equal(moved.code, 124, moved.out);
+    assert.ok(!fs.existsSync(gateFile), 'Replacement fully published before releasing its gate');
+    const replacement = f.task('old'); assert.notEqual(replacement.terminal, old.terminal);
+    fs.writeFileSync(release, 'go'); const result = await admission.result;
+    assert.ok([0, 4].includes(result.code), result.out);
+    if (result.code === 4) { assert.match(result.out, /worker-space-busy/); f.spawn('new'); }
+    assert.equal(f.task('new').workerSpace.id, replacement.workerSpace.id);
+    assert.equal(readWorld().terminals[replacement.terminal].state, 'live');
+    assert.equal(readWorld().terminals[f.task('new').terminal].state, 'live');
+  } finally {
+    fs.writeFileSync(removal.release, 'go'); fs.writeFileSync(release, 'go');
+    if (admission) await admission.result;
+    await handover.result;
+  }
+}
+gapTests['join-project-space-gate'] = async () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try { await joinPlacementGateTests('focused'); }
+  finally { fs.writeFileSync(world, before); }
+};
 gapTests['join-project-space-handover'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
   try { await joinProjectSpaceHandoverRaceTests('focused'); }
@@ -1238,7 +1342,7 @@ gapTests['join-project-space-handover'] = async () => {
 };
 gapTests['join-project-space'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
-  try { joinProjectSpaceTests(); joinProjectSpaceRefusalTests(); joinProjectSpaceRepairTest(); await joinProjectSpaceRaceTests(); joinProjectSpaceInheritanceTests(); await joinProjectSpaceHandoverRaceTests(); }
+  try { joinProjectSpaceTests(); joinProjectSpaceRefusalTests(); joinProjectSpaceRepairTest(); await joinProjectSpaceRaceTests(); joinProjectSpaceInheritanceTests(); await joinProjectSpaceHandoverRaceTests(); await joinPlacementGateTests(); }
   finally { fs.writeFileSync(world, before); }
 };
 gapTests['worker-spaces'] = async () => {
@@ -2379,7 +2483,7 @@ const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'cr
     const doneReady = path.join(f.dir, 'done-ready'), doneScript = path.join(f.dir, 'done.mjs');
     fs.writeFileSync(doneScript, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
 const open = fs.openSync; fs.openSync = (file, ...args) => {
- if (String(file).endsWith('task.json.lifecycle.lock')) fs.writeFileSync(${JSON.stringify(doneReady)}, 'ready');
+ if (String(file).endsWith('worker-spaces.lock')) fs.writeFileSync(${JSON.stringify(doneReady)}, 'ready');
  return open(file, ...args);
 }; main(process.argv.slice(2));`);
     done = projectProcess(f, ['done', task.id], { script: doneScript, terminal: address });
