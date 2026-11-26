@@ -2831,8 +2831,11 @@ function cmdLand(args) {
   // A workflow task's link is recorded already when its worker reports; it lands only once.
   if (task.pr && (task.landed || !task.workflow)) {
     if (finishMergedTask(h, task)) return;
-    if (!task.workflow && !task.gate) reviewLabels(h, id, 'check');
-    console.log(`${id} already has a pull request: ${task.pr}`); return;
+    if (task.workflow || task.gate || task.state === 'closed') {
+      if (!task.workflow && !task.gate) reviewLabels(h, id, 'check');
+      console.log(`${id} already has a pull request: ${task.pr}`); return;
+    }
+    // Plain tasks can have new repairs to publish to this same open pull request.
   }
   if (task.state === 'closed' && finishMergedTask(h, task)) return;
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; it is delivered only after its worker reported.`);
@@ -2845,6 +2848,21 @@ function cmdLand(args) {
   // Keep first-land local refusals ahead of GitHub reads and cleanup.
   if (task.workflow && task.stage === 'plan') no(`its last report is a plan awaiting approval, not an implementation. Read the plan, then: crew tell ${id} "approved, implement", or send it back with what to change.`);
   const remote = git('remote', 'get-url', 'origin');
+  if (task.pr && !task.workflow && !task.gate) {
+    let context;
+    try { context = reviewPrEvidence(task); } catch (error) { no(error.message); }
+    if (!context || context.pr.state !== 'open' || context.pr.merged_at) no('its existing PR is not open; no commits were pushed');
+    const local = reviewHeadOf(task), published = git('ls-remote', '--exit-code', '--heads', 'origin', branchOf(task));
+    if (published.code !== 0 || published.stdout.trim().split(/\s+/)[0] !== context.pr.head.sha) no('its published branch does not match the PR head; reconcile it first');
+    if (git('fetch', '--quiet', 'origin', branchOf(task)).code !== 0) no('its published branch could not be fetched', 4);
+    if (git('merge-base', '--is-ancestor', 'FETCH_HEAD', local).code !== 0) no('its published branch is ahead or diverged; reconcile it without force');
+    const pushed = git('push', '--quiet', 'origin', `HEAD:refs/heads/${branchOf(task)}`);
+    if (pushed.code !== 0) no(`the ordinary push was refused (${lastLine(pushed.stderr)}).`, 4);
+    saveTask(h, { ...loadTask(h, id), landed: task.landed ?? now() });
+    reviewLabels(h, id, 'check');
+    console.log(`delivered ${id} to its existing pull request: ${task.pr}${local === context.pr.head.sha ? ' (no new commits)' : ' (published repair commits)'}`);
+    return;
+  }
   if (task.gate === 'no-mistakes') {
     // The gate reviewed, pushed and opened the pull request while the worker drove it; what
     // is left is to find that pull request: in the report, or by asking GitHub for the branch.

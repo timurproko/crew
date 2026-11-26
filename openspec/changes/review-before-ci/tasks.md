@@ -23,9 +23,9 @@
 
 ## 4. Plain land publishes follow-up commits to the existing open pull request
 
-- [ ] 4.1 Route existing plain PRs through reported/clean-copy and exact open-PR identity checks, then ordinary push without creating another PR; local-remote/fake-GitHub fixtures must prove the remote head advances and the URL is unchanged.
-- [ ] 4.2 Retain no-op idempotency and guarded merged cleanup while refusing dirty, wrong-identity, closed, divergent and failed-publication cases; fixtures must assert no force-push, duplicate PR or workflow/gate push.
-- [ ] 4.3 Refresh coverage after publication and document repair land in README; fixtures must show new human commits require delta review and an unchanged covered head stays approved.
+- [x] 4.1 Route existing plain PRs through reported/clean-copy and exact open-PR identity checks, then ordinary push without creating another PR; local-remote/fake-GitHub fixtures must prove the remote head advances and the URL is unchanged.
+- [x] 4.2 Retain no-op idempotency and guarded merged cleanup while refusing dirty, wrong-identity, closed, divergent and failed-publication cases; fixtures must assert no force-push, duplicate PR or workflow/gate push.
+- [x] 4.3 Refresh coverage after publication and document repair land in README; fixtures must show new human commits require delta review and an unchanged covered head stays approved.
 
 ## 5. One role table drives immediate Approved and Build transitions without a CI-wait state
 

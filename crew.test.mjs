@@ -1098,7 +1098,7 @@ gapTests['merged-land-summary'] = () => {
   assert.match(r.out, /kept for now.*discarded none/); assert.ok(fs.existsSync(path.join(held.worktree, '.artifacts', 'KEEP')));
   f.leave(); r = f.call(['land', held.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /discarded ignored scratch/);
   const open = f.spawn('open'); f.pr({ state: 'OPEN' });
-  r = f.call(['land', open.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /already has a pull request/);
+  r = f.call(['land', open.id]); assert.equal(r.code, 6, r.out); assert.match(r.out, /identity is unproven/);
   assert.equal(readWorld().terminals[open.terminal].state, 'live'); assert.ok(fs.existsSync(path.join(open.worktree, '.artifacts', 'KEEP')));
   const empty = f.spawn('empty'); fs.rmSync(path.join(empty.worktree, '.artifacts'), { recursive: true });
   r = f.call(['finish', empty.id]); assert.equal(r.code, 0, r.out); assert.match(r.out, /discarded none/);
@@ -2509,6 +2509,7 @@ else if(method==='GET' && endpoint.includes('/check-runs?')) {
 else if(method==='GET' && endpoint.includes('/statuses?')) console.log(JSON.stringify(s.statuses ?? []));
 else if(method==='GET' && endpoint.includes('/commits/')) console.log(JSON.stringify(s.commits?.[endpoint.split('/').at(-1)] ?? {}));
 else if(method==='GET' && endpoint.includes('/pulls/')) {
+  if(s.remote) { const head=spawnSync('git',['--git-dir',s.remote,'rev-parse',s.branch ?? 'feature/ship'],{encoding:'utf8'}); if(head.status===0)s.head=head.stdout.trim(); }
   if(s.prDenied) fail('PR state unavailable');
   if(s.prDelay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,s.prDelay);
   const recorded = ${JSON.stringify(recordedRestPr(42, 'feature/ship', 'pull-get-open.json'))};
@@ -2524,7 +2525,7 @@ else fail('unexpected fake request');`);
   const allCalls = () => JSON.parse(fs.readFileSync(log, 'utf8')), starts = [];
   const headRead = (c, i) => c.saved === undefined && starts.some(([from, to]) => i >= from && i < to);
   const calls = () => allCalls().filter((c, i) => !headRead(c, i)), headReads = () => allCalls().filter(headRead);
-  const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim() }); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
+  const parent = (id = 'ship', fields = {}, report = 'Implementation: https://github.com/acme/demo/pull/42') => { const t = f.spawn(id, ['--kind', 'ship', '--agent', 'pi']); control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim(), branch: t.branch }); fs.writeFileSync(t.report, report); f.save({ ...t, ...fields, state: 'reported' }); return f.task(id); };
   const start = (id = 'ship', suffix = '') => { const review = `${id}-review${suffix}`; control({ watch: review }); const from = allCalls().length, r = f.call(['review', id, '--agent', 'pi', '--force']); starts.push([from, allCalls().length]); assert.equal(r.code, 0, r.out); return { task: f.task(review), result: r }; };
   const done = (task, report) => { control({ watch: task.id }); if (report !== undefined) fs.writeFileSync(task.report, report); return crew(['done', task.id], { cwd: f.home, terminal: task.terminal, env }); };
   const writes = () => calls().filter(c => ['POST', 'DELETE'].includes(c.method));
@@ -2532,8 +2533,8 @@ else fail('unexpected fake request');`);
   return { ...f, under, approved, changes, oldUnder, oldChanges, manifest, control, calls, headReads, parent, start, done, writes, warnings, quotaReads, finishResult };
 }
 function reviewRemote(f, task) {
-  const remote = path.join(f.dir, 'remote.git'); git('clone', '--bare', '-q', f.repo, remote);
-  git('-C', f.repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git');
+  const remote = path.join(f.dir, 'remote.git');
+  if (!fs.existsSync(remote)) { git('clone', '--bare', '-q', f.repo, remote); git('-C', f.repo, 'remote', 'add', 'origin', 'https://github.com/acme/demo.git'); }
   git('-C', f.repo, 'config', `url.${slash(remote)}.insteadOf`, 'https://github.com/acme/demo.git');
   git('-C', task.worktree, 'push', '-q', 'origin', `HEAD:refs/heads/${task.branch}`);
   return remote;
@@ -2592,6 +2593,28 @@ gapTests['ship-check-wait'] = () => {
   f.save({...f.task('ship'),checkRepair:undefined}); r=wait(); assert.equal(r.code,124,r.out);
   assert.equal(f.task('ship').state,'reported','fast report is not overwritten by automatic tell');
   assert.equal(f.task('ship').checkRepair.pending,false);
+};
+
+gapTests['plain-land-repairs'] = () => {
+  const f=reviewLabelsFixture('land-repairs'), task=f.parent('ship',{pr:'https://github.com/acme/demo/pull/42'}), remote=reviewRemote(f,task);
+  const a=git('-C',task.worktree,'rev-parse','HEAD').trim(); f.save({...f.task('ship'),approvedHead:a,reviewVerdict:{verdict:'APPROVE',head:a,currentHead:a,stale:false,needsReview:false}});
+  f.control({remote,labels:['unrelated',f.approved]});
+  commit(task.worktree,{'repair.js':'export const fixed=true;'},'repair'); const head=git('-C',task.worktree,'rev-parse','HEAD').trim();
+  let r=f.call(['land','ship']); assert.equal(r.code,0,r.out); assert.match(r.out,/published repair commits/);
+  assert.equal(git('--git-dir',remote,'rev-parse',task.branch).trim(),head); assert.equal(f.task('ship').approvedHead,a); assert.equal(f.task('ship').reviewVerdict.needsReview,true);
+  assert.deepEqual(f.control().labels,['unrelated',f.changes]); assert.ok(!f.calls().some(c=>c.a[0]==='pr'&&c.a[1]==='create'));
+  r=f.call(['land','ship']); assert.equal(r.code,0,r.out); assert.match(r.out,/no new commits/);
+  fs.writeFileSync(path.join(task.worktree,'dirty.txt'),'dirty'); assert.equal(f.call(['land','ship']).code,6); fs.unlinkSync(path.join(task.worktree,'dirty.txt'));
+  f.control({prState:'closed'}); assert.equal(f.call(['land','ship']).code,6); f.control({prState:'open'});
+  const hook=path.join(remote,'hooks','pre-receive'); fs.writeFileSync(hook,'#!/bin/sh\nexit 1\n',{mode:0o755});
+  commit(task.worktree,{'retry.js':'retry'},'retry repair'); const beforeRefused=git('--git-dir',remote,'rev-parse',task.branch).trim();
+  r=f.call(['land','ship']); assert.equal(r.code,4,r.out); assert.equal(git('--git-dir',remote,'rev-parse',task.branch).trim(),beforeRefused);
+  fs.unlinkSync(hook); assert.equal(f.call(['land','ship']).code,0);
+  const bot=path.join(f.dir,'outside'); git('clone','-q','--branch',task.branch,remote,bot); commit(bot,{'remote.js':'remote change'},'remote repair'); git('-C',bot,'push','-q');
+  commit(task.worktree,{'local.js':'local change'},'local repair'); r=f.call(['land','ship']); assert.equal(r.code,6,r.out); assert.match(r.out,/ahead or diverged/);
+  const remoteHead=git('--git-dir',remote,'rev-parse',task.branch).trim(); assert.notEqual(remoteHead,git('-C',task.worktree,'rev-parse','HEAD').trim());
+  f.control({prResponse:{state:'open',number:42,html_url:'https://github.com/acme/demo/pull/42',head:{sha:head,ref:'wrong',repo:{full_name:'acme/demo'}}}});
+  assert.equal(f.call(['land','ship']).code,6); assert.equal(git('--git-dir',remote,'rev-parse',task.branch).trim(),remoteHead);
 };
 
 gapTests['review-delta-brief'] = () => {
@@ -2722,7 +2745,9 @@ gapTests['review-label-exclusive-actions'] = () => {
     const id = stale ? 'stale-land' : 'fresh-land', ship = f.parent(id, { pr: 'https://github.com/acme/demo/pull/42' });
     const head = f.control().head;
     f.save({ ...ship, reviewVerdict: { verdict: 'APPROVE', head, currentHead: head, stale: false, needsReview: false } });
-    f.control({ head: stale ? 'b'.repeat(40) : head, labels: ['unrelated', f.under, f.oldUnder, f.approved, f.changes] });
+    if (stale) commit(ship.worktree, { 'repair.txt': 'new work' }, 'repair');
+    reviewRemote(f, ship);
+    f.control({ head: git('-C', ship.worktree, 'rev-parse', 'HEAD').trim(), labels: ['unrelated', f.under, f.oldUnder, f.approved, f.changes] });
     r = f.call(['land', id]); assert.equal(r.code, 0, r.out);
     assert.deepEqual(f.control().labels, ['unrelated', stale ? f.changes : f.approved], 'Land normalizes conflicting assignments, even manually added labels');
   }

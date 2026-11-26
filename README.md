@@ -405,6 +405,12 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
   accounts, that account is used. crew never merges a project's pull request.
 - `crew review` and `crew tell` work the same way for a workflow project's implementation.
 
+For plain projects with an existing open PR, `crew land` publishes clean committed repairs
+to the same recorded branch with an ordinary push; it never opens another PR or force-pushes.
+The worker must report again. PR/repository/branch identity and remote history are checked;
+dirty, closed, ahead or diverged work is refused safely. No new commits is idempotent.
+Workflow and gate land still publish nothing themselves.
+
 For every kind, first land requires a reported worker, an existing copy, and clean tracked
 and untracked files, even when it only records a link. An already-landed open PR can return early.
 Land records the PR link, landed timestamp and backlog completion before any merged-task
