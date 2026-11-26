@@ -36,18 +36,45 @@ edits do not need it and remain usable during slow Core calls.
 
 Copy allocation stays outside both gate and registry lock. A saved preparing reservation with no
 published terminal constrains later admission but is not positive occupancy; contenders release
-the gate between retries so the launch can publish. Stop/finish refuse a still-preparing task,
-even with force, rather than return its copy while allocation can still publish a terminal.
-Actual Core start and publication share one gate interval. Already-admitted launches allow up to
+the gate between retries so the launch can publish. Each reservation records a random preparation
+token and the spawner's local host/platform, PID and OS process-start identity. Windows uses
+Get-Process creation ticks; Linux uses boot ID plus /proc start ticks; other POSIX hosts use
+locale/timezone-stable ps start time. PID existence with the same start identity means live,
+regardless of how long preparation takes. Missing permissions, malformed identity and another
+host are unknown, never dead. An absent PID or a different verified start identity proves the
+recorded spawner ended, including PID reuse and machine restart.
+
+Stop/finish protect a live or unverifiable allocating spawner, including with force. A recorded
+terminal already proves publication completed and retains normal stop/finish behavior, even if
+an older task record still says preparing. For a proven-dead spawner, finish cancels the token
+under the placement gate, then applies ordinary copy/terminal protections; --force is required
+when unfinished work could be discarded. Every preparation update and the final launch check
+its token/state under that gate, so cancelled preparation cannot publish late. New per-project
+admission encountering a dead reservation refuses in one line naming the exact home-qualified
+`crew finish <id> --force` command, rather than endlessly claiming a worker is still launching.
+It does not silently discard another task's partial work. Concurrent recovery commands serialize;
+losers may retry and an already-finished recovery is idempotent.
+
+Allocator and initial Core launch stdout are kept as nonce-bound task-folder receipts. Recovery
+can validate an unpublished delivery copy against the project's Git common directory, and a
+returned Core address is durable launch ownership evidence rather than inferred from labels.
+Partial/unverifiable external-tool output cannot authorize adopting foreign terminals or deleting
+an unverified copy. Actual Core start and publication share one gate interval. Already-admitted launches allow up to
 ten minutes to reacquire the gate for publication/failure recording, matching the copy allocator's
 existing long wait instead of stranding preparation on brief contention. Failed reservations do
 not establish occupancy. Core reads share a ten-second
 admission budget with at most two seconds per probe. Gate contention and preparing launches cause
 bounded wait/retry or worker-space-busy refusal, before the contender creates a task or copy;
 background observation writers yield immediately, and done retains its existing longer report wait.
-An interrupted owner may leave worker-spaces.lock behind: never steal it or delete it based on
-PID/age guesses. This intentionally serializes terminal transitions within a home, so slow cleanup
-can require another command to retry. Legacy binaries and direct-file writers cannot participate.
+The placement gate is an atomically published populated directory with a unique owner-nonce
+file containing the same OS identity proof. A proven-dead owner is reclaimable. Exactly one
+contender can unlink that nonce; removal of the now-empty directory is non-recursive, so a new
+populated live gate cannot be deleted by a delayed reclaimer. A reclaimer interrupted after
+unlinking its nonce leaves an empty, safely removable gate, not another permanent reservation.
+Release retires the owned directory before deleting it privately. Live, unverifiable and old
+file-format gates are never stolen by PID/age guesses. This intentionally serializes terminal
+transitions within a home, so slow cleanup can require another command to retry. Legacy binaries
+and direct-file writers cannot participate.
 
 Slow external operations do not hold the registry lock. Switching never
 moves, relabels or reorders already-spawned workers or creates/removes any space.
@@ -345,6 +372,12 @@ inherited identity. `--gaps=join-project-space-gate` covers manual relaunch, sto
 publication gaps, plus replacement releasing its gate while an admission waits to acquire it;
 that admission cannot read task state until it owns the gate. Both groups also run inside the
 broader join-project-space group, alongside two-spawn and gate-free copy-preparation contention.
+`--gaps=preparation-recovery` kills and awaits actual spawner processes after reservation, before/
+after plain copy creation, after delivery returns its copy, after brief creation and after Core
+returns its address. It covers live-but-slow protection without age expiry, coordinator restart,
+racing stale-gate/admission detection and finish recovery, token cancellation, unpublished copy/
+terminal receipts, PID reuse, unknown identity and an interrupted empty-gate reclaimer. It uses
+real local process identity with fake Core and isolated homes, never the live coordinator.
 
 The additional focused groups `--gaps=worker-space-local-setter` and
 `--gaps=worker-space-local-ordering` cover the desktop command, exact capability/results,

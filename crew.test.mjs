@@ -7,7 +7,7 @@ import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, autoModeGuard, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity, approvalCovers } from './crew.mjs';
+import { validId, projectNameError, shq, bashPath, briefText, agentCommand, cleanProfile, quotaVerdict, githubOwner, AGENTS, TOOLS, autoModeGuard, main, snapshotCopy, repairFile, canonicalPrUrl, discoverTaskPrs, prObservation, rememberTaskPr, fleetTaskVisible, verifiedPrRead, coordinatorIdentity, approvalCovers, spawnerIdentity, spawnerState } from './crew.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crew-test-'));
@@ -1195,7 +1195,7 @@ const original = cp.spawnSync; let paused = false;
 cp.spawnSync = (...args) => {
   if (paused || !args[1]?.includes(${JSON.stringify(verb)}) || (${JSON.stringify(address)} && !args[1]?.includes(${JSON.stringify(address)}))) return original(...args);
   paused = true; const result = ${after} ? original(...args) : undefined;
-  fs.writeFileSync(${JSON.stringify(ready)}, 'ready'); const deadline = Date.now() + 15000;
+  fs.writeFileSync(${JSON.stringify(ready)}, JSON.stringify({command:args[0],args:args[1],status:result?.status,stderr:result?.stderr})); const deadline = Date.now() + 15000;
   while (!fs.existsSync(${JSON.stringify(release)})) { if (Date.now() > deadline) throw Error('Core barrier timeout'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
   return ${after} ? result : original(...args);
 }; syncBuiltinESMExports();
@@ -1293,10 +1293,10 @@ async function joinPlacementGateTests(scope = 'integrated') {
   const removal = joinCoreBarrier(f, 'remove', 'rm', old.terminal, true);
   const ready = path.join(f.dir, 'acquire-ready'), release = path.join(f.dir, 'acquire-release'), script = path.join(f.dir, 'acquire.mjs');
   fs.writeFileSync(script, `import fs from 'node:fs';
-const open = fs.openSync, read = fs.readFileSync; let paused = false;
-fs.openSync = (file, ...args) => {
-  try { return open(file, ...args); } catch (error) {
-    if (!paused && String(file) === ${JSON.stringify(gateFile)} && error.code === 'EEXIST') {
+const rename = fs.renameSync, read = fs.readFileSync; let paused = false;
+fs.renameSync = (from, to, ...args) => {
+  try { return rename(from, to, ...args); } catch (error) {
+    if (!paused && String(to) === ${JSON.stringify(gateFile)} && ['EEXIST','ENOTEMPTY','EPERM','EACCES'].includes(error.code)) {
       paused = true; fs.writeFileSync(${JSON.stringify(ready)}, 'ready'); const deadline = Date.now() + 15000;
       while (!fs.existsSync(${JSON.stringify(release)})) { if (Date.now() > deadline) throw Error('Acquire timeout'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
     }
@@ -1304,7 +1304,10 @@ fs.openSync = (file, ...args) => {
   }
 };
 fs.readFileSync = (file, ...args) => {
-  if (String(file) === ${JSON.stringify(task)} && JSON.parse(read(${JSON.stringify(gateFile)}, 'utf8')).pid !== process.pid) throw Error('Admission read task state before owning placement gate');
+  if (String(file) === ${JSON.stringify(task)}) {
+    const owner = fs.readdirSync(${JSON.stringify(gateFile)})[0];
+    if (JSON.parse(read(${JSON.stringify(gateFile)} + '/' + owner, 'utf8')).pid !== process.pid) throw Error('Admission read task state before owning placement gate');
+  }
   return read(file, ...args);
 };
 const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)}); main(process.argv.slice(2));`);
@@ -1330,6 +1333,136 @@ const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'cr
     await handover.result;
   }
 }
+function preparationBriefBarrier(f) {
+  const ready = path.join(f.dir, 'brief-ready'), release = path.join(f.dir, 'brief-release'), script = path.join(f.dir, 'brief.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs'; const write=fs.writeFileSync; let paused=false;
+fs.writeFileSync=(file,...args)=>{const result=write(file,...args);if(!paused && String(file)===${JSON.stringify(slash(path.join(f.home, 'tasks', 'abandoned', 'brief.md')))}){paused=true;write(${JSON.stringify(ready)},'ready');const deadline=Date.now()+15000;while(!fs.existsSync(${JSON.stringify(release)})){if(Date.now()>deadline)throw Error('Brief timeout');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}}return result;};
+const { main }=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));`);
+  return { ready, release, script };
+}
+gapTests['preparation-process-proof'] = () => {
+  const script = path.join(root, 'linux-process-proof.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs';import assert from 'node:assert/strict';
+Object.defineProperty(process,'platform',{value:'linux'});
+const read=fs.readFileSync;let ticks='123',state='R',boot='11111111-1111-4111-8111-111111111111',denied=false,comm='odd) process ) name';
+fs.readFileSync=(file,...args)=>{if(String(file)==='/proc/'+process.pid+'/stat'){if(denied)throw Object.assign(Error('denied'),{code:'EACCES'});return process.pid+' ('+comm+') '+state+' '+Array(18).fill('0').join(' ')+' '+ticks+' 0';}if(String(file)==='/proc/sys/kernel/random/boot_id')return boot;return read(file,...args);};
+const {spawnerIdentity,spawnerState}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});
+const owner=spawnerIdentity();assert.ok(owner.started.endsWith(':123'));assert.equal(spawnerState(owner),'live');
+comm='a different ) command';assert.equal(spawnerState(owner),'live');
+ticks='124';assert.equal(spawnerState(owner),'dead');ticks='123';
+boot='22222222-2222-4222-8222-222222222222';assert.equal(spawnerState(owner),'dead');boot='11111111-1111-4111-8111-111111111111';
+state='Z';assert.equal(spawnerState(owner),'dead');state='R';denied=true;assert.equal(spawnerState(owner),'unknown');
+process.kill=()=>{throw Object.assign(Error('gone'),{code:'ESRCH'});};assert.equal(spawnerState(owner),'dead');
+assert.equal(spawnerState({...owner,host:'other-host'}),'unknown');`);
+  const result = spawnSync(process.execPath, [script], { encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr);
+};
+gapTests['preparation-recovery'] = async () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    for (const phase of ['reserved', 'before-copy', 'after-copy', 'delivery', 'brief', 'launch']) {
+      const name = `recovery-${phase}`, f = joinSpaceFixture(name); f.mode('per-project');
+      const deliveredCopy = path.join(f.dir, 'allocated-copy');
+      if (phase === 'delivery') {
+        const delivery = path.join(f.dir, 'fake-delivery.mjs');
+        fs.writeFileSync(delivery, `import {spawnSync} from 'node:child_process';const a=process.argv.slice(2);const folder=${JSON.stringify(deliveredCopy)};
+const args=a[0]==='start'?['-C',${JSON.stringify(f.repo)},'worktree','add','-b',a[1],folder,'HEAD']:['-C',${JSON.stringify(f.repo)},'worktree','remove','--force',a[1]];
+const r=spawnSync('git',args,{encoding:'utf8'});if(r.status!==0){console.error(r.stderr);process.exit(1)}if(a[0]==='start')console.log(JSON.stringify({path:folder,created:true,pooled:false}));`);
+        f.env.CREW_TOOL_DELIVERY = delivery;
+      }
+      const barrier = phase === 'reserved' ? projectBarrier(f, 'after') : phase === 'brief' ? preparationBriefBarrier(f)
+        : joinCoreBarrier(f, phase, phase === 'delivery' ? 'start' : phase === 'launch' ? 'run' : 'worktree', ['delivery', 'launch'].includes(phase) ? null : 'add', phase !== 'before-copy');
+      let owner = `owner-spaces-${name}`;
+      const pending = projectProcess(f, ['spawn', 'abandoned', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { script: barrier.script, terminal: owner, env: f.env });
+      const call = args => crew(args, { cwd: f.home, terminal: owner, env: f.env });
+      try {
+        await until(() => fs.existsSync(barrier.ready));
+        const task = f.task('abandoned'); assert.equal(task.state, 'preparing'); assert.equal(task.terminal, null);
+        assert.equal(task.preparation.owner.pid, pending.child.pid); assert.ok(task.preparation.owner.started);
+        if (phase === 'after-copy') {
+          f.save({ ...task, preparation: { ...task.preparation, started: '2000-01-01T00:00:00Z' } });
+          for (const verb of ['finish', 'stop']) {
+            const active = call([verb, task.id, '--force']); assert.equal(active.code, 6, active.out); assert.match(active.out, /spawner is alive/);
+          }
+          const active = call(['spawn', 'slow-contender', '--project', 'demo', '--agent', 'pi', 'Count.']);
+          assert.equal(active.code, 4, active.out); assert.doesNotMatch(active.out, /abandoned/);
+        }
+        pending.child.kill('SIGKILL'); await pending.result;
+        assert.equal(spawnerState(task.preparation.owner), 'dead');
+        if (phase === 'delivery') {
+          assert.ok(fs.existsSync(deliveredCopy), `Allocator must complete: ${fs.readFileSync(barrier.ready, 'utf8')}`);
+          const receipt = path.join(f.home, 'tasks', task.id, `copy-${task.preparation.token}.json`);
+          assert.ok(fs.existsSync(receipt), `Missing durable receipt: ${fs.readdirSync(path.dirname(receipt)).join(', ')}`);
+          const value = JSON.parse(fs.readFileSync(receipt, 'utf8')); assert.equal(value.path, deliveredCopy); assert.equal(value.created, true);
+        }
+        if (phase === 'brief') {
+          assert.equal(call(['end']).code, 0);
+          owner = `restart-${name}`; const w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
+          assert.equal(call(['start']).code, 0, 'A new coordinator can recover a prior spawn reservation');
+        }
+        // Two admissions may simultaneously discover/reclaim a dead placement
+        // gate. They must preserve the dead task and name the same safe command.
+        const contenders = ['one', 'two'].map(id => projectProcess(f, ['spawn', id, '--project', 'demo', '--agent', 'pi', 'Count.'], { terminal: owner, env: f.env }));
+        for (const contender of contenders) {
+          const result = await contender.result; assert.equal(result.code, 4, result.out);
+          assert.match(result.out, /worker-space-abandoned/); assert.match(result.out, /crew finish abandoned --force/);
+        }
+        assert.equal(f.task(task.id).state, 'preparing', 'Detection does not silently discard partial work');
+        if (phase === 'after-copy') {
+          fs.writeFileSync(path.join(task.worktree, 'protected.txt'), 'keep until explicit force');
+          const protectedResult = call(['finish', task.id]); assert.equal(protectedResult.code, 6, protectedResult.out);
+          assert.ok(fs.existsSync(path.join(task.worktree, 'protected.txt')));
+        }
+        // Finish races serialize cancellation and cleanup; the second is
+        // idempotent, never deletes a new gate or resurrects the reservation.
+        const finishers = [1, 2].map(() => projectProcess(f, ['finish', task.id, '--force'], { terminal: owner, env: f.env }));
+        for (const finisher of finishers) {
+          const result = await finisher.result; assert.ok([0, 4].includes(result.code), result.out);
+          if (result.code === 4) assert.match(result.out, /worker-space-busy/);
+        }
+        const retried = call(['finish', task.id, '--force']); assert.equal(retried.code, 0, retried.out);
+        const closed = f.task(task.id); assert.equal(closed.state, 'closed'); assert.ok(closed.preparation.cancelled);
+        assert.ok(!fs.existsSync(task.worktree), 'Owned partial copy returned after confirmed spawner death and force');
+        if (phase === 'delivery') {
+          assert.equal(closed.worktree, slash(deliveredCopy), 'Durable allocator receipt recovers the unpublished copy path');
+          assert.ok(!fs.existsSync(deliveredCopy));
+        }
+        if (phase === 'launch') {
+          assert.ok(closed.terminals.length === 1, 'Unpublished Core stdout receipt restores exact launch ownership');
+          assert.ok(!readWorld().terminals[closed.terminals[0].address]);
+        }
+        if (phase === 'delivery') delete f.env.CREW_TOOL_DELIVERY;
+        const result = call(['spawn', 'recovered', '--project', 'demo', '--agent', 'pi', 'Count.']); assert.equal(result.code, 0, result.out);
+      } catch (error) {
+        if (pending.child.exitCode === null && pending.child.signalCode === null) pending.child.kill('SIGKILL');
+        const result = await pending.result;
+        throw new Error(`Preparation phase ${phase}: ${error.message}\n${result.out}`, { cause: error });
+      } finally {
+        fs.writeFileSync(barrier.release, 'go');
+        if (pending.child.exitCode === null && pending.child.signalCode === null) pending.child.kill('SIGKILL');
+        await pending.result;
+      }
+    }
+    const f = joinSpaceFixture('recovery-fence'), gate = joinCoreBarrier(f, 'copy', 'worktree', 'add', true);
+    const pending = projectProcess(f, ['spawn', 'abandoned', '--project', 'demo', '--agent', 'pi', 'Count.'], { script: gate.script, terminal: 'owner-spaces-recovery-fence', env: f.env });
+    try {
+      await until(() => fs.existsSync(gate.ready)); const task = f.task('abandoned');
+      f.save({ ...task, state: 'failed', preparation: { ...task.preparation, cancelled: new Date().toISOString() } });
+      fs.writeFileSync(gate.release, 'go'); const result = await pending.result;
+      assert.equal(result.code, 4, result.out); assert.match(result.out, /preparation-cancelled/);
+      assert.ok(!readWorld().log.some(a => a[0] === 'run'), 'A revoked publisher cannot start a late worker');
+      assert.equal(f.task(task.id).state, 'failed');
+    } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+    const empty = joinSpaceFixture('recovery-empty-gate');
+    fs.mkdirSync(path.join(empty.home, 'worker-spaces.lock'));
+    empty.spawn('after-interrupted-reclaimer');
+    assert.ok(!fs.existsSync(path.join(empty.home, 'worker-spaces.lock')), 'An interrupted nonce reclaimer cannot strand an empty gate');
+    const own = spawnerIdentity(); assert.equal(spawnerState(own), 'live');
+    const changedStart = own.started.replace(/\d+$/, value => String(BigInt(value) + 1n));
+    if (changedStart !== own.started) assert.equal(spawnerState({ ...own, started: changedStart }), 'dead', 'A reused PID is not the recorded process instance');
+    assert.equal(spawnerState({ ...own, started: 'broken' }), 'unknown', 'Malformed process proof never authorizes cancellation');
+    assert.equal(spawnerState({ ...own, host: `${own.host}-other` }), 'unknown', 'Another machine never proves local death');
+  } finally { fs.writeFileSync(world, before); }
+};
 gapTests['join-project-space-gate'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
   try { await joinPlacementGateTests('focused'); }
@@ -2185,12 +2318,23 @@ fs.writeFileSync(${JSON.stringify(orphan)},git('rev-parse','HEAD'));git('checkou
 
 gapTests['owned-late-publication'] = () => {
   const f = gapFixture('owned-late'), t = f.spawn('late', ['--agent', 'pi']), bin = path.join(f.dir, 'bin'); fs.mkdirSync(bin); fs.writeFileSync(path.join(bin, 'pi'), '');
+  // Retain multi-launch ownership cleanup, but a third late publication must now
+  // be excluded while finish owns the placement gate, not injected through it.
+  const predecessor = structuredClone(readWorld().terminals[t.terminal]);
+  const replaced = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'before-finish'], { CREW_AGENT_PATH: bin });
+  assert.equal(replaced.code, 0, replaced.out);
+  const existing = readWorld(); existing.terminals[t.terminal] = predecessor; fs.writeFileSync(world, JSON.stringify(existing));
+  assert.ok(f.task(t.id).terminals.every(worker => readWorld().terminals[worker.address]?.state === 'live'), 'Both historically owned workers are live before finish');
+  const runsBefore = readWorld().log.filter(a => a[0] === 'run').length;
   const preload = path.join(f.dir, 'late.cjs'), launch = path.join(f.dir, 'launch.log');
   fs.writeFileSync(preload, `const fs=require('node:fs'),cp=require('node:child_process'),orig=cp.spawnSync;let launched=false;
 cp.spawnSync=(p,a,o)=>{const r=orig(p,a,o);if(!launched&&a?.includes(${JSON.stringify(fake)})&&a.includes('kill')){launched=true;
-const next=orig(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},'relaunch',${JSON.stringify(t.id)},'--agent','pi','--model','late-worker'],{cwd:${JSON.stringify(f.home)},encoding:'utf8',env:{...process.env,NODE_OPTIONS:'',CREW_AGENT_PATH:${JSON.stringify(bin)}}});fs.writeFileSync(${JSON.stringify(launch)},next.stdout+next.stderr);if(next.status!==0)throw Error('replacement failed '+next.stderr)}return r};require('node:module').syncBuiltinESMExports();`);
+const next=orig(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},'relaunch',${JSON.stringify(t.id)},'--agent','pi','--model','late-worker'],{cwd:${JSON.stringify(f.home)},encoding:'utf8',env:{...process.env,NODE_OPTIONS:'',CREW_AGENT_PATH:${JSON.stringify(bin)}}});fs.writeFileSync(${JSON.stringify(launch)},JSON.stringify({code:next.status,out:next.stdout+next.stderr}))}return r};require('node:module').syncBuiltinESMExports();`);
   const r = f.call(['finish', t.id], { NODE_OPTIONS: `--require ${JSON.stringify(preload)}` });
-  assert.equal(r.code, 0, r.out); assert.match(fs.readFileSync(launch, 'utf8'), /relaunched/);
+  assert.equal(r.code, 0, r.out);
+  const attempted = JSON.parse(fs.readFileSync(launch, 'utf8')); assert.equal(attempted.code, 4, attempted.out);
+  assert.match(attempted.out, /worker-space-busy/);
+  assert.equal(readWorld().log.filter(a => a[0] === 'run').length, runsBefore, 'Finish excludes a third concurrent launch');
   const closed = f.task(t.id); assert.equal(closed.terminals.length, 2);
   for (const worker of closed.terminals) assert.ok(!readWorld().terminals[worker.address], `Late owned terminal ${worker.address} must be removed`);
   assert.ok(!closed.copyToReturn && !fs.existsSync(t.worktree), r.out);
@@ -2482,9 +2626,9 @@ const { main } = await import(${JSON.stringify(pathToFileURL(path.join(here, 'cr
     fs.writeFileSync(task.report, 'Fast replacement report.');
     const doneReady = path.join(f.dir, 'done-ready'), doneScript = path.join(f.dir, 'done.mjs');
     fs.writeFileSync(doneScript, `import fs from 'node:fs'; import { main } from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
-const open = fs.openSync; fs.openSync = (file, ...args) => {
- if (String(file).endsWith('worker-spaces.lock')) fs.writeFileSync(${JSON.stringify(doneReady)}, 'ready');
- return open(file, ...args);
+const rename = fs.renameSync; fs.renameSync = (from, to, ...args) => {
+ if (String(to).endsWith('worker-spaces.lock')) fs.writeFileSync(${JSON.stringify(doneReady)}, 'ready');
+ return rename(from, to, ...args);
 }; main(process.argv.slice(2));`);
     done = projectProcess(f, ['done', task.id], { script: doneScript, terminal: address });
     await until(() => fs.existsSync(doneReady));

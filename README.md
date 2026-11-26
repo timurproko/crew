@@ -191,8 +191,13 @@ the decision and reservation. Task writers and terminal transitions use that sam
 the whole replacement gap, so admission cannot see a transient empty space. Copy allocation stays
 outside the gate; unpublished reservations cause bounded wait/retry rather than a duplicate space
 request. Registry-only settings/registration remain independent and Core/copy operations never hold
-the registry lock. Slow terminal transitions can require another command to retry; locks are never
-stolen.
+the registry lock. Slow terminal transitions can require another command to retry. Preparation
+records the spawner's PID and OS start identity: live/unknown allocators stay protected, while a
+proven-dead reservation can be cancelled with `crew finish <id> --force` using normal cleanup
+guards. A new spawn identifies abandoned preparation with the exact home-qualified recovery
+command. Gate recovery also requires OS-instance death proof, never an age/PID guess; token checks
+prevent cancelled preparation from publishing late. See the detailed recovery/receipt contract
+in docs/worker-spaces.md.
 
 **Herdr dependency:** per-project grouping requests separate automatic spaces, but connected
 nesting under the coordinator and exact project names require the compatible Herdr companion
