@@ -257,9 +257,10 @@ function requireUnusedProject(h, name) {
       return task;
     });
   } catch (error) { refuse(`Crew home ${slash(h.dir)}: cannot check task references (${error.message}); project ${name} was kept.`); }
-  const users = tasks.filter(t => t.project === name && t.state !== 'closed');
+  const references = tasks.filter(t => t.project === name || resolveWorkerSpace(h, t).project === name);
+  const users = references.filter(t => t.state !== 'closed');
   if (users.length) refuse(`Project ${name} is used by unfinished tasks: ${users.map(t => `${t.id}[${t.state}]`).join(' ')}. Finish them first.`);
-  const waiting = tasks.filter(t => t.project === name && t.copyToReturn);
+  const waiting = references.filter(t => t.copyToReturn);
   if (waiting.length) refuse(`Project ${name} still has working copies of finished tasks to return: ${waiting.map(t => t.id).join(' ')}. They go back once no terminal holds them (crew status --all).`);
 }
 
@@ -328,7 +329,7 @@ const launchedTerminals = (task, address, agent) => [...ownedTerminals(task).fil
 const saveTask = (h, task) => taskTransaction(h, task.id, current => {
   const prFacts = current?.prFacts;
   const terminals = [...new Map([...(current?.terminals ?? []), ...(task.terminals ?? [])].map(t => [t.address, t])).values()];
-  writeJson(taskFile(h, task.id), { ...task, ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), updated: now() });
+  writeJson(taskFile(h, task.id), { ...task, ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), ...(current && Object.hasOwn(current, 'workerSpace') ? { workerSpace: current.workerSpace } : {}), updated: now() });
 });
 
 const prTime = value => {
@@ -1389,6 +1390,33 @@ function startTerminal(h, { id, worktree, label, pick, instruction, workerSpace 
 const kindLabel = task => (task.selfFix ? 'fix' : task.reviews ? 'review' : task.kind);
 const roleOf = kindLabel;
 
+// Placement is immutable task metadata, never evidence that Crew owns a terminal.
+function resolveWorkerSpace(h, task) {
+  if (!Object.hasOwn(task, 'workerSpace')) return makeWorkerSpace(h, 'combined', task.project);
+  const space = task.workerSpace;
+  const projectAllowed = space?.project === task.project || (task.selfFix && space?.project === 'crew');
+  if (!space || space.version !== 1 || !WORKER_SPACE_MODES.includes(space.mode) || !projectAllowed
+      || (space.project !== SELF_PROJECT && projectNameError(space.project))) {
+    refuse(`Task ${task.id} has invalid workerSpace placement; nothing was moved or stopped.`);
+  }
+  const expected = makeWorkerSpace(h, space.mode, space.project);
+  if (space.id !== expected.id || space.name !== expected.name) refuse(`Task ${task.id} has invalid workerSpace identity; nothing was moved or stopped.`);
+  return expected;
+}
+function repositoryIdentity(folder) {
+  const r = run('git', ['-C', folder, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { timeout: 2000 });
+  try { return r.code === 0 && r.stdout.trim() ? comparablePath(fs.realpathSync(r.stdout.trim())) : null; } catch { return null; }
+}
+function admittedWorkerSpace(h, task) {
+  if (Object.hasOwn(task, 'workerSpace')) return resolveWorkerSpace(h, task);
+  const mode = h.config.workerSpaceMode ?? 'combined';
+  let project = task.project;
+  if (task.selfFix && mode === 'per-project') {
+    const registered = registeredProject(h, 'crew'), identity = repositoryIdentity(task.projectPath);
+    if (registered && identity && repositoryIdentity(registered.path) === identity) project = 'crew';
+  }
+  return makeWorkerSpace(h, mode, project);
+}
 function makeWorkerSpace(h, mode, project) {
   const base = `fm-crew-${h.config.tag}`;
   return { version: 1, mode, id: mode === 'combined' ? base : project === SELF_PROJECT ? `${base}-self` : `${base}-project-${project}`,
@@ -1417,7 +1445,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     // The project may have been removed/replaced while selection was running.
     if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
     if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
-    record.workerSpace = makeWorkerSpace(h, h.config.workerSpaceMode ?? 'combined', opts.project);
+    record.workerSpace = admittedWorkerSpace(h, record);
     fs.mkdirSync(dir, { recursive: true });
     saveTask(h, record); // reservation freezes placement and prevents removal/replacement before external work
   });
@@ -1499,6 +1527,7 @@ function relaunch(h, task, reason, flags = null) {
 }
 function replaceWorker(h, task, reason, flags) {
   const store = value => writeJson(taskFile(h, task.id), { ...value, updated: now() });
+  task = { ...task, workerSpace: resolveWorkerSpace(h, task) };
   const before = task.launch ?? { harness: task.agent }, tried = new Set([...(task.tried ?? []), pickKey(before)]);
   const role = roleOf(task), named = flags && [...PICK_FLAGS, 'no-fallback'].some(key => flags[key] !== undefined);
   const config = dispatchConfig(h);
@@ -1518,6 +1547,8 @@ function replaceWorker(h, task, reason, flags) {
   }
   const [pick, ...rest] = usable;
   const chain = original.filter(c => pickKey(c) !== pickKey(pick) && !tried.has(pickKey(c)));
+  // Freeze legacy placement before ending its terminal; recovery cannot consult a new mode.
+  store(task);
   if (task.terminal) {
     let seen = probe(task.terminal).state;
     if (seen === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; task ${task.id} was left as it is. Try again.`, 4);
@@ -1525,7 +1556,7 @@ function replaceWorker(h, task, reason, flags) {
     if (seen !== 'absent') refuse(`Core still has terminal ${task.terminal}; task ${task.id} was not handed over.`, 6);
   }
   const instruction = `Read the brief at ${task.brief} and carry it out exactly. Another worker (${pickLabel(before)}) began this task and had to stop: ${reason}. What it did is already in this working copy: look at \`git status\` and \`git log\`, and at ${task.report} if it exists, then continue from there instead of starting again.`;
-  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, workerSpace: task.workerSpace ?? makeWorkerSpace(h, 'combined', task.project), instruction });
+  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, workerSpace: task.workerSpace, instruction });
   const address = started.value?.address;
   if (started.code !== 0 || !address) {
     store({ ...task, state: 'failed', terminal: null, terminals: address ? launchedTerminals(task, address, pick.harness) : ownedTerminals(task), error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
@@ -2385,7 +2416,7 @@ function cmdReview(args) {
   if (task.kind !== 'ship' || task.selfFix) refuse(`Task ${id} is not a ship task of a project; only those have a branch to review.`);
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; review it after its worker reported.`);
   const project = registeredProject(h, task.project) ?? refuse(`Unknown project: ${task.project}.`);
-  const opts = { kind: 'scout', project: task.project };
+  const opts = { kind: 'scout', project: task.project }, workerSpace = resolveWorkerSpace(h, task);
   // Without a choice and without a review chain in the configuration: CREW_REVIEW_AGENT, else the author's agent.
   const legacy = process.env.CREW_REVIEW_AGENT ?? task.agent;
   if (!AGENTS[legacy]) refuse(`Unknown agent: ${legacy}. Known: ${Object.keys(AGENTS).join(', ')}`);
@@ -2399,7 +2430,7 @@ function cmdReview(args) {
     '- Look for defects: wrong behaviour, missed cases, broken or missing tests, changes beyond the task. Run the project\'s tests if that is cheap. Ignore style.',
     '- Start your report with one line: `APPROVE` or `CHANGES NEEDED`. Then each defect with file and line, what goes wrong, and how to see it. No defect, no text.',
   ].join('\n');
-  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead } });
+  launchWorker(h, { id: reviewId, opts, chosen: chooseWorker(h, 'review', flags, legacy, task.project), project, task: text, extra: { reviews: id, reviewHead, workerSpace } });
   reviewLabels(h, reviewId);
   console.log(`next: crew wait ${reviewId}; on CHANGES NEEDED: crew tell ${id} "<the defects>", wait, and review again`);
 }

@@ -694,7 +694,123 @@ async function workerSpaceConfigTests() {
     } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
   }
 }
-gapTests['worker-spaces'] = async () => { await workerSpaceConfigTests(); };
+function workerSpaceFixture(name) {
+  const noGh = path.join(root, 'space-no-gh.mjs'); fs.writeFileSync(noGh, 'process.exit(1);');
+  const env = { CREW_GH: noGh, CREW_AGENT_PATH: '', CREW_NO_QUOTA: '1', CREW_RECOVERY_SECONDS: '0' };
+  const f = gapFixture(`spaces-${name}`, env), call = (args, more = {}) => f.call(args, more);
+  const add = (name, repo = f.repo) => { const r = call(['project', 'add', name, repo]); assert.equal(r.code, 0, r.out); };
+  const spawn = (id, project = 'demo', flags = []) => {
+    const r = call(['spawn', id, '--project', project, '--agent', 'pi', '--model', 'first', ...flags, 'Count.']);
+    assert.equal(r.code, 0, r.out); return f.task(id);
+  };
+  const done = t => {
+    fs.writeFileSync(t.report, 'Complete.');
+    const r = crew(['done', t.id], { cwd: f.home, terminal: t.terminal, env }); assert.equal(r.code, 0, r.out);
+  };
+  const mode = value => { const r = call(['config', 'worker-space', value]); assert.equal(r.code, 0, r.out); };
+  const labels = t => readWorld().terminals[f.task(t.id).terminal].labels;
+  const space = t => labels(t)['herdr.space'];
+  return { ...f, call, add, spawn, done, mode, labels, space, env };
+}
+function workerSpacePlacementTests() {
+  const f = workerSpaceFixture('placement'); f.add('other'); f.add('.xrbuild'); f.add('agentnumberone.dev');
+  const tag = JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8')).tag, combined = `fm-crew-${tag}`;
+  const a = f.spawn('old-a'), b = f.spawn('old-b', 'other');
+  assert.equal(f.space(a), combined); assert.equal(f.space(b), combined);
+  assert.equal(f.labels(a)['crew.space.name'], undefined, 'Combined title stays directory-derived');
+  const old = structuredClone(readWorld().terminals[a.terminal]);
+  const n = readWorld().log.length; f.mode('per-project');
+  const fresh = f.spawn('new-a'), other = f.spawn('new-b', 'other'), again = f.spawn('again');
+  assert.equal(f.space(fresh), `${combined}-project-demo`); assert.notEqual(f.space(fresh), f.space(other));
+  assert.equal(f.space(again), f.space(fresh)); assert.equal(f.labels(fresh)['crew.space.name'], 'demo');
+  for (const project of ['.xrbuild', 'agentnumberone.dev']) {
+    const t = f.spawn(project.startsWith('.') ? 'dot' : 'domain', project);
+    assert.equal(f.space(t), `${combined}-project-${project}`); assert.equal(f.labels(t)['crew.space.name'], project);
+    assert.equal(f.labels(t)['crew.home'], tag); assert.equal(f.labels(t)['crew.space.project'], project);
+  }
+  assert.deepEqual(readWorld().terminals[a.terminal], old);
+  f.add('not-yet'); f.mode('combined');
+  assert.equal(f.space(f.spawn('combined-existing')), combined);
+  assert.equal(f.space(f.spawn('combined-new', 'not-yet')), combined);
+  f.mode('per-project'); assert.equal(f.space(f.spawn('return-a')), f.space(fresh));
+  assert.deepEqual(readWorld().terminals[a.terminal], old);
+  assert.ok(!readWorld().log.slice(n).some(c => /label|move|space|doc/.test(c[0])), 'No regrouping operations');
+  const otherHome = workerSpaceFixture('other-home'); otherHome.mode('per-project');
+  assert.notEqual(otherHome.space(otherHome.spawn('same-project')), f.space(fresh));
+  // Fake delivery puts a dotted project's worker in an arbitrary pool directory.
+  const pooled = path.join(f.dir, 'pooled'), delivery = path.join(f.dir, 'delivery.mjs');
+  fs.mkdirSync(pooled); fs.writeFileSync(delivery, `console.log(JSON.stringify({path:${JSON.stringify(pooled)},created:true,pooled:true}));`);
+  const r = f.call(['spawn', 'pool-dot', '--project', '.xrbuild', '--agent', 'pi', 'Count.'], { CREW_TOOL_DELIVERY: delivery });
+  assert.equal(r.code, 0, r.out); assert.equal(f.task('pool-dot').worktree, slash(pooled));
+  assert.equal(f.labels(f.task('pool-dot'))['crew.space.name'], '.xrbuild');
+}
+function workerSpaceInheritanceTests() {
+  for (const initial of ['combined', 'per-project']) {
+    const f = workerSpaceFixture(`inherit-${initial}`); f.mode(initial);
+    const manual = f.spawn('manual', 'demo', ['--kind', 'ship']), automatic = f.spawn('auto');
+    const reviewSource = f.spawn('review-source', 'demo', ['--kind', 'ship']); f.done(reviewSource);
+    const oldSpace = f.space(manual), untouched = structuredClone(readWorld().terminals[reviewSource.terminal]);
+    f.mode(initial === 'combined' ? 'per-project' : 'combined');
+    let r = f.call(['review', 'review-source', '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+    assert.equal(f.space(f.task('review-source-review')), oldSpace);
+    r = f.call(['relaunch', 'manual', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+    assert.equal(f.space(manual), oldSpace); assert.equal(f.task('manual').terminals.length, 2);
+    const current = f.task('auto');
+    f.save({ ...current, chain: [{ harness: 'pi', model: 'second' }], candidates: [{ harness: 'pi', model: 'first' }, { harness: 'pi', model: 'second' }] });
+    setTerminal(current.terminal, { status: { app: 'pi', state: 'idle' }, screen: 'quota exhausted' });
+    r = f.call(['wait', 'auto', '--timeout', '0.2']); assert.equal(r.code, 124, r.out);
+    assert.notEqual(f.task('auto').terminal, current.terminal, r.out); assert.equal(f.space(automatic), oldSpace);
+    assert.deepEqual(readWorld().terminals[reviewSource.terminal], untouched);
+  }
+  const f = workerSpaceFixture('legacy');
+  const t = f.spawn('legacy', 'demo', ['--kind', 'ship']), bad = f.spawn('bad', 'demo', ['--kind', 'ship']);
+  const { workerSpace, ...legacy } = t; f.save(legacy);
+  f.mode('per-project'); f.done(t);
+  let r = f.call(['review', 'legacy', '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(f.task('legacy-review')), workerSpace.id); assert.equal(f.task('legacy').workerSpace, undefined, 'No bulk rewrite');
+  // Tell reopens the old worker, then a manual replacement persists combined placement.
+  r = f.call(['tell', 'legacy', 'Continue.']); assert.equal(r.code, 0, r.out);
+  r = f.call(['relaunch', 'legacy', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.space(t), workerSpace.id); assert.deepEqual(f.task('legacy').workerSpace, workerSpace);
+  for (const invalid of [null, { ...bad.workerSpace, version: 2 }, { ...bad.workerSpace, id: 'personal' }, { ...bad.workerSpace, project: 'other' }, { ...bad.workerSpace, name: 'wrong' }]) {
+    f.save({ ...bad, workerSpace: invalid }); const n = readWorld().log.length;
+    r = f.call(['relaunch', 'bad', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 2, r.out);
+    f.save({ ...bad, state: 'reported', workerSpace: invalid });
+    r = f.call(['review', 'bad', '--agent', 'pi']); assert.equal(r.code, 2, r.out); assert.match(r.out, /invalid workerSpace/);
+    assert.ok(!readWorld().log.slice(n).some(c => ['kill', 'rm', 'run'].includes(c[0])));
+  }
+}
+function workerSpaceFixTests() {
+  for (const registration of ['matching', 'unrelated', 'missing']) {
+    const f = repairFixture(`spaces-${registration}`);
+    if (registration !== 'missing') {
+      const repo = path.join(f.dir, registration === 'matching' ? 'linked-source' : 'unrelated');
+      if (registration === 'matching') git('-C', f.repo, 'worktree', 'add', '--detach', repo, 'HEAD');
+      else { fs.mkdirSync(repo); git('-C', repo, 'init', '-q'); }
+      assert.equal(f.call(['project', 'add', 'crew', repo]).code, 0);
+    }
+    assert.equal(f.call(['config', 'worker-space', 'per-project']).code, 0);
+    let r = f.call(['fix', '--agent', 'pi', '--model', 'first', 'Repair.']); assert.equal(r.code, 0, r.out);
+    const t = f.task('fix-1'), binding = t.workerSpace;
+    assert.equal(t.project, 'crew:self'); assert.equal(binding.project, registration === 'matching' ? 'crew' : 'crew:self');
+    assert.equal(binding.name, 'crew'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
+    assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
+    r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: '' }); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task(t.id).workerSpace, binding);
+    assert.equal(readWorld().terminals[f.task(t.id).terminal].labels['herdr.space'], binding.id);
+    if (registration === 'matching') {
+      r = f.call(['project', 'remove', 'crew']); assert.equal(r.code, 2, r.out); assert.match(r.out, /unfinished tasks: fix-1/);
+      const other = path.join(f.dir, 'replacement'); fs.mkdirSync(other); git('-C', other, 'init', '-q');
+      r = f.call(['project', 'add', 'crew', other, '--replace']); assert.equal(r.code, 2, r.out); assert.match(r.out, /unfinished tasks: fix-1/);
+      const file = path.join(f.home, 'tasks', t.id, 'task.json');
+      fs.writeFileSync(file, JSON.stringify({ ...f.task(t.id), state: 'closed', copyToReturn: { since: 'now' } }));
+      r = f.call(['project', 'remove', 'crew']); assert.equal(r.code, 2, r.out); assert.match(r.out, /copies of finished tasks.*fix-1/);
+    }
+  }
+}
+gapTests['worker-spaces'] = async () => {
+  await workerSpaceConfigTests(); workerSpacePlacementTests(); workerSpaceInheritanceTests(); workerSpaceFixTests();
+};
 
 gapTests['registry-sharing'] = async () => {
   const f = gapFixture('registry-sharing'), registry = path.join(f.home, 'crew.json'), lock = path.join(f.home, 'projects.lock');

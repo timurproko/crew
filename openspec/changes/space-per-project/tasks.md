@@ -10,11 +10,11 @@ Implementation approved by the coordinator. Groups match the draft PR's Implemen
 
 ## 2. Project spaces are reused and task placement survives reviews, recovery and mode switches
 
-- [ ] 2.1 Save validated version-1 workerSpace bindings at admission and pass them through the common terminal launcher with the published labels; verify exact old combined ID, two-project separation, same-project reuse, lazy creation, dotted names and home/machine isolation in focused worker-space regressions.
-- [ ] 2.2 Inherit parent placement for reviewers and retain task placement across manual relaunch and automatic hand-over; verify both switch directions with live fake workers, new same-project spawns, projects with/without an existing project space, all three inherited launch paths, switch-back reuse and no move/relabel/reorder operations.
-- [ ] 2.3 Resolve legacy records to combined placement without moving or bulk migrating them; verify inherited launches after opt-in and safe refusal for invalid present placement metadata before stopping a worker.
-- [ ] 2.4 Resolve per-project self-fix placement to a verified crew registration or the internal repair namespace, preserving crew:self dispatch; verify matching repository, unrelated registration, missing registration, replacement cases and registration removal/repoint refusal while a fixer references the shared project binding.
-- [ ] 2.5 Publish `docs/worker-spaces.md` with exact label/identity rules, native-versus-Crew ownership, companion multi-child/name-consumer dependencies and downgrade limits; verify it matches emitted fixture labels and README links without changing any Herdr file.
+- [x] 2.1 Save validated version-1 workerSpace bindings at admission and pass them through the common terminal launcher with the published labels; verify exact old combined ID, two-project separation, same-project reuse, lazy creation, dotted names and home/machine isolation in focused worker-space regressions.
+- [x] 2.2 Inherit parent placement for reviewers and retain task placement across manual relaunch and automatic hand-over; verify both switch directions with live fake workers, new same-project spawns, projects with/without an existing project space, all three inherited launch paths, switch-back reuse and no move/relabel/reorder operations.
+- [x] 2.3 Resolve legacy records to combined placement without moving or bulk migrating them; verify inherited launches after opt-in and safe refusal for invalid present placement metadata before stopping a worker.
+- [x] 2.4 Resolve per-project self-fix placement to a verified crew registration or the internal repair namespace, preserving crew:self dispatch; verify matching repository, unrelated registration, missing registration, replacement cases and registration removal/repoint refusal while a fixer references the shared project binding.
+- [x] 2.5 Publish `docs/worker-spaces.md` with exact label/identity rules, native-versus-Crew ownership, companion multi-child/name-consumer dependencies and downgrade limits; verify it matches emitted fixture labels and README links without changing any Herdr file.
 
 ## 3. Finishing tasks preserves foreign terminals, legacy workflows and other occupied spaces
 

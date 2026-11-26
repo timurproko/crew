@@ -168,6 +168,7 @@ nesting under the coordinator and exact project names require the compatible Her
 update (herdr-app PR 88). Until installed, project spaces may not appear connected under the
 coordinator, and headings may still come from working-copy directories. Combined remains
 the default. The setting does not change Herdr's separate connection preference.
+See [worker-space identity, inheritance and companion requirements](docs/worker-spaces.md).
 
 ## Agents
 
