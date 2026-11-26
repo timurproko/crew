@@ -56,6 +56,7 @@ crew init [folder]                       create a crew home (default ~/.crew)
 crew project add <name> <git folder> [--gate-skip <steps>|none] [--workflow delivery|plain]   register a project   (crew project list)
 crew project remove <name>               forget a project with no unfinished tasks
 crew start | crew end                    take or release the home for this session
+crew config worker-space [combined|per-project]   show/change new-task space grouping (default combined)
 crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
     who: [--agent a1|pi|claude] [--model <id>] [--effort <level>] [--account <claude account>] [--rule <n>] [--no-fallback]
 crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   candidates and quota now, next choice marked
@@ -146,6 +147,34 @@ cannot honor this protocol. Lock contention waits up to two seconds and names
 `<crew home>/projects.lock` on refusal. An interrupted transaction can leave that lock behind:
 retry first, and remove it only after confirming that no process is still using it. Crew
 never steals a lock based on its age or a guessed-dead PID. Registry format stays version 1.
+
+## Worker spaces
+
+`crew config worker-space` shows the home's mode. The owning coordinator can set it with
+`crew config worker-space per-project` or `crew config worker-space combined`. It is stored
+as `workerSpaceMode` in the home's `crew.json`; absent means **combined**, today's shared
+worker space. No hand editing or session restart is needed.
+
+A change applies to **new independent task admissions** only. Existing workers never move,
+relabel or reshuffle; reviews, relaunches and automatic hand-overs inherit their task's
+space, even after a mode switch. In per-project mode a new task uses its project's space
+even when older workers for that project remain combined. Switching back sends new tasks
+into combined even if their project already has its own space. During a spawn, placement
+is frozen when its task is reserved: an already-admitted launch can start after a switch
+using its saved mode.
+
+**Herdr dependency:** per-project grouping requests separate automatic spaces, but connected
+nesting under the coordinator and exact project names require the compatible Herdr companion
+update (herdr-app PR 88). Until installed, project spaces may not appear connected under the
+coordinator, and headings may still come from working-copy directories. Combined remains
+the default. The setting does not change Herdr's separate connection preference.
+Crew never deletes a space itself. Finish removes only recorded task-owned terminals;
+Herdr removes an automatic space when its last tab disappears. Another worker or a foreign
+terminal/tab keeps it alive, including under force. End only releases the home, leaving
+occupied spaces and task placement untouched. Same-named personal spaces and spaces on
+other machines are not cleanup targets.
+
+See [worker-space identity, inheritance and companion requirements](docs/worker-spaces.md).
 
 ## Agents
 
