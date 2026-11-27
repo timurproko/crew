@@ -90,3 +90,45 @@ Crew SHALL accept legacy project-ID names and saved directory-derived names with
 
 - **WHEN** a recorded worker's name label differs from its saved placement, or its space ID or project key is invalid
 - **THEN** the evidence does not authorize joining, moving or stopping any worker and admission refuses before allocating a copy or launching a terminal
+
+### Requirement: Workflow detection uses repository signals
+
+Crew SHALL recognize the shared delivery source from its named change-delivery skill or shared delivery caller workflow, not a project name. CLI and plugin-equivalent registration SHALL use the same detection. Spawn SHALL recheck repository signals for existing registrations, honor explicit Plain selection with a one-line advisory when delivery signals are present, and never rewrite registration merely to detect a workflow. Existing task delivery records SHALL remain unchanged.
+
+#### Scenario: Source repository is added without an override
+
+- **WHEN** a folder containing the change-delivery skill is registered under any valid name without a workflow override and delivery is available
+- **THEN** future ship workers receive the plan-first delivery brief even without a shared AGENTS template header
+
+#### Scenario: Existing plain selection gains a delivery signal
+
+- **WHEN** a previously registered project now carries a delivery signal and a ship task is spawned
+- **THEN** automatic selection detects workflow, explicit Plain remains Plain with a concise advisory, and stored registration fields are unchanged
+
+### Requirement: Project kinds are discoverable and authoritative
+
+Crew SHALL expose home-free project-kinds version-one capability JSON from project-scoped and root probes, advertising JSON listing, kind setting, explicit home, expected path and workflow/plain/gate. JSON listing SHALL return canonical home identity and every exact registered name/path with its stored explicit kind or effective legacy selection. Explicit selections SHALL govern future ship tasks; an unavailable selected kind SHALL refuse instead of falling back.
+
+#### Scenario: Desktop discovers and lists
+
+- **WHEN** a desktop probes capabilities and requests project list JSON from an initialized home
+- **THEN** it gets one versioned capability object and an authoritative complete projects array, including an empty array for an empty registry, without Core queries or task mutations
+
+#### Scenario: Selected kind cannot be honored
+
+- **WHEN** an explicit workflow or gate selection lacks its required tool or gate remote
+- **THEN** selection or spawn refuses clearly rather than silently delivering as Plain or another mode
+
+### Requirement: Project kind updates preserve registration identity
+
+Crew SHALL provide a structured kind-only setter requiring an explicit initialized absolute home, an existing project and matching canonical expected path. Under registry serialization it SHALL change only the stored kind, preserving the folder, legacy workflow, gate skips and unknown fields. It SHALL refuse other owners, unknown projects/kinds and unsafe or changed homes/paths without re-registration, takeover or task changes. Successful repeated stored selection SHALL be a no-op.
+
+#### Scenario: Safe kind-only change
+
+- **WHEN** the owner or an unowned-home desktop selects an available kind for an existing matching name/path
+- **THEN** Crew returns canonical home, exact project identity, requested kind and a truthful changed boolean, with only that registration's kind field altered
+
+#### Scenario: Refusal is structured and harmless
+
+- **WHEN** the project was removed or repointed, a different owner controls the home, arguments or kind are invalid, or registry locking fails
+- **THEN** Crew returns nonzero versioned JSON with a stable refusal code and does not initialize, re-register, transfer ownership or mutate tasks

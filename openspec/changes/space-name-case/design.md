@@ -49,8 +49,20 @@ Add a focused name-case group to `crew.test.mjs`, using isolated homes/repositor
 - Copy names can differ from primary folders in plain fallback allocations → use repository provenance for canonical project naming, and document that exact Agents visual agreement depends on repository-named working copies or compatible companion projection.
 - Relaxing saved-name validation could hide corruption → preserve exact ID/project/mode checks, reject unsafe names and require label/saved-name equality; refuse conflicting same-space names before launch side effects.
 
+## Coordinator-approved scope extensions
+
+### Repository-signal workflow detection
+
+Herdr Add project calls the existing `crew project add NAME FOLDER` with no workflow flag. Crew currently stores only explicit overrides and detects delivery in the allocated copy from `delivery instructions` or the AGENTS template header. The workflow source can lack that header while shipping `skills/change-delivery/SKILL.md` and its delivery automation. Add bounded, read-only recognition of the named skill or a shared delivery caller workflow, never a hard-coded project/folder name. Recheck on spawn. A detected auto registration uses workflow; an explicit Plain selection remains Plain but receives a concise advisory. Neither path rewrites the registration. Keep legacy gate precedence, explicit overrides and old task delivery records.
+
+### Project-kinds v1 interface
+
+Implement the contract in the read-only Herdr PR 100 design: project capability probe, JSON listing and `project set-kind NAME --kind KIND --home ABSOLUTE_HOME --expected-path FOLDER --json`. Also expose the same capability at `crew --capabilities --json` as the coordinator requested. Use workflow/plain/gate, canonical home and path identity, strict option parsing and structured failures. Reuse the local worker-space setter's initialized-home validation, atomic registry transaction and no-ambient-crash behavior.
+
+Persist only a new registration `kind` field; keep legacy workflow/gateSkip and every unknown field unchanged. The explicit kind takes precedence over legacy detection. Gate requires its tool and repository remote; workflow requires delivery availability. A selected but unavailable kind refuses at selection/spawn instead of falling back. JSON list returns stored explicit selections or Crew's effective legacy detection. Setter allows an unowned home or the recorded owner's own terminal, and conservatively refuses any different/unknown owner without takeover. Unlike the worker-space preference exception, it does not bypass another coordinator's owner record. Expected path is canonicalized and rechecked under registry serialization. No task/worktree/remote writes occur.
+
 ## Migration Plan
 
-After approval, implement the two outcomes in order and update README and worker-space documentation alongside tests. Run useful targeted fake-Core groups before publication. The coordinator's implementation approval explicitly requests one whole `crew.test.mjs` run locally before pushing, resolving the brief's earlier conflicting test instructions. Run that suite once in the isolated fake-Core fixture environment alongside useful targeted groups.
+After approval, implement the four coordinator-approved outcomes in order and update README and worker-space documentation alongside tests. Run useful targeted fake-Core groups before publication. The coordinator's implementation approval explicitly requests one whole `crew.test.mjs` run locally before pushing, resolving the brief's earlier conflicting test instructions. Run that suite once in the isolated fake-Core fixture environment alongside useful targeted groups.
 
 Publish only this branch through the shared workflow as a draft PR. Rollback for new admissions is the existing combined setting; do not deploy an older binary to directory-cased live tasks unless it can still read their saved placement. No existing homes or spaces are migrated by this task.

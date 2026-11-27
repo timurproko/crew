@@ -841,7 +841,56 @@ function spaceNameCaseTests() {
   assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'bad-label')));
   assert.ok(!readWorld().log.slice(n).some(c => ['kill', 'rm', 'run'].includes(c[0])));
 }
-gapTests['space-name-case'] = spaceNameCaseTests;
+function spaceNameCompatibilityTests() {
+  for (const name of ['myworkflows', 'MyWorkflows']) {
+    const f = joinSpaceFixture(`name-inherit-${name === 'myworkflows' ? 'legacy' : 'directory'}`), repo = path.join(f.dir, 'MyWorkflows');
+    git('clone', '-q', f.repo, repo); f.add('myworkflows', repo); f.mode('per-project');
+    const source = f.spawn('source', 'myworkflows', ['--kind', 'ship']);
+    const manual = f.spawn('manual', 'myworkflows', ['--kind', 'ship']);
+    const auto = f.spawn('auto', 'myworkflows');
+    // Genuine pre-change metadata and matching labels/launch authority, not a
+    // title-only guess. Model an occupied old automatic space without renaming it.
+    for (const t of [source, manual, auto]) {
+      const space = { ...t.workerSpace, name };
+      f.save({ ...t, workerSpace: space, terminalLaunches: t.terminalLaunches.map(intent => ({ ...intent, workerSpace: space })) });
+      setTerminal(t.terminal, { labels: { ...f.labels(t), 'crew.space.name': name } });
+    }
+    const w = readWorld(); w.spaces = { [source.workerSpace.id]: { id: source.workerSpace.id, name, automatic: true, members: [source.terminal, manual.terminal, auto.terminal] } };
+    for (const t of [source, manual, auto]) w.terminals[t.terminal].space = source.workerSpace.id;
+    fs.writeFileSync(world, JSON.stringify(w));
+    f.mode('combined'); const combined = f.spawn('combined', 'myworkflows'); f.mode('per-project');
+    const untouched = structuredClone(readWorld().terminals), n = readWorld().log.length;
+    const joined = f.spawn('joined', 'myworkflows');
+    assert.deepEqual(joined.workerSpace, f.task(source.id).workerSpace, 'Canonical legacy/new title outranks eligible combined');
+    assert.notEqual(joined.workerSpace.id, combined.workerSpace.id);
+    assert.equal(f.labels(joined)['crew.space.name'], name);
+    assert.equal(Object.keys(readWorld().spaces).length, 2, 'No duplicate space');
+    for (const [address, terminal] of Object.entries(untouched)) assert.deepEqual(readWorld().terminals[address], terminal);
+    assert.ok(!readWorld().log.slice(n).some(c => /space|move|label|doc/.test(c[0])), 'Joining does not rename or relabel');
+    f.mode('combined'); f.done(source);
+    let r = f.call(['review', source.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task('source-review').workerSpace, joined.workerSpace);
+    r = f.call(['relaunch', manual.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task(manual.id).workerSpace, joined.workerSpace);
+    const current = f.task(auto.id);
+    f.save({ ...current, chain: [{ harness: 'pi', model: 'second' }], candidates: [{ harness: 'pi', model: 'first' }, { harness: 'pi', model: 'second' }] });
+    setTerminal(current.terminal, { status: { app: 'pi', state: 'idle' }, screen: 'quota exhausted' });
+    r = f.call(['wait', auto.id, '--timeout', '0.2']); assert.equal(r.code, 124, r.out);
+    assert.notEqual(f.task(auto.id).terminal, current.terminal, r.out);
+    assert.deepEqual(f.task(auto.id).workerSpace, joined.workerSpace);
+    for (const id of ['source-review', manual.id, auto.id]) assert.equal(f.labels(f.task(id))['crew.space.name'], name);
+    // Independently valid but contradictory saved names cannot be used to guess
+    // a winner or issue another space request. Labels remain exact per record.
+    const conflict = f.task(joined.id), space = { ...conflict.workerSpace, name: 'Different' };
+    f.save({ ...conflict, workerSpace: space }); setTerminal(conflict.terminal, { labels: { ...f.labels(conflict), 'crew.space.name': space.name } });
+    f.mode('per-project'); const before = readWorld().log.length;
+    r = f.call(['spawn', 'conflict', '--project', 'myworkflows', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 4, r.out); assert.match(r.out, /conflicting saved names/);
+    assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'conflict')));
+    assert.ok(!readWorld().log.slice(before).some(c => ['run', 'kill', 'rm'].includes(c[0])));
+  }
+}
+gapTests['space-name-case'] = () => { spaceNameCaseTests(); spaceNameCompatibilityTests(); };
 
 function workerSpaceInheritanceTests() {
   for (const initial of ['combined', 'per-project']) {

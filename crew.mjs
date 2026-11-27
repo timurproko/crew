@@ -1921,8 +1921,10 @@ function workerSpaceOccupancy(h, tasks, deadline) {
     // Kept shells are live terminals, not live workers. Pi can advertise status.app
     // even on Core versions that do not recognize it in the inventory's agent field.
     if (!entry.agent && !terminal.agent && !terminal.status?.app) continue;
-    if (!projects.has(space.id)) projects.set(space.id, new Set());
-    projects.get(space.id).add(space.project);
+    if (!projects.has(space.id)) projects.set(space.id, { projects: new Set(), space });
+    const occupied = projects.get(space.id);
+    if (space.mode === 'per-project' && occupied.space.name !== space.name) fail(`space ${space.id} has conflicting saved names`);
+    occupied.projects.add(space.project);
   }
   return projects;
 }
@@ -1938,8 +1940,8 @@ function admittedWorkerSpace(h, task, repair, occupancy, name) {
   const canonical = makeWorkerSpace(h, mode, project, name);
   if (mode === 'combined') return canonical;
   if (!occupancy) refuse('worker-space-unavailable: the admission setting changed; retry. Nothing was launched.', 4);
-  const exclusive = id => occupancy.get(id)?.size === 1 && occupancy.get(id).has(project);
-  if (exclusive(canonical.id)) return canonical;
+  const exclusive = id => occupancy.get(id)?.projects.size === 1 && occupancy.get(id).projects.has(project);
+  if (exclusive(canonical.id)) return occupancy.get(canonical.id).space;
   const combined = makeWorkerSpace(h, 'combined', project);
   return exclusive(combined.id) ? combined : canonical;
 }

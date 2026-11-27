@@ -295,11 +295,13 @@ A joining worker gets its own crew.task and herdr.tab, not another worker's iden
 `fm-crew-<home>` saves version 1, mode combined, project P, name null, and launches with
 crew.space.version=1, crew.space.mode=combined, crew.space.project=P and **no crew.space.name**.
 It keeps that space's directory-derived heading; it does not force P as a title. Joining
-`fm-crew-<home>-project-P` saves/labels version 1, mode per-project, project/name P. Both retain
+`fm-crew-<home>-project-P` saves/labels version 1, mode per-project, project P and the
+occupied space's validated saved name (or repository folder name for fresh placement). Both retain
 crew.home, crew.kind, herdr.right-click=menu and herdr.tab=<home>-<new-task>.
 
-This matches herdr-app main's `src/plugins/crew/fleet.js`: placement validates the mode/project/name
-and constructs the expected identity; bindFleet checks the current task's live terminal and exact
+The companion must validate mode/project/ID independently of the saved display name, accepting
+both legacy project-ID names and directory-derived names. Older companions that require name to
+equal project need that compatibility update. Its binding checks still require the live terminal and exact
 native same-machine membership, crew.task/home and herdr.space. Neither title nor project
 resemblance grants child binding. A per-project label tuple inside combined is invalid. Combined
 children normalize their project/name internally so legitimate per-task project labels can differ.
@@ -332,6 +334,13 @@ Task records save internal `workerSpace: {version, mode, id, project, name}` met
 admission. Reviews copy it, replacements validate and retain it before ending their old
 terminal, and concurrent task saves preserve it. Missing metadata means legacy combined
 placement, irrespective of today's setting. No bulk migration or forced move occurs.
+Saved per-project names are safe nonempty basename strings, not recomputed from current
+registration spelling. Exact identity and label matching remain required. Occupied canonical
+joins retain the validated saved name, including old lower-case names; conflicting live saved
+names for one identity refuse admission. Crew does not rename occupied spaces: no atomic native
+rename exists in this command interface, and task/terminal writes would not atomically change
+native space state. A legacy heading can therefore remain lower-case until natural zero-tab
+removal. Reviews and replacements retain either old or new spelling without registry/path probes.
 Invalid present metadata refuses inherited launches before stopping the current worker.
 Placement labels/metadata do **not** prove Crew owns a terminal; only recorded launched
 terminal identities do. Full status already exposes recorded task project; minimal fleet
@@ -363,8 +372,9 @@ installs that update nor enables Herdr's separate connection preference.
 The app must accept legacy combined labels and version-1 project/internal IDs, validate
 home/task identity against exact current terminal and native space membership, and bind
 several same-machine child spaces to the current owner. Mixed shared/project layouts must
-be supported. It must consume per-project name metadata for registered project headings
-rather than pool folder names, preserving explicit user rename precedence. The old
+be supported. It must consume per-project name metadata for repository folder headings
+rather than registered IDs or pool parent names, accepting legacy ID names and directory-cased
+names without coupling display text to identity, and preserving explicit user rename precedence. The old
 single-child `fm-crew-<home tag>` matcher is insufficient. These are companion changes,
 not a new Core API or changes to Herdr in this repository.
 
@@ -458,6 +468,11 @@ exact fleet key and scale guards remain in place. `--gaps=home-discovery-sandbox
 that subprocess fixtures cannot discover a host registry above their temporary root, even
 when temporary output is placed under a real Crew task folder; fixture-local registry
 checks and default-home tests still use the real command implementation.
+
+`--gaps=space-name-case` covers directory spelling, aliases, real linked fixture copies under
+hash-bearing pool parents, dot-prefixed projects, safe-name and exact-label validation, old
+lower-case and directory-cased canonical joins, canonical-over-combined preference, review/
+relaunch/hand-over inheritance and conflicting saved-name refusal. All evidence is fake-Core only.
 
 ## Named limits
 
