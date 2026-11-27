@@ -256,7 +256,22 @@ New launches additionally carry:
 | `crew.space.version` | `1` |
 | `crew.space.mode` | `combined` or `per-project` |
 | `crew.space.project` | Placement project key: exact registered name, or `crew:self` for internal repair fallback. |
-| `crew.space.name` | Per-project only: exact registered name, or `crew` for internal repair fallback. Omitted in combined mode to preserve directory-derived headings. |
+| `crew.space.name` | Per-project only: saved repository folder display name, preserving case and dots, or `crew` for internal repair fallback. Legacy registered-ID names remain valid. Omitted in combined mode to preserve directory-derived headings. |
+
+The display name is separate from project identity. For a fresh canonical placement,
+`myworkflows` registered at `D:/Git/MyWorkflows` requests `MyWorkflows`, while
+`crew.space.project` stays `myworkflows` and the automatic ID still ends in
+`-project-myworkflows`. Registration aliases use the repository folder's basename too.
+Directory spelling comes from the real repository path; a linked checkout resolves its
+shared Git directory back to the repository rather than using a task name, hash-bearing
+pool parent or slot number. `.xrbuild` keeps its leading dot and stays distinct from `xrbuild`.
+
+This follows Herdr's `paneDirectory` / `directoryName` source for Agents headings: the
+resolved directory's last segment, without lowercasing or removing punctuation. Repository-named
+pool leaves therefore agree with the requested title. A plain task-named copy, agent navigation
+to another directory, or an explicit user rename can produce a different Agents heading;
+Crew does not override Herdr's directory resolver or explicit names. Native agreement still
+requires a companion that accepts directory-cased names independently of project IDs.
 
 ### Occupancy-aware joins
 

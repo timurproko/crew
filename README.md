@@ -216,6 +216,13 @@ terminal/tab keeps it alive, including under force. End only releases the home, 
 occupied spaces and task placement untouched. Same-named personal spaces and spaces on
 other machines are not cleanup targets.
 
+New per-project space titles use the repository folder's real spelling, not the command ID:
+`myworkflows` registered at `D:/Git/MyWorkflows` requests `MyWorkflows`; `.xrbuild` keeps its
+dot. Linked copies resolve the repository folder, never a pool's hash-bearing parent or slot
+number. Project IDs in commands, task records and automatic space IDs stay unchanged. Combined
+still omits a requested title. Existing occupied spaces retain their saved title when joined
+or inherited; Crew does not rename them.
+
 See [worker-space identity, inheritance and companion requirements](docs/worker-spaces.md).
 
 ## Agents

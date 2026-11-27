@@ -2,9 +2,9 @@
 
 ## 1. New project spaces preserve repository folder spelling without changing project identity
 
-- [ ] 1.1 Separate canonical placement identity from directory-derived display-name construction and saved-name validation; add fake-Core assertions for `myworkflows` mapped to `MyWorkflows`, registry aliases, dot-prefixed folders and hash-parent pool copies with unchanged command/project/space IDs.
-- [ ] 1.2 Preserve legacy saved-name acceptance while validating ID/project/mode and safe title strings; cover malformed metadata and exact terminal-label checks in the focused `node crew.test.mjs --gaps=space-name-case` group.
-- [ ] 1.3 Update README and the label/identity table in `docs/worker-spaces.md` to distinguish project IDs from display names; ensure the examples and focused fixture expectations agree with the new contract.
+- [x] 1.1 Separate canonical placement identity from directory-derived display-name construction and saved-name validation; add fake-Core assertions for `myworkflows` mapped to `MyWorkflows`, registry aliases, dot-prefixed folders and hash-parent pool copies with unchanged command/project/space IDs.
+- [x] 1.2 Preserve legacy saved-name acceptance while validating ID/project/mode and safe title strings; cover malformed metadata and exact terminal-label checks in the focused `node crew.test.mjs --gaps=space-name-case` group.
+- [x] 1.3 Update README and the label/identity table in `docs/worker-spaces.md` to distinguish project IDs from display names; ensure the examples and focused fixture expectations agree with the new contract.
 
 ## 2. Existing project spaces retain their saved names through joins and inherited launches
 
@@ -16,5 +16,5 @@
 ## Workflow follow-up
 
 - Implementation begins only after this draft plan is approved. Tick each corresponding PR outcome after its code, tests and documentation land.
-- Use targeted local fake-Core tests and let whole-suite CI run through the repository workflow, following the brief's later targeted-only rule.
+- The coordinator approved implementation and explicitly requested one whole `crew.test.mjs` run locally before pushing; run that once alongside useful targeted fake-Core groups.
 - Publish the final implementation head and confirm CI was triggered without waiting for checks or the delivery bot; never mark ready or merge.

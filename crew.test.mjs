@@ -770,10 +770,10 @@ function workerSpacePlacementTests() {
   const n = readWorld().log.length; f.mode('per-project');
   const fresh = f.spawn('new-a'), other = f.spawn('new-b', 'other'), again = f.spawn('again');
   assert.equal(f.space(fresh), `${combined}-project-demo`); assert.notEqual(f.space(fresh), f.space(other));
-  assert.equal(f.space(again), f.space(fresh)); assert.equal(f.labels(fresh)['crew.space.name'], 'demo');
+  assert.equal(f.space(again), f.space(fresh)); assert.equal(f.labels(fresh)['crew.space.name'], 'repo');
   for (const project of ['.xrbuild', 'agentnumberone.dev']) {
     const t = f.spawn(project.startsWith('.') ? 'dot' : 'domain', project);
-    assert.equal(f.space(t), `${combined}-project-${project}`); assert.equal(f.labels(t)['crew.space.name'], project);
+    assert.equal(f.space(t), `${combined}-project-${project}`); assert.equal(f.labels(t)['crew.space.name'], 'repo', 'Aliases use their repository folder, not the project key');
     assert.equal(f.labels(t)['crew.home'], tag); assert.equal(f.labels(t)['crew.space.project'], project);
   }
   assert.deepEqual(readWorld().terminals[a.terminal], old);
@@ -790,8 +790,59 @@ function workerSpacePlacementTests() {
   fs.mkdirSync(pooled); fs.writeFileSync(delivery, `console.log(JSON.stringify({path:${JSON.stringify(pooled)},created:true,pooled:true}));`);
   const r = f.call(['spawn', 'pool-dot', '--project', '.xrbuild', '--agent', 'pi', 'Count.'], { CREW_TOOL_DELIVERY: delivery });
   assert.equal(r.code, 0, r.out); assert.equal(f.task('pool-dot').worktree, slash(pooled));
-  assert.equal(f.labels(f.task('pool-dot'))['crew.space.name'], '.xrbuild');
+  assert.equal(f.labels(f.task('pool-dot'))['crew.space.name'], 'repo');
 }
+function spaceNameCaseTests() {
+  const f = joinSpaceFixture('name-case');
+  const makeRepo = name => {
+    const repo = path.join(f.dir, name); git('clone', '-q', f.repo, repo); return repo;
+  };
+  const mixed = makeRepo('MyWorkflows'), dot = makeRepo('.xrbuild'), plain = makeRepo('XRBuild');
+  f.add('myworkflows', mixed); f.add('alias', WINDOWS ? mixed.toLowerCase() : mixed);
+  f.add('.xrbuild', dot); f.add('xrbuild', plain);
+  f.mode('per-project');
+  const w = readWorld(); w.spaces = {}; fs.writeFileSync(world, JSON.stringify(w));
+  for (const [id, project, name] of [['mixed', 'myworkflows', 'MyWorkflows'], ['alias', 'alias', 'MyWorkflows'], ['dot', '.xrbuild', '.xrbuild'], ['plain', 'xrbuild', 'XRBuild']]) {
+    const t = f.spawn(id, project), labels = f.labels(t);
+    assert.equal(t.project, project); assert.equal(t.workerSpace.project, project);
+    assert.equal(t.workerSpace.name, name); assert.equal(labels['crew.space.name'], name);
+    assert.ok(labels['herdr.space'].endsWith(`-project-${project}`));
+    assert.equal(labels['crew.space.project'], project);
+    assert.equal(readWorld().spaces[t.workerSpace.id].name, name);
+  }
+  // Real linked fixture copies: basename from repository provenance, never the
+  // hashed parent, a slot number, or an arbitrary linked-checkout task name.
+  for (const [project, repo, leaf] of [['myworkflows', mixed, 'MyWorkflows'], ['.xrbuild', dot, '.xrbuild']]) {
+    const pooled = path.join(f.dir, '.treehouse', `${leaf}-a1b2c3`, '2', leaf);
+    git('-C', repo, 'worktree', 'add', '--detach', pooled, 'HEAD');
+    const delivery = path.join(f.dir, `delivery-${project}.mjs`);
+    fs.writeFileSync(delivery, `console.log(JSON.stringify({path:${JSON.stringify(pooled)},created:true,pooled:true}));`);
+    const r = f.call(['spawn', `pool-${project.replace(/^\./, '')}`, '--project', project, '--agent', 'pi', 'Count.'], { CREW_TOOL_DELIVERY: delivery });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(f.task(`pool-${project.replace(/^\./, '')}`).worktree, slash(pooled));
+    assert.equal(f.labels(f.task(`pool-${project.replace(/^\./, '')}`))['crew.space.name'], leaf);
+    const linked = path.join(f.dir, `${project}-linked-task`);
+    git('-C', repo, 'worktree', 'add', '--detach', linked, 'HEAD');
+    f.add(`linked-${project.replace(/^\./, '')}`, linked);
+    assert.equal(f.spawn(`linked-${project.replace(/^\./, '')}`, `linked-${project.replace(/^\./, '')}`).workerSpace.name, leaf);
+  }
+  const bad = f.spawn('bad-name', 'myworkflows', ['--kind', 'ship']);
+  for (const name of [null, '', ' ', 1, '.', '..', 'wrong/name', 'wrong\\name', 'wrong\nname', 'x'.repeat(4097)]) {
+    f.save({ ...bad, workerSpace: { ...bad.workerSpace, name } }); const n = readWorld().log.length;
+    const r = f.call(['relaunch', bad.id, '--agent', 'pi', '--model', 'second']);
+    assert.equal(r.code, 2, r.out); assert.match(r.out, /invalid workerSpace/);
+    assert.ok(!readWorld().log.slice(n).some(c => ['kill', 'rm', 'run'].includes(c[0])));
+  }
+  f.save(bad);
+  const before = structuredClone(readWorld().terminals[bad.terminal]);
+  setTerminal(bad.terminal, { labels: { ...before.labels, 'crew.space.name': 'myworkflows' } });
+  const n = readWorld().log.length, refused = f.call(['spawn', 'bad-label', '--project', 'myworkflows', '--agent', 'pi', 'Count.']);
+  assert.equal(refused.code, 4, refused.out); assert.match(refused.out, /placement-v1 labels/);
+  assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'bad-label')));
+  assert.ok(!readWorld().log.slice(n).some(c => ['kill', 'rm', 'run'].includes(c[0])));
+}
+gapTests['space-name-case'] = spaceNameCaseTests;
+
 function workerSpaceInheritanceTests() {
   for (const initial of ['combined', 'per-project']) {
     const f = workerSpaceFixture(`inherit-${initial}`); f.mode(initial);
@@ -820,7 +871,7 @@ function workerSpaceInheritanceTests() {
   r = f.call(['tell', 'legacy', 'Continue.']); assert.equal(r.code, 0, r.out);
   r = f.call(['relaunch', 'legacy', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
   assert.equal(f.space(t), workerSpace.id); assert.deepEqual(f.task('legacy').workerSpace, workerSpace);
-  for (const invalid of [null, { ...bad.workerSpace, version: 2 }, { ...bad.workerSpace, id: 'personal' }, { ...bad.workerSpace, project: 'other' }, { ...bad.workerSpace, name: 'wrong' }]) {
+  for (const invalid of [null, { ...bad.workerSpace, version: 2 }, { ...bad.workerSpace, id: 'personal' }, { ...bad.workerSpace, project: 'other' }, { ...bad.workerSpace, name: '../wrong' }]) {
     f.save({ ...bad, workerSpace: invalid }); const n = readWorld().log.length;
     r = f.call(['relaunch', 'bad', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 2, r.out);
     f.save({ ...bad, state: 'reported', workerSpace: invalid });
@@ -845,7 +896,7 @@ function workerSpaceFixTests() {
     const fleet = JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.find(task => task.id === t.id);
     assert.equal(fleet.project, full.project); assert.equal(fleet.project, 'crew:self');
     assert.equal(readWorld().terminals[t.terminal].labels['crew.space.project'], binding.project, 'Fleet task identity never rewrites the repair placement alias');
-    assert.equal(binding.name, 'crew'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
+    assert.equal(binding.name, registration === 'matching' ? 'core' : 'crew'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
     assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
     r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: '' }); assert.equal(r.code, 0, r.out);
     assert.deepEqual(f.task(t.id).workerSpace, binding);
@@ -991,12 +1042,12 @@ function joinProjectSpaceTests() {
   f.mode('combined'); const mixed = f.spawn('mixed', 'other'); f.mode('per-project');
   const canonical = f.spawn('canonical'); assert.equal(f.space(canonical), project);
   assert.equal(f.space(f.spawn('canonical-again')), project);
-  assert.deepEqual(canonical.workerSpace, { version: 1, mode: 'per-project', id: project, project: 'demo', name: 'demo' });
+  assert.deepEqual(canonical.workerSpace, { version: 1, mode: 'per-project', id: project, project: 'demo', name: 'repo' });
   // Once both spaces are eligible, prefer occupied canonical rather than proliferating identities.
   f.save({ ...mixed, state: 'reported' });
   assert.equal(f.space(f.spawn('prefer-canonical')), project);
   const dot = f.spawn('dot', '.xrbuild'); assert.equal(f.space(dot), `${combined}-project-.xrbuild`);
-  assert.equal(f.labels(dot)['crew.space.name'], '.xrbuild');
+  assert.equal(f.labels(dot)['crew.space.name'], 'repo');
   // History and shells cannot make empty combined reusable, or pollute live P exclusivity.
   for (const state of ['reported', 'closed', 'stopped', 'failed', 'ended', 'shell']) {
     const g = joinSpaceFixture(`join-${state}`), t = g.spawn('former');

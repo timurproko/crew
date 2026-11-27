@@ -51,6 +51,6 @@ Add a focused name-case group to `crew.test.mjs`, using isolated homes/repositor
 
 ## Migration Plan
 
-After approval, implement the two outcomes in order and update README and worker-space documentation alongside tests. Run useful targeted fake-Core groups before publication. The brief's final Rules prohibit a full local suite despite its opening sentence requesting one; follow the later targeted-only rule and leave whole-suite CI to the repository workflow. No local implementation test runs are needed for this plan-only handoff.
+After approval, implement the two outcomes in order and update README and worker-space documentation alongside tests. Run useful targeted fake-Core groups before publication. The coordinator's implementation approval explicitly requests one whole `crew.test.mjs` run locally before pushing, resolving the brief's earlier conflicting test instructions. Run that suite once in the isolated fake-Core fixture environment alongside useful targeted groups.
 
 Publish only this branch through the shared workflow as a draft PR. Rollback for new admissions is the existing combined setting; do not deploy an older binary to directory-cased live tasks unless it can still read their saved placement. No existing homes or spaces are migrated by this task.

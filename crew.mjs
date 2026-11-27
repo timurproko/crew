@@ -1827,9 +1827,27 @@ function resolveWorkerSpace(h, task) {
       || (space.project !== SELF_PROJECT && projectNameError(space.project))) {
     refuse(`Task ${task.id} has invalid workerSpace placement; nothing was moved or stopped.`);
   }
-  const expected = makeWorkerSpace(h, space.mode, space.project);
-  if (space.id !== expected.id || space.name !== expected.name) refuse(`Task ${task.id} has invalid workerSpace identity; nothing was moved or stopped.`);
+  const expected = makeWorkerSpace(h, space.mode, space.project, space.name);
+  if (space.id !== expected.id || (space.mode === 'combined' ? space.name !== null : !validSpaceName(space.name))) {
+    refuse(`Task ${task.id} has invalid workerSpace identity; nothing was moved or stopped.`);
+  }
   return expected;
+}
+const validSpaceName = name => typeof name === 'string' && name.length <= 4096 && name.trim().length > 0
+  && !['.', '..'].includes(name) && !/[\x00-\x1f\x7f/\\]/.test(name);
+function repositorySpaceName(folder) {
+  // The same source as Herdr's directoryName: the repository folder's basename,
+  // with its real spelling. A linked copy's common .git points back to that folder;
+  // never derive a title from a pool's hash-bearing parent or a numeric slot.
+  const r = run('git', ['-C', folder, 'rev-parse', '--path-format=absolute', '--git-common-dir', '--show-toplevel'], { timeout: 2000 });
+  const [common, top] = r.stdout.trim().split(/\r?\n/);
+  let name;
+  try {
+    const root = path.basename(common) === '.git' ? path.dirname(common) : top;
+    name = path.basename(fs.realpathSync.native(root));
+  } catch { /* fail closed below, before allocating a copy */ }
+  if (r.code !== 0 || !validSpaceName(name)) refuse('worker-space-unavailable: cannot resolve the repository folder name; retry. Nothing was launched.', 4);
+  return name;
 }
 function repositoryIdentity(folder) {
   const r = run('git', ['-C', folder, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { timeout: 2000 });
@@ -1908,7 +1926,7 @@ function workerSpaceOccupancy(h, tasks, deadline) {
   }
   return projects;
 }
-function admittedWorkerSpace(h, task, repair, occupancy) {
+function admittedWorkerSpace(h, task, repair, occupancy, name) {
   if (Object.hasOwn(task, 'workerSpace')) return resolveWorkerSpace(h, task);
   const mode = h.config.workerSpaceMode ?? 'combined';
   if (task.selfFix && mode === 'per-project') {
@@ -1917,7 +1935,7 @@ function admittedWorkerSpace(h, task, repair, occupancy) {
     if ((registeredProject(h, 'crew')?.path ?? null) !== repair.path) refuse('The crew registration changed during repair admission; retry. No task or terminal was created.');
   }
   const project = task.selfFix && mode === 'per-project' ? repair.project : task.project;
-  const canonical = makeWorkerSpace(h, mode, project);
+  const canonical = makeWorkerSpace(h, mode, project, name);
   if (mode === 'combined') return canonical;
   if (!occupancy) refuse('worker-space-unavailable: the admission setting changed; retry. Nothing was launched.', 4);
   const exclusive = id => occupancy.get(id)?.size === 1 && occupancy.get(id).has(project);
@@ -1925,10 +1943,10 @@ function admittedWorkerSpace(h, task, repair, occupancy) {
   const combined = makeWorkerSpace(h, 'combined', project);
   return exclusive(combined.id) ? combined : canonical;
 }
-function makeWorkerSpace(h, mode, project) {
+function makeWorkerSpace(h, mode, project, name = project === SELF_PROJECT ? 'crew' : project) {
   const base = `fm-crew-${h.config.tag}`;
   return { version: 1, mode, id: mode === 'combined' ? base : project === SELF_PROJECT ? `${base}-self` : `${base}-project-${project}`,
-    project, name: mode === 'combined' ? null : project === SELF_PROJECT ? 'crew' : project };
+    project, name: mode === 'combined' ? null : name };
 }
 
 // Creates the task, its working copy and its terminal. `extra` is kept on the task record.
@@ -1971,13 +1989,23 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
       pending = preparations.length > 0;
       if (pending) return false; // release the gate so this launch can publish
       const occupancy = tasks ? workerSpaceOccupancy(h, tasks, deadline) : null;
+      // Resolve outside projects.lock, then recheck the exact registration at
+      // reservation. Inherited names never depend on the current registry/path.
+      const namingProject = independent && h.config.workerSpaceMode === 'per-project'
+        ? extra.selfFix ? repairPlacement.project : opts.project : null;
+      const namingPath = namingProject && namingProject !== SELF_PROJECT ? registeredProject(h, namingProject)?.path : null;
+      const name = namingPath ? repositorySpaceName(namingPath) : 'crew';
       return withRegistry(h, () => {
         // Only registry writers can race us: every task writer and terminal
         // transition needs the placement gate we still hold. No lock snapshots.
         if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
         if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
         if (independent && h.config.workerSpaceMode === 'per-project' && !tasks) return false;
-        record.workerSpace = admittedWorkerSpace(h, record, repairPlacement, occupancy);
+        if (namingProject && namingProject !== SELF_PROJECT && registeredProject(h, namingProject)?.path !== namingPath) {
+          refuse(extra.selfFix ? 'The crew registration changed during repair admission; retry. No task or terminal was created.'
+            : 'The project registration changed during space-name resolution; retry. No task or terminal was created.');
+        }
+        record.workerSpace = admittedWorkerSpace(h, record, repairPlacement, occupancy, name);
         fs.mkdirSync(dir, { recursive: true });
         saveTask(h, record); // reservation and decision share the same gate
         return true;
