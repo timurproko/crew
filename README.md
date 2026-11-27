@@ -152,6 +152,24 @@ Live, unknown and legacy claims remain protected: retry first, and inspect an in
 transaction before any manual recovery. Crew never steals a lock based on age or a guessed-dead
 PID. Registry format stays version 1.
 
+### Machine-readable project kinds
+
+`crew project --capabilities --json` (also `crew --capabilities --json`) advertises
+`project-kinds` v1 without opening a home. `crew project list --json` returns the canonical
+home and each project's authoritative `workflow`, `plain` or `gate` selection; clients must
+not infer Plain from a missing legacy override.
+
+```text
+crew project set-kind myworkflows --kind workflow --home C:/Users/me/.crew --expected-path D:/Git/MyWorkflows --json
+```
+
+This changes only an existing registration's `kind` field, preserving its folder, gate skips,
+legacy overrides and unknown metadata. Expected-path and owner checks refuse stale targets or
+another recorded coordinator; it never re-registers, takes over or changes existing tasks.
+Unowned homes are supported. The explicit kind wins over legacy detection; missing required
+tools/remote refuse rather than silently falling back. This is not the worker-space setter's
+ownership exception. See [JSON contract, refusals and availability](docs/project-kinds.md).
+
 ## Worker spaces
 
 `crew config worker-space` shows the home's mode. The owning coordinator can set it with
@@ -215,6 +233,13 @@ Herdr removes an automatic space when its last tab disappears. Another worker or
 terminal/tab keeps it alive, including under force. End only releases the home, leaving
 occupied spaces and task placement untouched. Same-named personal spaces and spaces on
 other machines are not cleanup targets.
+
+New per-project space titles use the repository folder's real spelling, not the command ID:
+`myworkflows` registered at `D:/Git/MyWorkflows` requests `MyWorkflows`; `.xrbuild` keeps its
+dot. Linked copies resolve the repository folder, never a pool's hash-bearing parent or slot
+number. Project IDs in commands, task records and automatic space IDs stay unchanged. Combined
+still omits a requested title. Existing occupied spaces retain their saved title when joined
+or inherited; Crew does not rename them.
 
 See [worker-space identity, inheritance and companion requirements](docs/worker-spaces.md).
 
@@ -438,14 +463,22 @@ use the global dispatch policy rather than guessing another account.
 
 How a ship task is delivered depends on the project. There are three kinds, and the kind is
 decided once, at spawn, and recorded on the task so the worker's brief, `crew land` and
-`crew status --json` agree (`deliveryKind`: `gate`, `workflow` or `plain`; `null` for non-ships):
+`crew status --json` agree (`deliveryKind`: `gate`, `workflow` or `plain`; `null` for non-ships).
+An explicit project `kind` set through the JSON API takes precedence and refuses if unavailable;
+the following precedence describes legacy registrations without that selection:
 
 - **Shared delivery workflow.** The repository follows the `change-delivery` skill. A project
   counts as one when it was added with `--workflow delivery`, or, without that choice, when
   `delivery` is installed and the worker's copy carries the shared instructions (`delivery
   instructions` reports a match, or `AGENTS.md` has the template's header line, which also
-  covers a repository on an older template). `--workflow plain` turns that off, not a selected
-  gate. Re-adding a project replaces its registration: omitted `--workflow` and `--gate-skip`
+  covers a repository on an older template), or contains the named
+  `skills/change-delivery/SKILL.md` skill or a shared delivery caller workflow under
+  `.github/workflows/`. This includes the workflow's own source repository, under any
+  registered name. Herdr Add project calls the same CLI add without a workflow flag;
+  automatic detection is rechecked in the allocated copy on spawn, not frozen at add. `--workflow plain` turns that off, not a selected
+  gate for legacy registrations. When a new repository signal appears, spawn prints one concise detection line;
+  an explicit Plain choice remains Plain with an advisory. Detection never rewrites the
+  registration or an older task's delivery records. Re-adding a project replaces its registration: omitted `--workflow` and `--gate-skip`
   choices are dropped, so repeat options you want to keep. The worker is
   told to follow the skill. A change that needs a plan is planned first as a draft pull request,
   then the worker stops and reports. Every report starts with `Plan: <link>` or

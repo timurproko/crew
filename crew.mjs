@@ -210,6 +210,9 @@ function validateRegistry(dir, config) {
       || Object.values(config.projects).some(p => !p || typeof p.path !== 'string' || !p.path)) {
     refuse(`Crew home ${slash(dir)} has an invalid version 1 registry (crew.json); nothing was changed.`);
   }
+  if (Object.values(config.projects).some(p => Object.hasOwn(p, 'kind') && !PROJECT_KINDS.includes(p.kind))) {
+    refuse(`Crew home ${slash(dir)} has an invalid project kind; nothing was changed.`);
+  }
   if (Object.hasOwn(config, 'workerSpaceMode') && !WORKER_SPACE_MODES.includes(config.workerSpaceMode)) {
     refuse(`Crew home ${slash(dir)}: workerSpaceMode must be combined or per-project; nothing was changed.`);
   }
@@ -1009,6 +1012,9 @@ function createHome(dir) {
 }
 
 function cmdProject(args) {
+  if (args[0] === 'set-kind' || args.some(a => ['--capabilities', '--json', '--home', '--expected-path'].includes(a))) {
+    cmdProjectKinds(args); return;
+  }
   const h = home();
   const [verb, name, source] = args;
   if (verb === 'list' || !verb) {
@@ -1053,6 +1059,7 @@ function cmdProject(args) {
     writeJson(path.join(h.dir, 'crew.json'), h.config);
   });
   console.log(`project ${name}: ${slash(folder)}${gateSkip ? ` (gate skips: ${gateSkip.join(', ') || 'nothing'})` : ''}${workflow ? ` (workflow: ${workflow})` : ''}`);
+  if (!workflow && workflowRepositorySignal(folder)) console.log(`project ${name}: repository delivery signal detected; future ship tasks use delivery when available (registration unchanged).`);
 }
 
 // A project follows the shared delivery workflow (the `change-delivery` skill) when it was
@@ -1060,10 +1067,118 @@ function cmdProject(args) {
 // shared instructions. `delivery instructions` is strict (an older template or one stray
 // instruction file fails it), so the template's own header line in AGENTS.md also counts.
 const WORKFLOWS = ['delivery', 'plain'];
+const PROJECT_KINDS = ['workflow', 'plain', 'gate'];
+const PROJECT_KINDS_API = { capability: 'project-kinds', version: 1 };
+function gateAvailable(folder) {
+  return Boolean(toolPath('no-mistakes')) && run('git', ['-C', folder, 'remote', 'get-url', 'no-mistakes'], { timeout: 2000 }).code === 0;
+}
+function projectKind(project, folder = project.path) {
+  return project.kind ?? (gateAvailable(folder) ? 'gate' : followsWorkflow(project, folder) ? 'workflow' : 'plain');
+}
+function projectKindAvailable(kind, folder) {
+  return kind === 'plain' || (kind === 'workflow' ? Boolean(toolPath('delivery')) : gateAvailable(folder));
+}
+function requireProjectKindOwner(h) {
+  // No takeover or guessed liveness. Even a stale/unknown different owner must
+  // release the home normally; this is NOT worker-space's local preference exception.
+  let owner;
+  try {
+    const file = path.join(h.dir, 'owner.json'), stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('unsafe owner');
+    owner = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    localSettingRefuse('home-owned', 'The Crew home owner cannot be verified.', 3);
+  }
+  if (typeof owner?.terminal !== 'string' || !owner.terminal || owner.terminal !== me()) {
+    localSettingRefuse('home-owned', 'Another session owns this Crew home.', 3);
+  }
+}
+function cmdProjectKinds(args) {
+  let h;
+  try {
+    if (args.length === 2 && args.includes('--capabilities') && args.includes('--json')) {
+      console.log(JSON.stringify({ ...PROJECT_KINDS_API, listJson: true, setKind: true, explicitHome: true, expectedPath: true, kinds: PROJECT_KINDS })); return;
+    }
+    const verb = args[0], setting = verb === 'set-kind', name = setting ? args[1] : null;
+    if (!['list', 'set-kind'].includes(verb) || (setting && projectNameError(name))) {
+      localSettingRefuse('invalid-arguments', 'Use project --capabilities --json, project list --json, or project set-kind NAME --kind KIND --home ABSOLUTE_HOME --expected-path FOLDER --json.');
+    }
+    const options = new Map(), allowed = setting ? ['--kind', '--home', '--expected-path', '--json'] : ['--home', '--json'];
+    for (let i = setting ? 2 : 1; i < args.length; i++) {
+      const key = args[i];
+      if (!allowed.includes(key) || options.has(key)) localSettingRefuse('invalid-arguments', 'Unknown or repeated project-kind option.');
+      const value = key === '--json' ? true : args[++i];
+      if (!value || (value !== true && value.startsWith('--'))) localSettingRefuse('invalid-arguments', `Missing value for ${key}.`);
+      options.set(key, value);
+    }
+    if (!options.has('--json') || (setting && options.size !== 4)) localSettingRefuse('invalid-arguments', 'Kind changes require --kind, --home, --expected-path and --json.');
+    const kind = options.get('--kind');
+    if (setting && !PROJECT_KINDS.includes(kind)) localSettingRefuse('kind-unavailable', 'Kind must be workflow, plain or gate.');
+    const target = options.get('--home') ?? findHome();
+    if (!target) localSettingRefuse('home-missing', 'No initialized Crew home was found.');
+    h = localWorkerSpaceHome(target);
+    if (!setting) {
+      const projects = Object.entries(h.config.projects).map(([name, project]) => {
+        if (projectNameError(name) || !path.isAbsolute(project.path)) localSettingRefuse('invalid-registry', 'The project registry contains an invalid name or path.');
+        return { name, path: project.path, kind: projectKind(project) };
+      });
+      console.log(JSON.stringify({ ...PROJECT_KINDS_API, ok: true, home: slash(h.dir), projects })); return;
+    }
+    requireProjectKindOwner(h);
+    const registered = registeredProject(h, name);
+    if (!registered) localSettingRefuse('project-missing', 'The project is not registered.');
+    const expected = options.get('--expected-path');
+    const pathMatches = project => {
+      if (!project || !path.isAbsolute(expected) || !path.isAbsolute(project.path)) return false;
+      try {
+        const actual = fs.realpathSync.native(project.path), wanted = fs.realpathSync.native(expected);
+        return fs.statSync(actual).isDirectory() && fs.statSync(wanted).isDirectory()
+          && comparablePath(actual) === comparablePath(wanted);
+      } catch { return false; }
+    };
+    if (!pathMatches(registered)) localSettingRefuse('project-changed', 'The project folder changed; refresh before trying again.');
+    if (!projectKindAvailable(kind, registered.path)) localSettingRefuse('kind-unavailable', 'The selected kind requires an available delivery tool or gate tool and remote.');
+    const changed = withRegistry(h, () => {
+      requireProjectKindOwner(h);
+      const current = registeredProject(h, name);
+      if (!current) localSettingRefuse('project-missing', 'The project is not registered.');
+      if (!pathMatches(current) || current.path !== registered.path) localSettingRefuse('project-changed', 'The project folder changed; refresh before trying again.');
+      if (current.kind === kind) return false;
+      h.config.projects[name] = { ...current, kind };
+      writeJson(path.join(h.dir, 'crew.json'), h.config, { exclusive: true });
+      return true;
+    }, {
+      read: () => localWorkerSpaceHome(h.dir, h.identity).config,
+      lockError: (error, busy) => localSettingRefuse(busy ? 'registry-busy' : 'internal-error', busy ? 'The project registry is busy; retry without removing its lock.' : 'Cannot lock the project registry.', busy ? 3 : 4),
+    });
+    console.log(JSON.stringify({ ...PROJECT_KINDS_API, ok: true, home: slash(h.dir), project: { name, path: registered.path, kind }, changed }));
+  } catch (error) {
+    const reason = error instanceof LocalSettingRefusal ? ({ 'home-not-found': 'home-missing', 'home-not-initialized': 'home-missing', 'invalid-home': 'invalid-arguments' }[error.reason] ?? error.reason) : 'internal-error';
+    process.exitCode = error instanceof LocalSettingRefusal ? error.exitCode : 70;
+    console.log(JSON.stringify({ ...PROJECT_KINDS_API, ok: false, home: h ? slash(h.dir) : null,
+      error: { code: reason, message: error instanceof LocalSettingRefusal ? error.message : 'Could not safely read or update project kinds.' } }));
+  }
+}
 const WORKFLOW_HEADER = '`templates/AGENTS.md` of';
+function workflowRepositorySignal(folder) {
+  // Read repository data only. Recognize the workflow's own named skill as well
+  // as adopters' callers; neither the project ID nor its folder name is a signal.
+  const text = file => {
+    try { return fs.statSync(file).size <= 131072 ? fs.readFileSync(file, 'utf8') : ''; } catch { return ''; }
+  };
+  const skill = text(path.join(folder, 'skills', 'change-delivery', 'SKILL.md'));
+  if (/^---\r?\n[\s\S]*?^name:\s*['"]?change-delivery['"]?\s*$/m.test(skill)) return true;
+  const dir = path.join(folder, '.github', 'workflows');
+  let files; try { files = fs.readdirSync(dir); } catch { return false; }
+  return files.filter(file => /\.ya?ml$/i.test(file)).slice(0, 100).some(file =>
+    /^\s*uses:\s*['"]?(?:timurproko\/MyWorkflows\/\.github\/workflows\/delivery\.ya?ml@[^\s'"]+|\.\/\.github\/workflows\/delivery\.ya?ml)['"]?\s*(?:#.*)?$/im.test(text(path.join(dir, file))));
+}
 function followsWorkflow(project, worktree) {
+  if (project.kind) return project.kind === 'workflow';
   if (project.workflow) return project.workflow === 'delivery';
   if (!toolPath('delivery')) return false;
+  if (workflowRepositorySignal(worktree)) return true;
   const said = runTool('delivery', ['instructions'], { cwd: worktree, timeout: 60000 });
   if (said?.code === 0 && /match the shared template/.test(said.stdout)) return true;
   try { return fs.readFileSync(path.join(worktree, 'AGENTS.md'), 'utf8').includes(WORKFLOW_HEADER); } catch { return false; }
@@ -1827,9 +1942,27 @@ function resolveWorkerSpace(h, task) {
       || (space.project !== SELF_PROJECT && projectNameError(space.project))) {
     refuse(`Task ${task.id} has invalid workerSpace placement; nothing was moved or stopped.`);
   }
-  const expected = makeWorkerSpace(h, space.mode, space.project);
-  if (space.id !== expected.id || space.name !== expected.name) refuse(`Task ${task.id} has invalid workerSpace identity; nothing was moved or stopped.`);
+  const expected = makeWorkerSpace(h, space.mode, space.project, space.name);
+  if (space.id !== expected.id || (space.mode === 'combined' ? space.name !== null : !validSpaceName(space.name))) {
+    refuse(`Task ${task.id} has invalid workerSpace identity; nothing was moved or stopped.`);
+  }
   return expected;
+}
+const validSpaceName = name => typeof name === 'string' && name.length <= 4096 && name.trim().length > 0
+  && !['.', '..'].includes(name) && !/[\x00-\x1f\x7f/\\]/.test(name);
+function repositorySpaceName(folder) {
+  // The same source as Herdr's directoryName: the repository folder's basename,
+  // with its real spelling. A linked copy's common .git points back to that folder;
+  // never derive a title from a pool's hash-bearing parent or a numeric slot.
+  const r = run('git', ['-C', folder, 'rev-parse', '--path-format=absolute', '--git-common-dir', '--show-toplevel'], { timeout: 2000 });
+  const [common, top] = r.stdout.trim().split(/\r?\n/);
+  let name;
+  try {
+    const root = path.basename(common) === '.git' ? path.dirname(common) : top;
+    name = path.basename(fs.realpathSync.native(root));
+  } catch { /* fail closed below, before allocating a copy */ }
+  if (r.code !== 0 || !validSpaceName(name)) refuse('worker-space-unavailable: cannot resolve the repository folder name; retry. Nothing was launched.', 4);
+  return name;
 }
 function repositoryIdentity(folder) {
   const r = run('git', ['-C', folder, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { timeout: 2000 });
@@ -1865,6 +1998,19 @@ function workerSpaceOccupancy(h, tasks, deadline) {
   const listed = hcJson(['ls', '--json'], options());
   if (listed.code !== 0 || !Array.isArray(listed.value?.terminals)) fail('Core did not provide terminal occupancy');
   const records = new Map(tasks.map(t => [t.id, t])), projects = new Map();
+  const rememberName = space => {
+    if (!projects.has(space.id)) projects.set(space.id, { projects: new Set(), space });
+    const occupied = projects.get(space.id);
+    if (space.mode === 'per-project' && occupied.space.name !== space.name) fail(`space ${space.id} has conflicting saved names`);
+    return occupied;
+  };
+  // Name continuity is not worker occupancy. A reported/stopped/failed task can
+  // still launch an inherited reviewer or replacement after its terminal ends.
+  // Pin its canonical name until closure, without letting it establish reuse.
+  for (const task of tasks.filter(t => t.state !== 'closed')) {
+    const space = resolveWorkerSpace(h, task);
+    if (space.mode === 'per-project') rememberName(space);
+  }
   const owned = new Map();
   for (const task of tasks.filter(unfinishedSpaceWorker)) for (const record of ownedTerminals(task)) {
     if (owned.has(record.address)) fail(`terminal ${record.address} is recorded by multiple tasks`);
@@ -1903,12 +2049,11 @@ function workerSpaceOccupancy(h, tasks, deadline) {
     // Kept shells are live terminals, not live workers. Pi can advertise status.app
     // even on Core versions that do not recognize it in the inventory's agent field.
     if (!entry.agent && !terminal.agent && !terminal.status?.app) continue;
-    if (!projects.has(space.id)) projects.set(space.id, new Set());
-    projects.get(space.id).add(space.project);
+    rememberName(space).projects.add(space.project);
   }
   return projects;
 }
-function admittedWorkerSpace(h, task, repair, occupancy) {
+function admittedWorkerSpace(h, task, repair, occupancy, name) {
   if (Object.hasOwn(task, 'workerSpace')) return resolveWorkerSpace(h, task);
   const mode = h.config.workerSpaceMode ?? 'combined';
   if (task.selfFix && mode === 'per-project') {
@@ -1917,18 +2062,18 @@ function admittedWorkerSpace(h, task, repair, occupancy) {
     if ((registeredProject(h, 'crew')?.path ?? null) !== repair.path) refuse('The crew registration changed during repair admission; retry. No task or terminal was created.');
   }
   const project = task.selfFix && mode === 'per-project' ? repair.project : task.project;
-  const canonical = makeWorkerSpace(h, mode, project);
+  const canonical = makeWorkerSpace(h, mode, project, name);
   if (mode === 'combined') return canonical;
   if (!occupancy) refuse('worker-space-unavailable: the admission setting changed; retry. Nothing was launched.', 4);
-  const exclusive = id => occupancy.get(id)?.size === 1 && occupancy.get(id).has(project);
-  if (exclusive(canonical.id)) return canonical;
+  const exclusive = id => occupancy.get(id)?.projects.size === 1 && occupancy.get(id).projects.has(project);
+  if (exclusive(canonical.id)) return occupancy.get(canonical.id).space;
   const combined = makeWorkerSpace(h, 'combined', project);
-  return exclusive(combined.id) ? combined : canonical;
+  return exclusive(combined.id) ? combined : occupancy.get(canonical.id)?.space ?? canonical;
 }
-function makeWorkerSpace(h, mode, project) {
+function makeWorkerSpace(h, mode, project, name = project === SELF_PROJECT ? 'crew' : project) {
   const base = `fm-crew-${h.config.tag}`;
   return { version: 1, mode, id: mode === 'combined' ? base : project === SELF_PROJECT ? `${base}-self` : `${base}-project-${project}`,
-    project, name: mode === 'combined' ? null : project === SELF_PROJECT ? 'crew' : project };
+    project, name: mode === 'combined' ? null : name };
 }
 
 // Creates the task, its working copy and its terminal. `extra` is kept on the task record.
@@ -1971,13 +2116,28 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
       pending = preparations.length > 0;
       if (pending) return false; // release the gate so this launch can publish
       const occupancy = tasks ? workerSpaceOccupancy(h, tasks, deadline) : null;
+      // Resolve outside projects.lock, then recheck the exact registration at
+      // reservation. Inherited names never depend on the current registry/path.
+      const namingProject = independent && h.config.workerSpaceMode === 'per-project'
+        ? extra.selfFix ? repairPlacement.project : opts.project : null;
+      const namingPath = namingProject && namingProject !== SELF_PROJECT ? registeredProject(h, namingProject)?.path : null;
+      const name = namingPath ? repositorySpaceName(namingPath) : 'crew';
+      const selection = !extra.selfFix && opts.kind === 'ship' ? registeredProject(h, opts.project) : null;
+      if (selection?.kind && !projectKindAvailable(selection.kind, selection.path)) {
+        refuse(`kind-unavailable: project ${opts.project}'s selected ${selection.kind} kind cannot be honored; restore its delivery tool or gate tool and remote. Nothing was launched.`, 4);
+      }
       return withRegistry(h, () => {
         // Only registry writers can race us: every task writer and terminal
         // transition needs the placement gate we still hold. No lock snapshots.
         if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
+        if (selection && (project.path !== selection.path || project.kind !== selection.kind)) return false;
         if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
         if (independent && h.config.workerSpaceMode === 'per-project' && !tasks) return false;
-        record.workerSpace = admittedWorkerSpace(h, record, repairPlacement, occupancy);
+        if (namingProject && namingProject !== SELF_PROJECT && registeredProject(h, namingProject)?.path !== namingPath) {
+          refuse(extra.selfFix ? 'The crew registration changed during repair admission; retry. No task or terminal was created.'
+            : 'The project registration changed during space-name resolution; retry. No task or terminal was created.');
+        }
+        record.workerSpace = admittedWorkerSpace(h, record, repairPlacement, occupancy, name);
         fs.mkdirSync(dir, { recursive: true });
         saveTask(h, record); // reservation and decision share the same gate
         return true;
@@ -1991,7 +2151,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   }
   fs.mkdirSync(h.worktrees, { recursive: true });
   // Slow tools run outside the transaction; this preparing task now protects the path.
-  const gated = opts.kind === 'ship' && !extra.selfFix && toolPath('no-mistakes') && run('git', ['-C', project.path, 'remote', 'get-url', 'no-mistakes']).code === 0;
+  const gated = opts.kind === 'ship' && !extra.selfFix && (project.kind ? project.kind === 'gate' : gateAvailable(project.path));
   const intent = gated ? slash(path.join(dir, 'intent.md')) : null;
   // Once reserved, finish/stop cannot revoke this allocation. Wait through other
   // terminal transitions rather than abandon a preparing task on brief contention.
@@ -2028,6 +2188,10 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // with what the worker was told. The gate, where there is one, delivers instead.
   const workflow = opts.kind === 'ship' && !extra.selfFix && !gated && followsWorkflow(project, worktree);
   if (workflow) { record = { ...record, workflow: 'delivery' }; savePreparing(record); }
+  if (opts.kind === 'ship' && !extra.selfFix && workflowRepositorySignal(worktree)) {
+    if (project.kind === 'plain' || (!project.kind && project.workflow === 'plain')) console.log(`project ${opts.project}: repository now looks like delivery; explicit plain selection retained, registration unchanged.`);
+    else if (!project.kind && !project.workflow) console.log(`project ${opts.project}: repository now looks like delivery; ${workflow ? 'using delivery for this task' : 'current delivery selection retained'}, registration unchanged.`);
+  }
   fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project), workflow, branch }));
 
   withPlacementGate(h, () => {
@@ -3998,6 +4162,11 @@ const COMMANDS = { '_launch-check': cmdLaunchCheck, init: cmdInit, config: cmdCo
   home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, agents: cmdAgents, relaunch: cmdRelaunch, selfrepair: cmdSelfmerge, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
+  crew --capabilities --json              discover project-kinds v1 without a home
+  crew project --capabilities --json       the same project capability probe
+  crew project list --json [--home <absolute-home>]   authoritative project kinds
+  crew project set-kind <name> --kind workflow|plain|gate --home <absolute-home> --expected-path <folder> --json
+      change only an existing project's kind; another recorded owner refuses
   crew project add <name> <git folder> [--gate-skip <steps>|none] [--workflow delivery|plain]   register a project   (crew project list)
       re-adding replaces the registration: omitted workflow and gate-skip choices are dropped
   crew project remove <name>               forget a project with no unfinished tasks
@@ -4046,16 +4215,19 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   Profile provider selects the quota family, not the launch provider; floors use applicable effective availability.
   Initial selection skips reads for one candidate; agents/hand-over check even one. Shared quota,
   CREW_NO_QUOTA=1 or missing quota-axi skips quota reads, not applicable installation checks.
-  Gate delivery needs both the no-mistakes remote and installed tool; otherwise workflow/plain.
+  Legacy gate detection needs both remote and tool; otherwise workflow/plain. An explicit
+  project kind wins over legacy detection and refuses if its required tool/remote is unavailable.
 `;
 
 export function main(argv) {
   const [name, ...args] = argv;
+  if (name === '--capabilities') { cmdProjectKinds([name, ...args]); return; }
   if (name === '--version') { console.log(VERSION); return; }
   const command = COMMANDS[name];
   // `crew <command> --help` is a question, never an id or a task text.
   const localConfig = name === 'config' && args[0] === 'worker-space' && args.some(a => ['--set-local', '--capabilities', '--home', '--json'].includes(a));
-  if (command && name !== 'backlog' && !localConfig && args.some(a => a === '--help' || a === '-h')) { console.log(USAGE); return; }
+  const projectApi = name === 'project' && (args[0] === 'set-kind' || args.some(a => ['--capabilities', '--json', '--home', '--expected-path'].includes(a)));
+  if (command && name !== 'backlog' && !localConfig && !projectApi && args.some(a => a === '--help' || a === '-h')) { console.log(USAGE); return; }
   if (!command) { console.log(USAGE); process.exitCode = name && name !== '--help' && name !== 'help' ? 2 : 0; return; }
   try { command(args); } catch (error) {
     if (error instanceof Refusal) {

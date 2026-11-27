@@ -657,6 +657,176 @@ function gapFixture(name, extra = {}) {
   const leave = () => { const w = readWorld(); delete w.terminals[`guest-${name}`]; fs.writeFileSync(world, JSON.stringify(w)); };
   return { dir, home, repo, call, task, save, spawn, guest, leave };
 }
+function projectKindFixture(name) {
+  const f = gapFixture(`kinds-${name}`), delivery = path.join(f.dir, 'delivery.mjs');
+  fs.writeFileSync(delivery, `import fs from 'node:fs'; import path from 'node:path'; import {spawnSync} from 'node:child_process';
+const a=process.argv.slice(2); if(a[0]!=='start')process.exit(1);
+const detached=a[1]==='--detach', key=detached?a[2]:a[1], copy=path.join(${JSON.stringify(f.dir)},'delivery-copies',key.replaceAll('/','-'));
+const r=spawnSync('git',['worktree','add',...(detached?['--detach']:['-b',key]),copy,'HEAD'],{encoding:'utf8'});
+if(r.status!==0){console.error(r.stderr);process.exit(1);}console.log(JSON.stringify({path:copy,created:true}));`);
+  const env = { CREW_TOOL_DELIVERY: delivery };
+  const call = (args, extra = {}) => f.call(args, { ...env, ...extra });
+  return { ...f, call, env, delivery, owner: `owner-kinds-${name}` };
+}
+gapTests['workflow-detection'] = () => {
+  for (const signal of ['skill', 'caller']) {
+    const f = projectKindFixture(`detect-${signal}`);
+    let r = f.call(['spawn', 'before', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 0, r.out); assert.equal(f.task('before').workflow, undefined);
+    const file = path.join(f.home, 'crew.json'), before = fs.readFileSync(file, 'utf8');
+    commit(f.repo, signal === 'skill' ? { 'skills/change-delivery/SKILL.md': '---\nname: change-delivery\n---\n# Change delivery\n' }
+      : { '.github/workflows/custom.yaml': 'jobs:\n  deliver:\n    uses: timurproko/MyWorkflows/.github/workflows/delivery.yml@main\n' }, 'Delivery source signal');
+    r = f.call(['spawn', 'after', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 0, r.out); assert.match(r.out, /repository now looks like delivery.*registration unchanged/);
+    assert.equal(f.task('after').workflow, 'delivery'); assert.equal(f.task('before').workflow, undefined);
+    assert.match(fs.readFileSync(f.task('after').brief, 'utf8'), /plan as a draft pull request|plan first as a draft pull request|then STOP/);
+    assert.equal(fs.readFileSync(file, 'utf8'), before, 'Spawn detection never edits registration');
+    r = f.call(['project', 'add', 'arbitrary-alias', f.repo]); assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /repository delivery signal detected/);
+    r = f.call(['spawn', 'alias', '--project', 'arbitrary-alias', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 0, r.out); assert.equal(f.task('alias').workflow, 'delivery');
+    assert.equal(f.call(['project', 'add', 'arbitrary-alias', f.repo, '--workflow', 'plain']).code, 0);
+    const plain = fs.readFileSync(file, 'utf8');
+    r = f.call(['spawn', 'explicit-plain', '--project', 'arbitrary-alias', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 0, r.out); assert.match(r.out, /repository now looks like delivery; explicit plain selection retained, registration unchanged/);
+    assert.equal(f.task('explicit-plain').workflow, undefined); assert.equal(fs.readFileSync(file, 'utf8'), plain);
+  }
+  const f = projectKindFixture('not-a-signal');
+  commit(f.repo, { 'skills/change-delivery/SKILL.md': '---\nname: unrelated\n---\n', '.github/workflows/other.yml': '# uses: timurproko/MyWorkflows/.github/workflows/delivery.yml@main\njobs: {}\n' }, 'Not delivery');
+  const r = f.call(['spawn', 'plain', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+  assert.equal(r.code, 0, r.out); assert.equal(f.task('plain').workflow, undefined);
+};
+
+gapTests['project-kinds'] = () => {
+  const f = projectKindFixture('api'), registry = path.join(f.home, 'crew.json');
+  const read = () => JSON.parse(fs.readFileSync(registry, 'utf8'));
+  const json = (args, extra = {}) => { const r = f.call(args, extra); return { ...r, value: JSON.parse(r.out) }; };
+  const setArgs = (kind = 'plain', name = 'demo', expected = f.repo, target = f.home) => ['project', 'set-kind', name, '--kind', kind, '--home', target, '--expected-path', expected, '--json'];
+  const snapshot = () => fs.readFileSync(registry, 'utf8');
+  const beforeProbe = readWorld().log.length;
+  for (const args of [['project', '--capabilities', '--json'], ['--capabilities', '--json']]) {
+    const r = crew(args, { cwd: root }); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(JSON.parse(r.out), { capability: 'project-kinds', version: 1, listJson: true, setKind: true, explicitHome: true, expectedPath: true, kinds: ['workflow', 'plain', 'gate'] });
+  }
+  assert.equal(readWorld().log.length, beforeProbe, 'Discovery never queries Core or opens a home');
+  let r = json(['project', 'list', '--json']); assert.equal(r.code, 0, r.out);
+  const home = slash(fs.realpathSync(f.home));
+  assert.deepEqual(r.value, { capability: 'project-kinds', version: 1, ok: true, home, projects: [{ name: 'demo', path: slash(f.repo), kind: 'plain' }] });
+  const old = f.spawn('historical', ['--kind', 'ship', '--agent', 'pi']);
+  const historical = fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8');
+  const config = read(); config.future = { keep: true };
+  config.projects.demo = { ...config.projects.demo, workflow: 'delivery', gateSkip: ['ci', 'test'], future: { nested: [1, 2] } };
+  fs.writeFileSync(registry, JSON.stringify(config));
+  const original = structuredClone(config.projects.demo), ownerFile = path.join(f.home, 'owner.json'), owner = fs.readFileSync(ownerFile, 'utf8');
+  r = json(setArgs()); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(r.value, { capability: 'project-kinds', version: 1, ok: true, home, project: { name: 'demo', path: slash(f.repo), kind: 'plain' }, changed: true });
+  assert.deepEqual(read().projects.demo, { ...original, kind: 'plain' }); assert.deepEqual(read().future, { keep: true });
+  assert.equal(fs.readFileSync(ownerFile, 'utf8'), owner); assert.equal(fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8'), historical);
+  const noOp = snapshot(); r = json(setArgs()); assert.equal(r.code, 0, r.out); assert.equal(r.value.changed, false); assert.equal(snapshot(), noOp);
+  assert.equal(json(['project', 'list', '--home', f.home, '--json']).value.projects[0].kind, 'plain');
+  const refusal = (args, reason, extra) => {
+    const before = snapshot(), n = readWorld().log.length, r = json(args, extra);
+    assert.notEqual(r.code, 0, r.out); assert.equal(r.value.ok, false); assert.equal(r.value.error.code, reason, r.out);
+    assert.equal(snapshot(), before); assert.equal(readWorld().log.length, n, 'API refusal does not control terminals'); return r;
+  };
+  refusal(setArgs('unknown'), 'kind-unavailable'); refusal(setArgs('plain', 'missing'), 'project-missing');
+  refusal(setArgs('plain', 'demo', path.join(f.dir, 'not-this-folder')), 'project-changed');
+  refusal(setArgs('workflow'), 'kind-unavailable', { CREW_TOOL_DELIVERY: '' });
+  refusal(setArgs('gate'), 'kind-unavailable');
+  for (const args of [setArgs().slice(0, -1), [...setArgs(), '--replace'], [...setArgs(), '--json'], ['project', '--capabilities', '--json', '--home', f.home], ['project', 'list', '--json', '--kind', 'plain'], ['project', 'set-kind', 'demo', '--kind', 'plain', '--home', f.home, '--json']]) refusal(args, 'invalid-arguments');
+  refusal(setArgs('plain', 'demo', f.repo, path.join(f.dir, 'missing-home')), 'home-missing');
+  refusal(setArgs('plain', 'demo', f.repo, 'relative'), 'invalid-arguments');
+  const empty = path.join(f.dir, 'empty'); fs.mkdirSync(empty);
+  refusal(setArgs('plain', 'demo', f.repo, empty), 'home-missing'); assert.deepEqual(fs.readdirSync(empty), []);
+  const external = crew(setArgs(), { cwd: root, env: f.env });
+  assert.equal(external.code, 3, external.out); assert.equal(JSON.parse(external.out).error.code, 'home-owned');
+  assert.equal(snapshot(), noOp, 'Another terminal cannot change kind');
+  fs.writeFileSync(ownerFile, '{bad'); refusal(setArgs(), 'home-owned'); fs.writeFileSync(ownerFile, owner);
+  fs.writeFileSync(path.join(f.home, 'projects.lock'), '{}');
+  try { refusal(setArgs('workflow'), 'registry-busy'); } finally { fs.unlinkSync(path.join(f.home, 'projects.lock')); }
+  // Existing shared initialized-home validation is also used by this API. A hard
+  // linked registry cannot redirect a setting into another home.
+  const linkHome = path.join(f.dir, 'linked-home'); fs.mkdirSync(path.join(linkHome, 'tasks'), { recursive: true });
+  fs.linkSync(registry, path.join(linkHome, 'crew.json'));
+  try { refusal(setArgs('plain', 'demo', f.repo, linkHome), 'invalid-arguments'); } finally { fs.unlinkSync(path.join(linkHome, 'crew.json')); }
+  const gate = path.join(f.dir, 'no-mistakes.mjs'); fs.writeFileSync(gate, 'process.exit(0);');
+  f.env.CREW_TOOL_NO_MISTAKES = gate; git('-C', f.repo, 'remote', 'add', 'no-mistakes', f.repo);
+  for (const kind of ['workflow', 'plain', 'gate']) {
+    r = json(setArgs(kind), { CREW_TOOL_NO_MISTAKES: gate }); assert.equal(r.code, 0, r.out);
+    assert.equal(r.value.project.kind, kind); assert.deepEqual(read().projects.demo, { ...original, kind });
+    assert.equal(json(['project', 'list', '--json'], { CREW_TOOL_NO_MISTAKES: gate }).value.projects[0].kind, kind);
+    r = f.call(['spawn', `selected-${kind}`, '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { CREW_TOOL_NO_MISTAKES: gate });
+    assert.equal(r.code, 0, r.out);
+    const task = f.task(`selected-${kind}`);
+    assert.equal(task.workflow, kind === 'workflow' ? 'delivery' : undefined);
+    assert.equal(task.gate, kind === 'gate' ? 'no-mistakes' : undefined);
+    assert.equal(fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8'), historical);
+  }
+  r = json(setArgs('workflow')); assert.equal(r.code, 0, r.out);
+  const n = readWorld().log.length;
+  r = f.call(['spawn', 'unavailable', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { CREW_TOOL_DELIVERY: '' });
+  assert.equal(r.code, 4, r.out); assert.match(r.out, /kind-unavailable/);
+  assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'unavailable')));
+  assert.ok(!readWorld().log.slice(n).some(c => ['run', 'kill', 'rm'].includes(c[0])));
+  // An unowned explicit home is editable without pretending to own a terminal.
+  fs.unlinkSync(ownerFile);
+  r = crew(setArgs('plain'), { cwd: root, env: f.env }); assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(r.out).project.kind, 'plain'); assert.ok(!fs.existsSync(ownerFile));
+  const g = gapFixture('kinds-empty'); assert.equal(g.call(['project', 'remove', 'demo']).code, 0);
+  r = g.call(['project', 'list', '--json']); assert.equal(r.code, 0, r.out); assert.deepEqual(JSON.parse(r.out).projects, []);
+};
+gapTests['project-kinds-concurrency'] = async () => {
+  const f = projectKindFixture('concurrency'), args = ['project', 'set-kind', 'demo', '--kind', 'workflow', '--home', f.home, '--expected-path', f.repo, '--json'];
+  let gate = projectBarrier(f, 'before', 'kind-repoint'), pending = projectProcess(f, args, { script: gate.script, terminal: f.owner, env: f.env });
+  try {
+    await until(() => fs.existsSync(gate.ready));
+    const other = path.join(f.dir, 'replacement'); git('clone', '-q', f.repo, other);
+    assert.equal(f.call(['project', 'add', 'demo', other, '--replace']).code, 0);
+    fs.writeFileSync(gate.release, 'go'); const r = await pending.result;
+    assert.notEqual(r.code, 0, r.out); assert.equal(JSON.parse(r.out).error.code, 'project-changed');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8')).projects.demo.kind, undefined);
+  } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+  assert.equal(f.call(['project', 'add', 'demo', f.repo, '--replace']).code, 0);
+  gate = projectBarrier(f, 'before', 'kind-preserve'); pending = projectProcess(f, args, { script: gate.script, terminal: f.owner, env: f.env });
+  try {
+    await until(() => fs.existsSync(gate.ready));
+    assert.equal(f.call(['project', 'add', 'other', f.repo]).code, 0);
+    assert.equal(f.call(['config', 'worker-space', '--set-local', 'per-project', '--home', f.home, '--json']).code, 0);
+    fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
+    const config = JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8'));
+    assert.ok(config.projects.other); assert.equal(config.workerSpaceMode, 'per-project'); assert.equal(config.projects.demo.kind, 'workflow');
+  } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+};
+
+gapTests['project-kind-paths'] = async () => {
+  const f = projectKindFixture('path-proof'), registry = path.join(f.home, 'crew.json'), moved = path.join(f.dir, 'moved-repo');
+  const args = kind => ['project', 'set-kind', 'demo', '--kind', kind, '--home', f.home, '--expected-path', f.repo, '--json'];
+  const refuses = (r, before) => {
+    assert.equal(r.code, 2, r.out); assert.equal(JSON.parse(r.out).error.code, 'project-changed');
+    assert.equal(fs.readFileSync(registry, 'utf8'), before, 'Stale path refusal preserves registration bytes');
+  };
+  let before = fs.readFileSync(registry, 'utf8');
+  fs.renameSync(f.repo, moved);
+  try {
+    refuses(f.call(args('plain')), before);
+    fs.writeFileSync(f.repo, 'not a directory');
+    try { refuses(f.call(args('plain')), before); } finally { fs.unlinkSync(f.repo); }
+  } finally { fs.renameSync(moved, f.repo); }
+  assert.equal(f.call(args('plain')).code, 0, 'An existing canonical directory still works');
+  for (const kind of ['workflow', 'plain']) {
+    const gate = projectBarrier(f, 'before', `kind-delete-${kind}`);
+    const pending = projectProcess(f, args(kind), { script: gate.script, terminal: f.owner, env: f.env });
+    try {
+      await until(() => fs.existsSync(gate.ready)); before = fs.readFileSync(registry, 'utf8');
+      fs.renameSync(f.repo, moved); fs.writeFileSync(gate.release, 'go');
+      refuses(await pending.result, before); // locked recheck, including an otherwise no-op request
+    } finally {
+      fs.writeFileSync(gate.release, 'go'); await pending.result;
+      if (fs.existsSync(moved)) fs.renameSync(moved, f.repo);
+    }
+  }
+};
+
 // Concurrent CLIs with test-only filesystem barriers: no timing guesses or production hooks.
 function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), terminal = '', env = {}, cwd = f.home } = {}) {
   const child = spawn(process.execPath, [script, ...args], { cwd, env: {
@@ -770,10 +940,10 @@ function workerSpacePlacementTests() {
   const n = readWorld().log.length; f.mode('per-project');
   const fresh = f.spawn('new-a'), other = f.spawn('new-b', 'other'), again = f.spawn('again');
   assert.equal(f.space(fresh), `${combined}-project-demo`); assert.notEqual(f.space(fresh), f.space(other));
-  assert.equal(f.space(again), f.space(fresh)); assert.equal(f.labels(fresh)['crew.space.name'], 'demo');
+  assert.equal(f.space(again), f.space(fresh)); assert.equal(f.labels(fresh)['crew.space.name'], 'repo');
   for (const project of ['.xrbuild', 'agentnumberone.dev']) {
     const t = f.spawn(project.startsWith('.') ? 'dot' : 'domain', project);
-    assert.equal(f.space(t), `${combined}-project-${project}`); assert.equal(f.labels(t)['crew.space.name'], project);
+    assert.equal(f.space(t), `${combined}-project-${project}`); assert.equal(f.labels(t)['crew.space.name'], 'repo', 'Aliases use their repository folder, not the project key');
     assert.equal(f.labels(t)['crew.home'], tag); assert.equal(f.labels(t)['crew.space.project'], project);
   }
   assert.deepEqual(readWorld().terminals[a.terminal], old);
@@ -790,8 +960,167 @@ function workerSpacePlacementTests() {
   fs.mkdirSync(pooled); fs.writeFileSync(delivery, `console.log(JSON.stringify({path:${JSON.stringify(pooled)},created:true,pooled:true}));`);
   const r = f.call(['spawn', 'pool-dot', '--project', '.xrbuild', '--agent', 'pi', 'Count.'], { CREW_TOOL_DELIVERY: delivery });
   assert.equal(r.code, 0, r.out); assert.equal(f.task('pool-dot').worktree, slash(pooled));
-  assert.equal(f.labels(f.task('pool-dot'))['crew.space.name'], '.xrbuild');
+  assert.equal(f.labels(f.task('pool-dot'))['crew.space.name'], 'repo');
 }
+function spaceNameCaseTests() {
+  const f = joinSpaceFixture('name-case');
+  const makeRepo = name => {
+    const repo = path.join(f.dir, name); git('clone', '-q', f.repo, repo); return repo;
+  };
+  const mixed = makeRepo('MyWorkflows'), dot = makeRepo('.xrbuild'), plain = makeRepo('XRBuild');
+  f.add('myworkflows', mixed); f.add('alias', WINDOWS ? mixed.toLowerCase() : mixed);
+  f.add('.xrbuild', dot); f.add('xrbuild', plain);
+  f.mode('per-project');
+  const w = readWorld(); w.spaces = {}; fs.writeFileSync(world, JSON.stringify(w));
+  for (const [id, project, name] of [['mixed', 'myworkflows', 'MyWorkflows'], ['alias', 'alias', 'MyWorkflows'], ['dot', '.xrbuild', '.xrbuild'], ['plain', 'xrbuild', 'XRBuild']]) {
+    const t = f.spawn(id, project), labels = f.labels(t);
+    assert.equal(t.project, project); assert.equal(t.workerSpace.project, project);
+    assert.equal(t.workerSpace.name, name); assert.equal(labels['crew.space.name'], name);
+    assert.ok(labels['herdr.space'].endsWith(`-project-${project}`));
+    assert.equal(labels['crew.space.project'], project);
+    assert.equal(readWorld().spaces[t.workerSpace.id].name, name);
+  }
+  // Real linked fixture copies: basename from repository provenance, never the
+  // hashed parent, a slot number, or an arbitrary linked-checkout task name.
+  for (const [project, repo, leaf] of [['myworkflows', mixed, 'MyWorkflows'], ['.xrbuild', dot, '.xrbuild']]) {
+    const pooled = path.join(f.dir, '.treehouse', `${leaf}-a1b2c3`, '2', leaf);
+    git('-C', repo, 'worktree', 'add', '--detach', pooled, 'HEAD');
+    const delivery = path.join(f.dir, `delivery-${project}.mjs`);
+    fs.writeFileSync(delivery, `console.log(JSON.stringify({path:${JSON.stringify(pooled)},created:true,pooled:true}));`);
+    const r = f.call(['spawn', `pool-${project.replace(/^\./, '')}`, '--project', project, '--agent', 'pi', 'Count.'], { CREW_TOOL_DELIVERY: delivery });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(f.task(`pool-${project.replace(/^\./, '')}`).worktree, slash(pooled));
+    assert.equal(f.labels(f.task(`pool-${project.replace(/^\./, '')}`))['crew.space.name'], leaf);
+    const linked = path.join(f.dir, `${project}-linked-task`);
+    git('-C', repo, 'worktree', 'add', '--detach', linked, 'HEAD');
+    f.add(`linked-${project.replace(/^\./, '')}`, linked);
+    assert.equal(f.spawn(`linked-${project.replace(/^\./, '')}`, `linked-${project.replace(/^\./, '')}`).workerSpace.name, leaf);
+  }
+  const bad = f.spawn('bad-name', 'myworkflows', ['--kind', 'ship']);
+  for (const name of [null, '', ' ', 1, '.', '..', 'wrong/name', 'wrong\\name', 'wrong\nname', 'x'.repeat(4097)]) {
+    f.save({ ...bad, workerSpace: { ...bad.workerSpace, name } }); const n = readWorld().log.length;
+    const r = f.call(['relaunch', bad.id, '--agent', 'pi', '--model', 'second']);
+    assert.equal(r.code, 2, r.out); assert.match(r.out, /invalid workerSpace/);
+    assert.ok(!readWorld().log.slice(n).some(c => ['kill', 'rm', 'run'].includes(c[0])));
+  }
+  f.save(bad);
+  const before = structuredClone(readWorld().terminals[bad.terminal]);
+  setTerminal(bad.terminal, { labels: { ...before.labels, 'crew.space.name': 'myworkflows' } });
+  const n = readWorld().log.length, refused = f.call(['spawn', 'bad-label', '--project', 'myworkflows', '--agent', 'pi', 'Count.']);
+  assert.equal(refused.code, 4, refused.out); assert.match(refused.out, /placement-v1 labels/);
+  assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'bad-label')));
+  assert.ok(!readWorld().log.slice(n).some(c => ['kill', 'rm', 'run'].includes(c[0])));
+}
+function spaceNameCompatibilityTests() {
+  for (const name of ['myworkflows', 'MyWorkflows']) {
+    const f = joinSpaceFixture(`name-inherit-${name === 'myworkflows' ? 'legacy' : 'directory'}`), repo = path.join(f.dir, 'MyWorkflows');
+    git('clone', '-q', f.repo, repo); f.add('myworkflows', repo); f.mode('per-project');
+    const source = f.spawn('source', 'myworkflows', ['--kind', 'ship']);
+    const manual = f.spawn('manual', 'myworkflows', ['--kind', 'ship']);
+    const auto = f.spawn('auto', 'myworkflows');
+    // Genuine pre-change metadata and matching labels/launch authority, not a
+    // title-only guess. Model an occupied old automatic space without renaming it.
+    for (const t of [source, manual, auto]) {
+      const space = { ...t.workerSpace, name };
+      f.save({ ...t, workerSpace: space, terminalLaunches: t.terminalLaunches.map(intent => ({ ...intent, workerSpace: space })) });
+      setTerminal(t.terminal, { labels: { ...f.labels(t), 'crew.space.name': name } });
+    }
+    const w = readWorld(); w.spaces = { [source.workerSpace.id]: { id: source.workerSpace.id, name, automatic: true, members: [source.terminal, manual.terminal, auto.terminal] } };
+    for (const t of [source, manual, auto]) w.terminals[t.terminal].space = source.workerSpace.id;
+    fs.writeFileSync(world, JSON.stringify(w));
+    f.mode('combined'); const combined = f.spawn('combined', 'myworkflows'); f.mode('per-project');
+    const untouched = structuredClone(readWorld().terminals), n = readWorld().log.length;
+    const joined = f.spawn('joined', 'myworkflows');
+    assert.deepEqual(joined.workerSpace, f.task(source.id).workerSpace, 'Canonical legacy/new title outranks eligible combined');
+    assert.notEqual(joined.workerSpace.id, combined.workerSpace.id);
+    assert.equal(f.labels(joined)['crew.space.name'], name);
+    assert.equal(Object.keys(readWorld().spaces).length, 2, 'No duplicate space');
+    for (const [address, terminal] of Object.entries(untouched)) assert.deepEqual(readWorld().terminals[address], terminal);
+    assert.ok(!readWorld().log.slice(n).some(c => /space|move|label|doc/.test(c[0])), 'Joining does not rename or relabel');
+    f.mode('combined'); f.done(source);
+    let r = f.call(['review', source.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task('source-review').workerSpace, joined.workerSpace);
+    r = f.call(['relaunch', manual.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task(manual.id).workerSpace, joined.workerSpace);
+    const current = f.task(auto.id);
+    f.save({ ...current, chain: [{ harness: 'pi', model: 'second' }], candidates: [{ harness: 'pi', model: 'first' }, { harness: 'pi', model: 'second' }] });
+    setTerminal(current.terminal, { status: { app: 'pi', state: 'idle' }, screen: 'quota exhausted' });
+    r = f.call(['wait', auto.id, '--timeout', '0.2']); assert.equal(r.code, 124, r.out);
+    assert.notEqual(f.task(auto.id).terminal, current.terminal, r.out);
+    assert.deepEqual(f.task(auto.id).workerSpace, joined.workerSpace);
+    for (const id of ['source-review', manual.id, auto.id]) assert.equal(f.labels(f.task(id))['crew.space.name'], name);
+    // Independently valid but contradictory saved names cannot be used to guess
+    // a winner or issue another space request. Labels remain exact per record.
+    const conflict = f.task(joined.id), space = { ...conflict.workerSpace, name: 'Different' };
+    f.save({ ...conflict, workerSpace: space }); setTerminal(conflict.terminal, { labels: { ...f.labels(conflict), 'crew.space.name': space.name } });
+    f.mode('per-project'); const before = readWorld().log.length;
+    r = f.call(['spawn', 'conflict', '--project', 'myworkflows', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 4, r.out); assert.match(r.out, /conflicting saved names/);
+    assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'conflict')));
+    assert.ok(!readWorld().log.slice(before).some(c => ['run', 'kill', 'rm'].includes(c[0])));
+  }
+}
+function spaceNameLifecycleTests(name) {
+  const f = joinSpaceFixture(name), repo = path.join(f.dir, 'MyWorkflows');
+  git('clone', '-q', f.repo, repo); f.add('myworkflows', repo); f.add('other'); f.mode('per-project');
+  const source = f.spawn('ship', 'myworkflows', ['--kind', 'ship']);
+  const placement = { ...source.workerSpace, name: 'myworkflows' };
+  f.save({ ...source, workflow: 'delivery', workerSpace: placement,
+    terminalLaunches: source.terminalLaunches.map(intent => ({ ...intent, workerSpace: placement })) });
+  setTerminal(source.terminal, { labels: { ...f.labels(source), 'crew.space.name': placement.name } });
+  const w = readWorld(); w.spaces = { [placement.id]: { id: placement.id, name: placement.name, automatic: true, members: [source.terminal] } };
+  w.terminals[source.terminal].space = placement.id; fs.writeFileSync(world, JSON.stringify(w));
+  const tasks = () => fs.readdirSync(path.join(f.home, 'tasks')).map(id => f.task(id));
+  const consistent = stage => {
+    for (const task of tasks().filter(t => t.state !== 'closed' && t.workerSpace?.id === placement.id)) {
+      assert.equal(task.workerSpace.name, placement.name, `${stage}: saved ${task.id}`);
+      for (const intent of task.terminalLaunches ?? []) assert.equal(intent.workerSpace.name, placement.name, `${stage}: launch intent ${task.id}`);
+    }
+    for (const terminal of Object.values(readWorld().terminals).filter(t => t.state === 'live' && t.labels?.['herdr.space'] === placement.id)) {
+      assert.equal(terminal.labels['crew.space.name'], placement.name, `${stage}: live ${terminal.address}`);
+    }
+    assert.equal(readWorld().spaces[placement.id].name, placement.name, `${stage}: no modeled rename`);
+  };
+  const next = stage => {
+    consistent(stage);
+    const admitted = f.spawn(`after-${stage}`, 'myworkflows');
+    assert.deepEqual(admitted.workerSpace, placement, `${stage}: next admission`); consistent(stage);
+    f.done(admitted);
+    const r = f.call(['finish', admitted.id, '--force']); assert.equal(r.code, 0, r.out);
+    consistent(stage); // probes leave no unfinished worker masking the next transition
+  };
+  const reported = (id, text) => {
+    const task = f.task(id); fs.writeFileSync(task.report, text);
+    const r = crew(['done', id], { cwd: f.home, terminal: task.terminal, env: f.env }); assert.equal(r.code, 0, r.out);
+    assert.equal(f.task(id).state, 'reported');
+  };
+  const noWorkers = () => assert.ok(!tasks().some(t => t.workerSpace?.id === placement.id && ['working', 'preparing'].includes(t.state)));
+  const url = 'https://github.com/acme/demo/pull/42';
+  next('spawn');
+  reported(source.id, `Plan: ${url}\n\nA plan.`); assert.equal(f.task(source.id).stage, 'plan'); noWorkers(); next('plan');
+  let r = f.call(['tell', source.id, 'approved, implement']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(source.id).state, 'working'); next('approval');
+  reported(source.id, `Implementation: ${url}\n\nImplemented.`); assert.equal(f.task(source.id).stage, 'implementation'); noWorkers(); next('implementation');
+  r = f.call(['review', source.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out); next('review-spawn');
+  const review = f.task('ship-review'); assert.deepEqual(review.workerSpace, placement);
+  reported(review.id, 'APPROVE\n\n## What I checked\nThe change.'); noWorkers(); next('review-report');
+  r = f.call(['finish', review.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(review.id).state, 'closed'); noWorkers(); next('review-finish');
+  r = f.call(['tell', source.id, 'Continue implementation.']); assert.equal(r.code, 0, r.out); next('reopen');
+  r = f.call(['relaunch', source.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out); next('relaunch');
+  r = f.call(['stop', source.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(source.id).state, 'stopped'); noWorkers(); next('stopped');
+  r = f.call(['relaunch', source.id, '--agent', 'pi', '--model', 'third']); assert.equal(r.code, 0, r.out); next('stopped-relaunch');
+  reported(source.id, `Implementation: ${url}\n\nFinished.`); noWorkers(); next('final-report');
+  // Unrelated projects must remain admissible throughout settled legacy state.
+  const other = f.spawn('unrelated', 'other'); assert.equal(other.workerSpace.project, 'other');
+  r = f.call(['finish', source.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(source.id).state, 'closed'); assert.equal(readWorld().spaces[placement.id], undefined);
+  const fresh = f.spawn('fresh', 'myworkflows'); assert.equal(fresh.workerSpace.name, 'MyWorkflows', 'Closed history does not pin a deleted space');
+}
+gapTests['space-name-lifecycle'] = () => spaceNameLifecycleTests('name-lifecycle-focused');
+gapTests['space-name-case'] = () => { spaceNameCaseTests(); spaceNameCompatibilityTests(); spaceNameLifecycleTests('name-lifecycle-group'); };
+
 function workerSpaceInheritanceTests() {
   for (const initial of ['combined', 'per-project']) {
     const f = workerSpaceFixture(`inherit-${initial}`); f.mode(initial);
@@ -820,7 +1149,7 @@ function workerSpaceInheritanceTests() {
   r = f.call(['tell', 'legacy', 'Continue.']); assert.equal(r.code, 0, r.out);
   r = f.call(['relaunch', 'legacy', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
   assert.equal(f.space(t), workerSpace.id); assert.deepEqual(f.task('legacy').workerSpace, workerSpace);
-  for (const invalid of [null, { ...bad.workerSpace, version: 2 }, { ...bad.workerSpace, id: 'personal' }, { ...bad.workerSpace, project: 'other' }, { ...bad.workerSpace, name: 'wrong' }]) {
+  for (const invalid of [null, { ...bad.workerSpace, version: 2 }, { ...bad.workerSpace, id: 'personal' }, { ...bad.workerSpace, project: 'other' }, { ...bad.workerSpace, name: '../wrong' }]) {
     f.save({ ...bad, workerSpace: invalid }); const n = readWorld().log.length;
     r = f.call(['relaunch', 'bad', '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 2, r.out);
     f.save({ ...bad, state: 'reported', workerSpace: invalid });
@@ -845,7 +1174,7 @@ function workerSpaceFixTests() {
     const fleet = JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.find(task => task.id === t.id);
     assert.equal(fleet.project, full.project); assert.equal(fleet.project, 'crew:self');
     assert.equal(readWorld().terminals[t.terminal].labels['crew.space.project'], binding.project, 'Fleet task identity never rewrites the repair placement alias');
-    assert.equal(binding.name, 'crew'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
+    assert.equal(binding.name, registration === 'matching' ? 'core' : 'crew'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
     assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
     r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: '' }); assert.equal(r.code, 0, r.out);
     assert.deepEqual(f.task(t.id).workerSpace, binding);
@@ -991,12 +1320,12 @@ function joinProjectSpaceTests() {
   f.mode('combined'); const mixed = f.spawn('mixed', 'other'); f.mode('per-project');
   const canonical = f.spawn('canonical'); assert.equal(f.space(canonical), project);
   assert.equal(f.space(f.spawn('canonical-again')), project);
-  assert.deepEqual(canonical.workerSpace, { version: 1, mode: 'per-project', id: project, project: 'demo', name: 'demo' });
+  assert.deepEqual(canonical.workerSpace, { version: 1, mode: 'per-project', id: project, project: 'demo', name: 'repo' });
   // Once both spaces are eligible, prefer occupied canonical rather than proliferating identities.
   f.save({ ...mixed, state: 'reported' });
   assert.equal(f.space(f.spawn('prefer-canonical')), project);
   const dot = f.spawn('dot', '.xrbuild'); assert.equal(f.space(dot), `${combined}-project-.xrbuild`);
-  assert.equal(f.labels(dot)['crew.space.name'], '.xrbuild');
+  assert.equal(f.labels(dot)['crew.space.name'], 'repo');
   // History and shells cannot make empty combined reusable, or pollute live P exclusivity.
   for (const state of ['reported', 'closed', 'stopped', 'failed', 'ended', 'shell']) {
     const g = joinSpaceFixture(`join-${state}`), t = g.spawn('former');
