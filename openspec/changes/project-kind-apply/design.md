@@ -26,9 +26,9 @@ Project add/remove already allow non-owners under separate unfinished-task/path 
 
 ### Use one effective-kind resolver with provenance
 
-Reuse/refactor the current registered-folder resolver for list and admission. Return `kind`, `kindSource` (`explicit`, `legacy`, `detected`) and `available`; advertise `kindSource: true` in capability JSON. `kindSource` records whether a stored `kind`, a legacy `workflow` override, or automatic detection governs the selection. Keep legacy gate-first precedence for registrations without `kind`, and retain explicit-kind precedence over everything else. The first successful setter creates an explicit choice even if its effective kind already matched.
+Share one effective-kind resolver between list and admission. Return `kind`, `kindSource` (`explicit`, `legacy`, `detected`), `available` and `checkoutStale` (boolean or null when not inspected); advertise `kindSource: true` and `checkoutStale: true` in capability JSON. `kindSource` records whether a stored `kind`, a legacy `workflow` override, or automatic detection governs the selection. Keep legacy gate-first precedence for registrations without `kind`, and retain explicit-kind precedence over everything else. The first successful setter creates an explicit choice even if its effective kind already matched.
 
-The registered repository folder is the detection source. Do not allocate a working copy, update a checkout or fetch a remote merely to list projects. This chooses deterministic local inspection over adding remote/default-head resolution to Settings. Under unchanged inputs the listing predicts admission; a changed registry, repository or tool installation can legitimately change a later automatic result. Report unavailable explicit selections instead of displaying a fallback.
+Approval refinement: when delivery allocates from origin's published default, automatic detection reads that commit's instruction/skill/caller blobs, not the registered checkout. Resolve the default branch as delivery does (recorded origin/HEAD, otherwise remote HEAD), query its published head and fetch missing objects without moving refs, HEAD, index or working files. Bound remote operations and refuse unresolved automatic selection rather than inventing Plain. Without delivery or origin, use the local source that allocation uses. Expose checkoutStale=true only when the registered HEAD is a proven strict ancestor of the published head; false for proven non-behind state, null when not inspected. Under unchanged inputs the listing predicts admission; later registry/repository/tool changes can legitimately change a result. Explicit selections remain authoritative and can be listed offline.
 
 ### Freeze selection in the reservation transaction
 
@@ -42,7 +42,7 @@ Extend existing project-kinds, concurrency, path-proof and workflow-detection fa
 
 ## Risks / Trade-offs
 
-- Automatic projects follow the registered checkout, not a newer published default copy → document this rule prominently; the explicit setter is the stable choice when those differ.
+- Published-default detection can require network access and missing Git objects → bound reads/fetches, avoid changing checkout/ref state, and refuse unverifiable automatic selection; explicit choices remain inspectable offline.
 - A list result is not a promise against later filesystem/tool changes → describe it as the effective next-admission selection under unchanged inputs, never as a persisted automatic choice.
 - Existing consumers may compare capability/list objects exactly → use additive version-one fields and update contract tests; require the new permission flag before non-owner Settings edits.
 - Concurrent kind updates can occur during copy allocation → freeze at reservation, not just before terminal launch, and prove ordering with fake barriers.

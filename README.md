@@ -164,11 +164,13 @@ crew project set-kind myworkflows --kind workflow --home C:/Users/me/.crew --exp
 ```
 
 This changes only an existing registration's `kind` field, preserving its folder, gate skips,
-legacy overrides and unknown metadata. Expected-path and owner checks refuse stale targets or
-another recorded coordinator; it never re-registers, takes over or changes existing tasks.
-Unowned homes are supported. The explicit kind wins over legacy detection; missing required
-tools/remote refuse rather than silently falling back. This is not the worker-space setter's
-ownership exception. See [JSON contract, refusals and availability](docs/project-kinds.md).
+legacy overrides and unknown metadata. Expected-path checks refuse stale targets. The
+`setKindLocal:true` capability permits this kind-only edit from a non-owning local session,
+even while the coordinator is running; it never re-registers, takes over or changes existing
+tasks. The next spawn reads the new selection without restart. The explicit kind wins over legacy detection; missing required
+tools/remote refuse rather than silently falling back. This is a separate narrow local permission, not an extension of work-control authority. Spawn,
+stop, finish, tell, relaunch, land, backlog mutations and end remain owner-only; add/remove
+retain their existing independent registration safeguards. See [JSON contract, refusals and availability](docs/project-kinds.md).
 
 ## Worker spaces
 

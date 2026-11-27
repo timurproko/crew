@@ -1078,27 +1078,11 @@ function projectKind(project, folder = project.path) {
 function projectKindAvailable(kind, folder) {
   return kind === 'plain' || (kind === 'workflow' ? Boolean(toolPath('delivery')) : gateAvailable(folder));
 }
-function requireProjectKindOwner(h) {
-  // No takeover or guessed liveness. Even a stale/unknown different owner must
-  // release the home normally; this is NOT worker-space's local preference exception.
-  let owner;
-  try {
-    const file = path.join(h.dir, 'owner.json'), stat = fs.lstatSync(file);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('unsafe owner');
-    owner = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (error) {
-    if (error.code === 'ENOENT') return;
-    localSettingRefuse('home-owned', 'The Crew home owner cannot be verified.', 3);
-  }
-  if (typeof owner?.terminal !== 'string' || !owner.terminal || owner.terminal !== me()) {
-    localSettingRefuse('home-owned', 'Another session owns this Crew home.', 3);
-  }
-}
 function cmdProjectKinds(args) {
   let h;
   try {
     if (args.length === 2 && args.includes('--capabilities') && args.includes('--json')) {
-      console.log(JSON.stringify({ ...PROJECT_KINDS_API, listJson: true, setKind: true, explicitHome: true, expectedPath: true, kinds: PROJECT_KINDS })); return;
+      console.log(JSON.stringify({ ...PROJECT_KINDS_API, listJson: true, setKind: true, setKindLocal: true, explicitHome: true, expectedPath: true, kinds: PROJECT_KINDS })); return;
     }
     const verb = args[0], setting = verb === 'set-kind', name = setting ? args[1] : null;
     if (!['list', 'set-kind'].includes(verb) || (setting && projectNameError(name))) {
@@ -1125,7 +1109,7 @@ function cmdProjectKinds(args) {
       });
       console.log(JSON.stringify({ ...PROJECT_KINDS_API, ok: true, home: slash(h.dir), projects })); return;
     }
-    requireProjectKindOwner(h);
+    // This local preference changes future admissions only, never ownership or tasks.
     const registered = registeredProject(h, name);
     if (!registered) localSettingRefuse('project-missing', 'The project is not registered.');
     const expected = options.get('--expected-path');
@@ -1140,7 +1124,6 @@ function cmdProjectKinds(args) {
     if (!pathMatches(registered)) localSettingRefuse('project-changed', 'The project folder changed; refresh before trying again.');
     if (!projectKindAvailable(kind, registered.path)) localSettingRefuse('kind-unavailable', 'The selected kind requires an available delivery tool or gate tool and remote.');
     const changed = withRegistry(h, () => {
-      requireProjectKindOwner(h);
       const current = registeredProject(h, name);
       if (!current) localSettingRefuse('project-missing', 'The project is not registered.');
       if (!pathMatches(current) || current.path !== registered.path) localSettingRefuse('project-changed', 'The project folder changed; refresh before trying again.');

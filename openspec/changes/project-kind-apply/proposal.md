@@ -9,7 +9,8 @@ Herdr Settings cannot change a project's delivery kind while another coordinator
 - Allow the existing guarded kind-only setter from a local non-owner without reading, taking over or changing ownership or running work; advertise this permission through an additive capability.
 - Resolve effective delivery kind consistently for JSON listing and new task admission, with explicit kind choices winning over detection and list metadata distinguishing explicit choices, legacy overrides and automatic detection.
 - Freeze the resolved kind at task reservation so concurrent settings changes, copy allocation, review, land and relaunch cannot reinterpret existing work.
-- Document the source-folder detection rule, unchanged registration safeguards and owner-only work control; add fake-home regressions for selection, ordering and preservation.
+- Detect automatic kinds from the published-default snapshot used for a fresh delivery copy, exposing registered-checkout staleness separately rather than showing a misleading local kind.
+- Document detection, unchanged registration safeguards and owner-only work control; add fake-home regressions for selection, staleness, ordering and preservation.
 
 ## Capabilities
 

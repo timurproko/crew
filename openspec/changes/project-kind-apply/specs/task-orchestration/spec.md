@@ -31,7 +31,7 @@ Crew SHALL permit only one live coordinator to control work in a home, including
 
 ### Requirement: Workflow detection uses repository signals
 
-Crew SHALL recognize shared delivery from repository instructions, its named change-delivery skill or shared delivery caller workflow, not a project name. Listing and ship admission SHALL use the same registered-folder detection and available tools. Explicit kind SHALL win, followed by legacy gate/workflow precedence. Without a choice, detection SHALL be refreshed for each admission. Detection SHALL NOT rewrite registrations or reinterpret admitted tasks from their allocated copies.
+Crew SHALL recognize shared delivery from repository instructions, its named change-delivery skill or shared delivery caller workflow, not a project name. Listing and ship admission SHALL inspect the same allocation-source snapshot and available tools. Explicit kind SHALL win, followed by legacy gate/workflow precedence. Without a choice, detection SHALL be refreshed for each admission. Detection SHALL NOT rewrite registrations or reinterpret admitted tasks from their allocated copies.
 
 #### Scenario: Source repository is added without an override
 
@@ -46,7 +46,7 @@ Crew SHALL recognize shared delivery from repository instructions, its named cha
 #### Scenario: Registered folder and allocated copy disagree
 
 - **WHEN** the registered folder resolves to Plain but a newly allocated published-default copy contains delivery instructions, or the reverse
-- **THEN** the admitted task retains the kind resolved from the registered folder, matching JSON listing under unchanged inputs rather than silently switching in the copy
+- **THEN** JSON listing and the admitted task both use the published-default snapshot when delivery allocates from origin, with registered-checkout staleness exposed separately rather than substituting the local kind
 
 ### Requirement: Project kinds are discoverable and authoritative
 
@@ -61,6 +61,16 @@ Crew SHALL expose home-free project-kinds version-one capability JSON from proje
 
 - **WHEN** an explicit workflow or gate selection lacks its required tool or gate remote
 - **THEN** selection or spawn refuses clearly rather than silently delivering as Plain or another mode, and listing retains that explicit kind with unavailable status
+
+#### Scenario: Registered checkout is behind published default
+
+- **WHEN** the registered HEAD is a strict ancestor of the published default and its delivery signals differ
+- **THEN** listing reports the published snapshot's effective kind and checkoutStale true; spawn captures that same kind under unchanged inputs
+
+#### Scenario: Published automatic selection cannot be established
+
+- **WHEN** delivery uses origin but its default head or required objects cannot be read within bounded operations
+- **THEN** automatic listing and admission refuse kind-unavailable rather than advertising or launching a guessed Plain task
 
 #### Scenario: Choice and detection are distinguishable
 

@@ -706,7 +706,7 @@ gapTests['project-kinds'] = () => {
   const beforeProbe = readWorld().log.length;
   for (const args of [['project', '--capabilities', '--json'], ['--capabilities', '--json']]) {
     const r = crew(args, { cwd: root }); assert.equal(r.code, 0, r.out);
-    assert.deepEqual(JSON.parse(r.out), { capability: 'project-kinds', version: 1, listJson: true, setKind: true, explicitHome: true, expectedPath: true, kinds: ['workflow', 'plain', 'gate'] });
+    assert.deepEqual(JSON.parse(r.out), { capability: 'project-kinds', version: 1, listJson: true, setKind: true, setKindLocal: true, explicitHome: true, expectedPath: true, kinds: ['workflow', 'plain', 'gate'] });
   }
   assert.equal(readWorld().log.length, beforeProbe, 'Discovery never queries Core or opens a home');
   let r = json(['project', 'list', '--json']); assert.equal(r.code, 0, r.out);
@@ -738,10 +738,23 @@ gapTests['project-kinds'] = () => {
   refusal(setArgs('plain', 'demo', f.repo, 'relative'), 'invalid-arguments');
   const empty = path.join(f.dir, 'empty'); fs.mkdirSync(empty);
   refusal(setArgs('plain', 'demo', f.repo, empty), 'home-missing'); assert.deepEqual(fs.readdirSync(empty), []);
+  const beforeExternal = readWorld().log.length;
   const external = crew(setArgs(), { cwd: root, env: f.env });
-  assert.equal(external.code, 3, external.out); assert.equal(JSON.parse(external.out).error.code, 'home-owned');
-  assert.equal(snapshot(), noOp, 'Another terminal cannot change kind');
-  fs.writeFileSync(ownerFile, '{bad'); refusal(setArgs(), 'home-owned'); fs.writeFileSync(ownerFile, owner);
+  assert.equal(external.code, 0, external.out); assert.equal(JSON.parse(external.out).changed, false);
+  assert.equal(snapshot(), noOp, 'A non-owner no-op does not rewrite registration');
+  for (const metadata of ['{bad', JSON.stringify({ terminal: 'unverifiable-old-owner' })]) {
+    fs.writeFileSync(ownerFile, metadata);
+    const r = crew(setArgs('workflow'), { cwd: root, env: f.env }); assert.equal(r.code, 0, r.out);
+    assert.equal(fs.readFileSync(ownerFile, 'utf8'), metadata);
+    assert.equal(fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8'), historical);
+    assert.equal(crew(setArgs(), { cwd: root, env: f.env }).code, 0);
+  }
+  assert.equal(readWorld().log.length, beforeExternal, 'Local kind edits never query or control Core');
+  fs.writeFileSync(ownerFile, owner);
+  for (const args of [['spawn', 'not-owner', '--project', 'demo', 'Count.'], ['stop', old.id], ['finish', old.id], ['end']]) {
+    const r = crew(args, { cwd: f.home, env: f.env }); assert.equal(r.code, 3, r.out);
+  }
+  assert.equal(fs.readFileSync(ownerFile, 'utf8'), owner);
   fs.writeFileSync(path.join(f.home, 'projects.lock'), '{}');
   try { refusal(setArgs('workflow'), 'registry-busy'); } finally { fs.unlinkSync(path.join(f.home, 'projects.lock')); }
   // Existing shared initialized-home validation is also used by this API. A hard
