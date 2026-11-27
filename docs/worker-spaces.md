@@ -66,6 +66,7 @@ entire recorded identity tuple. The publisher can reconcile its own settled fail
 nonce matches fail closed before any terminal is adopted or stopped. Reconciled addresses enter
 the durable owned-terminal history under the placement gate. A normal acknowledgement records
 ownership before final working-state publication, and stale task saves retain launch authority.
+Acknowledgment rereads the task before storing its address, retaining an already accepted report.
 
 Allocator and initial Core stdout are also kept as task-folder receipts. Recovery validates an
 unpublished delivery copy against the project's Git common directory. Unverified copy receipts
@@ -95,7 +96,10 @@ dying inside the acknowledgement/publication task transaction, not only during a
 contender can unlink that nonce; removal of the now-empty directory is non-recursive, so a new
 populated live gate cannot be deleted by a delayed reclaimer. A reclaimer interrupted after
 unlinking its nonce leaves an empty, safely removable gate, not another permanent reservation.
-Release retires the owned directory before deleting it privately. Live, unverifiable and old
+Release retires the owned directory before deleting it privately. Transient Windows sharing
+errors retry retirement for up to one second with the same populated claim intact; exhaustion
+refuses with the claim retained for later proven-dead recovery, never shared-path deletion.
+Live, unverifiable and old
 file-format gates are never stolen by PID/age guesses. This intentionally serializes terminal
 transitions within a home, so slow cleanup can require another command to retry. Registry locks
 remain regular files with complete OS identity and claim nonce. Under the placement gate, a dead

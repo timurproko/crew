@@ -583,7 +583,21 @@ function withOwnedProcessLock(lock, action, { observation = false, waitMs = 2000
   } finally {
     // A live owner's nonce cannot be reclaimed. Retire its entire directory
     // before deleting privately, so contenders never mistake release for death.
-    if (acquired) { placementGates.delete(lock); fs.renameSync(lock, candidate); }
+    if (acquired) {
+      placementGates.delete(lock);
+      const deadline = Date.now() + 1000;
+      for (;;) {
+        try { fs.renameSync(lock, candidate); break; }
+        catch (error) {
+          if (!WINDOWS || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) refuse(`worker-space-busy: cannot retire owned lock ${slash(lock)} (${error.code}); the operation may have completed. The populated claim is retained; retry after this writer exits.`, 4);
+          // Keep the same populated claim through transient Windows sharing.
+          // Never unlink it or recursively remove the shared path to release.
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(20, remaining));
+        }
+      }
+    }
     fs.rmSync(candidate, { recursive: true, force: true });
   }
 }
@@ -1741,6 +1755,9 @@ function launchTaskTerminal(h, task, pick, instruction, persist, receipt) {
     workerSpace: intent.workerSpace, nonce: intent.nonce, receipt });
   const address = started.value?.address, acknowledged = started.code === 0 && typeof address === 'string' && /^[a-zA-Z0-9-]+$/.test(address);
   if (acknowledged) {
+    // Record the address without overwriting a report accepted during Core's
+    // call. The later publication reread cannot restore state lost here.
+    task = { ...task, ...readJson(taskFile(h, task.id)) };
     task = { ...task, agent: pick.harness, terminal: address, terminals: launchedTerminals(task, address, pick.harness),
       terminalLaunches: task.terminalLaunches.map(item => item.nonce === intent.nonce ? { ...item, address } : item) };
     persist(task);

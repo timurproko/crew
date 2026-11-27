@@ -1379,7 +1379,7 @@ function assertClaudePermissionLine(line, auto = true) {
   assert.ok(!line.includes('skip-permissions'), 'A worker is never started with its permission checks switched off');
 }
 gapTests['launch-commandline'] = () => {
-  const before = fs.readFileSync(world, 'utf8');
+  const before = fs.readFileSync(world, 'utf8'), sharedConfig = fs.readFileSync(claudeConfig, 'utf8');
   try {
     const f = joinSpaceFixture('launch-commandline');
     const bash = WINDOWS ? 'C:/Program Files/Git/bin/bash.exe' : 'bash';
@@ -1387,7 +1387,7 @@ gapTests['launch-commandline'] = () => {
     fs.writeFileSync(oldClaude, `if(process.argv.includes('--version') && process.argv.includes('auto')){console.error("error: option '--permission-mode <mode>' argument 'auto' is invalid. Allowed choices are acceptEdits, bypassPermissions, default, plan.");process.exit(1);}console.log('1.0.0 (Claude Code)');`);
     for (const id of ['pi', 'claude', 'claude-old']) {
       const harness = id === 'pi' ? 'pi' : 'claude';
-      const result = f.call(['spawn', id, '--project', 'demo', '--agent', harness, 'Count.'], id === 'claude-old' ? { CREW_TOOL_CLAUDE: oldClaude } : {}); assert.equal(result.code, 0, result.out);
+      const result = f.call(['spawn', id, '--project', 'demo', '--agent', harness, 'Count.'], { CREW_CLAUDE_CONFIG: path.join(f.dir, 'claude.json'), ...(id === 'claude-old' ? { CREW_TOOL_CLAUDE: oldClaude } : {}) }); assert.equal(result.code, 0, result.out);
       const task = f.task(id), nonce = task.terminalLaunches.at(-1).nonce;
       const line = readWorld().log.filter(args => args[0] === 'run').at(-1).at(-1);
       const check = `${shq(bashPath(process.execPath))} ${shq(bashPath(path.join(here, 'crew.mjs')))} _launch-check ${shq(task.id)} ${shq(nonce)}`;
@@ -1400,6 +1400,22 @@ gapTests['launch-commandline'] = () => {
       const denied = spawnSync(bash, ['--noprofile', '--norc', '-c', blocked], { cwd: task.worktree, encoding: 'utf8', env: { ...process.env, HOME: fakeUser, USERPROFILE: fakeUser, TMPDIR: root } });
       assert.equal(denied.status, 0, denied.stderr); assert.equal(denied.stdout, '', 'No agent/fallback executes after nonce denial');
     }
+    assert.equal(fs.readFileSync(claudeConfig, 'utf8'), sharedConfig, 'Focused launches cannot leak Claude trust entries into the main suite');
+  } finally { fs.writeFileSync(world, before); }
+};
+gapTests['launch-report-during-core'] = async () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    const f = joinSpaceFixture('early-report'), script = path.join(f.dir, 'report-before-ack.mjs');
+    fs.writeFileSync(script, `import fs from 'node:fs';import {spawnSync} from 'node:child_process';import assert from 'node:assert/strict';
+const args=process.argv.slice(2),result=spawnSync(process.execPath,[${JSON.stringify(fake)},...args],{encoding:'utf8'});
+if(args[0]==='run'){const file=${JSON.stringify(path.join(f.home, 'tasks', 'early', 'task.json'))},task=JSON.parse(fs.readFileSync(file,'utf8'));assert.ok(task.terminalLaunches[0].nonce);fs.writeFileSync(task.report,'early');fs.writeFileSync(file,JSON.stringify({...task,state:'reported',reported:'early'}));}
+process.stdout.write(result.stdout??'');process.stderr.write(result.stderr??'');process.exitCode=result.status;`);
+    const result = await projectProcess(f, ['spawn', 'early', '--project', 'demo', '--agent', 'pi', 'Count.'], { terminal: 'owner-spaces-early-report', env: { ...f.env, CREW_HC: script } }).result;
+    assert.equal(result.code, 0, result.out);
+    const task = f.task('early');
+    assert.deepEqual([task.state, task.reported, Boolean(task.terminal)], ['reported', 'early', true]);
+    assert.equal(task.terminalLaunches[0].address, task.terminal); assert.equal(task.terminals[0].address, task.terminal);
   } finally { fs.writeFileSync(world, before); }
 };
 gapTests['launch-nonce-recovery'] = async () => {
@@ -1615,6 +1631,46 @@ fs.unlinkSync=(file,...args)=>{if(!paused && String(file).endsWith('projects.loc
 const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));`);
   return { ready, release, script };
 }
+gapTests['lock-release-sharing'] = async () => {
+  if (!WINDOWS) return; // Windows directory retirement can fail on transient sharing.
+  const f = joinSpaceFixture('release-sharing'), task = f.spawn('working');
+  const file = path.join(f.home, 'tasks', task.id, 'task.json');
+  const locks = [path.join(f.home, 'worker-spaces.lock'), `${file}.lock`, `${file}.lifecycle.lock`];
+  for (const [index, lock] of locks.entries()) {
+    const script = path.join(f.dir, `release-${index}.mjs`), proof = path.join(f.dir, `release-${index}.json`);
+    fs.writeFileSync(script, `import fs from 'node:fs';import path from 'node:path';import assert from 'node:assert/strict';
+const rename=fs.renameSync,rm=fs.rmSync,lock=${JSON.stringify(lock)},errors=['EPERM','EACCES','EBUSY'];let attempts=0,claim;
+fs.rmSync=(file,...args)=>{assert.notEqual(file,lock,'Never recursively remove the shared lock');return rm(file,...args);};
+fs.renameSync=(from,to,...args)=>{
+  if(from===lock){
+    const files=fs.readdirSync(lock);assert.equal(files.length,1);const current=fs.readFileSync(path.join(lock,files[0]),'utf8');
+    claim??=current;assert.equal(current,claim,'Claim stays populated and unchanged until retirement');assert.equal(JSON.parse(current).pid,process.pid);
+    const code=errors[attempts++];if(code)throw Object.assign(Error('injected release sharing'),{code});
+  }
+  return rename(from,to,...args);
+};const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));
+fs.writeFileSync(${JSON.stringify(proof)},JSON.stringify({attempts,claim}));`);
+    const result = await projectProcess(f, ['done', task.id], { script, terminal: task.terminal, env: f.env }).result;
+    assert.equal(result.code, 2, result.out); assert.match(result.out, /Write your result/);
+    assert.doesNotMatch(result.out, /internal error/);
+    assert.equal(JSON.parse(fs.readFileSync(proof)).attempts, 4, 'All three sharing codes retry before atomic retirement');
+    assert.ok(!fs.existsSync(lock)); assert.equal(f.task(task.id).state, 'working');
+  }
+  const script = path.join(f.dir, 'release-exhausted.mjs'), lock = locks[0], proof = path.join(f.dir, 'exhausted.json');
+  fs.writeFileSync(script, `import fs from 'node:fs';import path from 'node:path';import assert from 'node:assert/strict';
+const rename=fs.renameSync,rm=fs.rmSync,clock=Date.now,lock=${JSON.stringify(lock)};let attempts=0,offset=0,claim;
+Date.now=()=>clock()+offset;
+fs.rmSync=(file,...args)=>{assert.notEqual(file,lock);return rm(file,...args);};
+fs.renameSync=(from,to,...args)=>{if(from===lock){const files=fs.readdirSync(lock);assert.equal(files.length,1);const current=fs.readFileSync(path.join(lock,files[0]),'utf8');claim??=current;assert.equal(current,claim);attempts++;offset+=600;throw Object.assign(Error('persistent release sharing'),{code:'EPERM'});}return rename(from,to,...args);};
+const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));fs.writeFileSync(${JSON.stringify(proof)},JSON.stringify({attempts,claim}));`);
+  const refused = await projectProcess(f, ['done', task.id], { script, terminal: task.terminal, env: f.env }).result;
+  assert.equal(refused.code, 4, refused.out); assert.match(refused.out, /cannot retire owned lock.*EPERM/); assert.doesNotMatch(refused.out, /internal error/);
+  const exhausted = JSON.parse(fs.readFileSync(proof)); assert.equal(exhausted.attempts, 2, 'Persistent errors stop at the bounded retirement deadline');
+  assert.equal(fs.readFileSync(path.join(lock, fs.readdirSync(lock)[0]), 'utf8'), exhausted.claim, 'Exhaustion leaves the populated ownership proof, not an empty or deleted gate');
+  assert.equal(spawnerState(JSON.parse(exhausted.claim)), 'dead');
+  const recovered = await projectProcess(f, ['done', task.id], { terminal: task.terminal, env: f.env }).result;
+  assert.equal(recovered.code, 2, recovered.out); assert.match(recovered.out, /Write your result/); assert.ok(!fs.existsSync(lock));
+};
 gapTests['preparation-recovery'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
   try {
