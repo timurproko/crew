@@ -662,11 +662,19 @@ function projectKindFixture(name) {
   fs.writeFileSync(delivery, `import fs from 'node:fs'; import path from 'node:path'; import {spawnSync} from 'node:child_process';
 const a=process.argv.slice(2); if(a[0]!=='start')process.exit(1);
 const detached=a[1]==='--detach', key=detached?a[2]:a[1], copy=path.join(${JSON.stringify(f.dir)},'delivery-copies',key.replaceAll('/','-'));
-const r=spawnSync('git',['worktree','add',...(detached?['--detach']:['-b',key]),copy,'HEAD'],{encoding:'utf8'});
+let from='HEAD';
+if(spawnSync('git',['remote','get-url','origin']).status===0){
+  let branch=spawnSync('git',['symbolic-ref','--short','refs/remotes/origin/HEAD'],{encoding:'utf8'}).stdout.trim().replace(/^origin\\//,'');
+  if(!branch)branch=/^ref: refs\\/heads\\/(.+)\\tHEAD$/m.exec(spawnSync('git',['ls-remote','--symref','origin','HEAD'],{encoding:'utf8'}).stdout)?.[1];
+  if(spawnSync('git',['fetch','--quiet','origin',branch]).status!==0)process.exit(1);from='origin/'+branch;
+}
+if(process.env.KIND_COPY_READY){fs.writeFileSync(process.env.KIND_COPY_READY,'ready');while(!fs.existsSync(process.env.KIND_COPY_RELEASE))Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}
+const r=spawnSync('git',['worktree','add',...(detached?['--detach']:['-b',key]),copy,from],{encoding:'utf8'});
 if(r.status!==0){console.error(r.stderr);process.exit(1);}console.log(JSON.stringify({path:copy,created:true}));`);
   const env = { CREW_TOOL_DELIVERY: delivery };
   const call = (args, extra = {}) => f.call(args, { ...env, ...extra });
-  return { ...f, call, env, delivery, owner: `owner-kinds-${name}` };
+  const spawn = (id, flags = []) => { const r = call(['spawn', id, '--project', 'demo', ...flags, 'Count lines.']); assert.equal(r.code, 0, r.out); return f.task(id); };
+  return { ...f, call, spawn, env, delivery, owner: `owner-kinds-${name}` };
 }
 gapTests['workflow-detection'] = () => {
   for (const signal of ['skill', 'caller']) {
@@ -706,12 +714,12 @@ gapTests['project-kinds'] = () => {
   const beforeProbe = readWorld().log.length;
   for (const args of [['project', '--capabilities', '--json'], ['--capabilities', '--json']]) {
     const r = crew(args, { cwd: root }); assert.equal(r.code, 0, r.out);
-    assert.deepEqual(JSON.parse(r.out), { capability: 'project-kinds', version: 1, listJson: true, setKind: true, setKindLocal: true, explicitHome: true, expectedPath: true, kinds: ['workflow', 'plain', 'gate'] });
+    assert.deepEqual(JSON.parse(r.out), { capability: 'project-kinds', version: 1, listJson: true, setKind: true, setKindLocal: true, kindSource: true, checkoutStale: true, explicitHome: true, expectedPath: true, kinds: ['workflow', 'plain', 'gate'] });
   }
   assert.equal(readWorld().log.length, beforeProbe, 'Discovery never queries Core or opens a home');
   let r = json(['project', 'list', '--json']); assert.equal(r.code, 0, r.out);
   const home = slash(fs.realpathSync(f.home));
-  assert.deepEqual(r.value, { capability: 'project-kinds', version: 1, ok: true, home, projects: [{ name: 'demo', path: slash(f.repo), kind: 'plain' }] });
+  assert.deepEqual(r.value, { capability: 'project-kinds', version: 1, ok: true, home, projects: [{ name: 'demo', path: slash(f.repo), kind: 'plain', kindSource: 'detected', available: true, checkoutStale: false }] });
   const old = f.spawn('historical', ['--kind', 'ship', '--agent', 'pi']);
   const historical = fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8');
   const config = read(); config.future = { keep: true };
@@ -809,6 +817,109 @@ gapTests['project-kinds-concurrency'] = async () => {
     const config = JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8'));
     assert.ok(config.projects.other); assert.equal(config.workerSpaceMode, 'per-project'); assert.equal(config.projects.demo.kind, 'workflow');
   } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+};
+
+gapTests['project-kind-snapshots'] = () => {
+  const signal = '# Agent instructions\nThis file is `templates/AGENTS.md` of `example/workflow`.\n';
+  for (const localWorkflow of [false, true]) {
+    const f = projectKindFixture(`snapshot-${localWorkflow}`);
+    if (localWorkflow) commit(f.repo, { 'AGENTS.md': signal }, 'local workflow');
+    const origin = path.join(f.dir, 'origin.git'), peer = path.join(f.dir, 'peer');
+    git('clone', '--bare', '-q', f.repo, origin); git('-C', f.repo, 'remote', 'add', 'origin', origin);
+    git('clone', '-q', origin, peer);
+    if (localWorkflow) { git('-C', peer, 'rm', 'AGENTS.md'); git('-C', peer, ...who, 'commit', '-qm', 'published plain'); }
+    else commit(peer, { 'AGENTS.md': signal }, 'published workflow');
+    git('-C', peer, 'push', '-q', 'origin', 'HEAD');
+    const before = git('-C', f.repo, 'show-ref'), head = git('-C', f.repo, 'rev-parse', 'HEAD');
+    const fetchHead = path.join(f.repo, '.git', 'FETCH_HEAD'); fs.writeFileSync(fetchHead, 'sentinel\n');
+    const n = readWorld().log.length, listed = f.call(['project', 'list', '--json']); assert.equal(listed.code, 0, listed.out);
+    const item = JSON.parse(listed.out).projects[0], expected = localWorkflow ? 'plain' : 'workflow';
+    assert.deepEqual(item, { name: 'demo', path: slash(f.repo), kind: expected, kindSource: 'detected', available: true, checkoutStale: true });
+    assert.equal(readWorld().log.length, n, 'List never consults Core');
+    assert.equal(git('-C', f.repo, 'show-ref'), before, 'Object fetch never moves refs');
+    assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD'), head); assert.equal(fs.readFileSync(fetchHead, 'utf8'), 'sentinel\n');
+    assert.equal(git('-C', f.repo, 'status', '--porcelain'), '');
+    const t = f.spawn('published', ['--kind', 'ship', '--agent', 'pi']);
+    assert.equal(t.deliveryKind, expected); assert.equal(t.workflow, localWorkflow ? undefined : 'delivery');
+    assert.equal(fs.existsSync(path.join(t.worktree, 'AGENTS.md')), !localWorkflow);
+    const status = JSON.parse(f.call(['status', '--json']).out).tasks.find(t => t.id === 'published'); assert.equal(status.deliveryKind, item.kind);
+    // A local branch ahead/diverged is not falsely advertised as strictly behind.
+    commit(f.repo, { 'local.txt': 'local branch\n' }, 'local change');
+    assert.equal(JSON.parse(f.call(['project', 'list', '--json']).out).projects[0].checkoutStale, false);
+    git('-C', f.repo, 'remote', 'set-url', 'origin', path.join(f.dir, 'missing-origin'));
+    const failed = f.call(['project', 'list', '--json']); assert.equal(failed.code, 2, failed.out); assert.equal(JSON.parse(failed.out).error.code, 'kind-unavailable');
+    const spawn = f.call(['spawn', 'unresolved', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(spawn.code, 4, spawn.out); assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'unresolved')));
+    const set = f.call(['project', 'set-kind', 'demo', '--kind', 'plain', '--home', f.home, '--expected-path', f.repo, '--json']); assert.equal(set.code, 0, set.out);
+    const explicit = JSON.parse(f.call(['project', 'list', '--json']).out).projects[0];
+    assert.deepEqual(explicit, { name: 'demo', path: slash(f.repo), kind: 'plain', kindSource: 'explicit', available: true, checkoutStale: null });
+  }
+  const f = projectKindFixture('snapshot-legacy');
+  assert.equal(f.call(['project', 'add', 'demo', f.repo, '--workflow', 'plain']).code, 0);
+  const item = JSON.parse(f.call(['project', 'list', '--json']).out).projects[0]; assert.equal(item.kindSource, 'legacy');
+  assert.equal(item.kind, 'plain'); assert.equal(item.checkoutStale, null);
+  assert.equal(f.call(['project', 'set-kind', 'demo', '--kind', 'workflow', '--home', f.home, '--expected-path', f.repo, '--json']).code, 0);
+  const unavailable = f.call(['project', 'list', '--json'], { CREW_TOOL_DELIVERY: '' }); assert.equal(unavailable.code, 0, unavailable.out);
+  assert.equal(JSON.parse(unavailable.out).projects[0].kind, 'workflow'); assert.equal(JSON.parse(unavailable.out).projects[0].available, false);
+};
+
+gapTests['project-kind-ordering'] = async () => {
+  for (const phase of ['before', 'allocation']) {
+    const f = projectKindFixture(`ordering-${phase}`), gate = projectBarrier(f, 'before', 'kind-reserve');
+    const ready = phase === 'before' ? gate.ready : path.join(f.dir, 'copy-ready'), release = phase === 'before' ? gate.release : path.join(f.dir, 'copy-release');
+    const env = { ...f.env, ...(phase === 'allocation' ? { KIND_COPY_READY: ready, KIND_COPY_RELEASE: release } : {}) };
+    const pending = projectProcess(f, ['spawn', 'racing', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { env, terminal: f.owner, ...(phase === 'before' ? { script: gate.script } : {}) });
+    try {
+      await until(() => fs.existsSync(ready));
+      if (phase === 'allocation') assert.equal(f.task('racing').deliveryKind, 'plain', 'Preparing reservation already freezes Plain');
+      const args = ['project', 'set-kind', 'demo', '--kind', 'workflow', '--home', f.home, '--expected-path', f.repo, '--json'];
+      const r = crew(args, { cwd: root, env: f.env }); assert.equal(r.code, 0, r.out);
+      fs.writeFileSync(release, 'go'); const launched = await pending.result; assert.equal(launched.code, 0, launched.out);
+      assert.equal(f.task('racing').deliveryKind, phase === 'before' ? 'workflow' : 'plain');
+      assert.equal(f.task('racing').workflow, phase === 'before' ? 'delivery' : undefined);
+      const later = f.spawn('later', ['--kind', 'ship', '--agent', 'pi']); assert.equal(later.deliveryKind, 'workflow');
+      const brief = fs.readFileSync(f.task('racing').brief, 'utf8');
+      if (phase === 'before') assert.match(brief, /then STOP/); else assert.ok(!brief.includes('then STOP'));
+    } finally { fs.writeFileSync(release, 'go'); await pending.result; }
+  }
+};
+
+gapTests['project-kind-lifecycle'] = () => {
+  const tools = projectKindFixture('lifecycle-tools'), gate = path.join(tools.dir, 'no-mistakes.mjs'); fs.writeFileSync(gate, 'process.exit(0);');
+  const env = { ...tools.env, CREW_TOOL_NO_MISTAKES: gate, CREW_NO_QUOTA: '1', CREW_RECOVERY_SECONDS: '0' };
+  const f = reviewLabelsFixture('kind-lifecycle', env), registry = path.join(f.home, 'crew.json');
+  git('-C', f.repo, 'remote', 'add', 'no-mistakes', f.repo);
+  const set = kind => {
+    const r = crew(['project', 'set-kind', 'demo', '--kind', kind, '--home', f.home, '--expected-path', f.repo, '--json'], { cwd: root, env });
+    assert.equal(r.code, 0, r.out);
+  };
+  for (const kind of ['plain', 'workflow', 'gate']) {
+    set(kind); const t = f.spawn(`old-${kind}`, ['--kind', 'ship', '--agent', 'pi']);
+    const brief = fs.readFileSync(t.brief, 'utf8'), taskFile = path.join(f.home, 'tasks', t.id, 'task.json');
+    const taskBytes = fs.readFileSync(taskFile, 'utf8'), ownerFile = path.join(f.home, 'owner.json'), owner = fs.readFileSync(ownerFile, 'utf8');
+    const next = kind === 'plain' ? 'workflow' : 'plain', n = readWorld().log.length; set(next);
+    assert.equal(readWorld().log.length, n); assert.equal(fs.readFileSync(taskFile, 'utf8'), taskBytes); assert.equal(fs.readFileSync(ownerFile, 'utf8'), owner);
+    const check = () => {
+      const current = f.task(t.id); assert.equal(current.workflow, kind === 'workflow' ? 'delivery' : undefined);
+      assert.equal(current.gate, kind === 'gate' ? 'no-mistakes' : undefined); assert.equal(fs.readFileSync(current.brief, 'utf8'), brief);
+      const status = JSON.parse(f.call(['status', '--json']).out).tasks.find(item => item.id === t.id); assert.equal(status.deliveryKind, kind);
+      assert.equal(JSON.parse(fs.readFileSync(registry)).projects.demo.kind, next);
+    };
+    check(); let r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'manual']); assert.equal(r.code, 0, r.out); check();
+    // Legacy records also keep their existing fields rather than consulting today's registration.
+    const current = f.task(t.id), { deliveryKind, ...legacy } = current;
+    f.save({ ...legacy, candidates: [{ harness: 'pi', model: 'manual' }, { harness: 'pi', model: 'automatic' }], chain: [{ harness: 'pi', model: 'automatic' }] });
+    setTerminal(current.terminal, { status: { state: 'idle', app: 'pi' }, screen: 'quota exhausted' });
+    r = f.call(['wait', t.id, '--timeout', '0.2']); assert.equal(r.code, 124, r.out); assert.notEqual(f.task(t.id).terminal, current.terminal, r.out); check();
+    commit(t.worktree, { [`${kind}.txt`]: 'implemented\n' }, `fix: implement ${kind}`);
+    reviewRemote(f, f.task(t.id)); f.control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim(), branch: t.branch });
+    r = f.done(f.task(t.id), kind === 'plain' ? 'Done.' : kind === 'workflow' ? 'Implementation: https://github.com/acme/demo/pull/42' : 'https://github.com/acme/demo/pull/42'); assert.equal(r.code, 0, r.out); check();
+    // Reported tasks must also remain byte-identical during a fresh setting write.
+    const reported = fs.readFileSync(taskFile, 'utf8'); set(kind); set(next); assert.equal(fs.readFileSync(taskFile, 'utf8'), reported);
+    const review = f.start(t.id).task; assert.equal(review.kind, 'scout'); check();
+    r = f.call(['land', t.id]); assert.equal(r.code, 0, r.out); check();
+    assert.match(r.out, kind === 'gate' ? /through no-mistakes/ : kind === 'workflow' ? /repository's delivery workflow/ : /against .* commit/);
+  }
 };
 
 gapTests['project-kind-paths'] = async () => {

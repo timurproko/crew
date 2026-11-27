@@ -156,8 +156,12 @@ PID. Registry format stays version 1.
 
 `crew project --capabilities --json` (also `crew --capabilities --json`) advertises
 `project-kinds` v1 without opening a home. `crew project list --json` returns the canonical
-home and each project's authoritative `workflow`, `plain` or `gate` selection; clients must
-not infer Plain from a missing legacy override.
+home and each project's authoritative `workflow`, `plain` or `gate` selection, with
+`kindSource` (`explicit`, `legacy`, `detected`), `available` and separate `checkoutStale`
+metadata; clients must not infer Plain from a missing legacy override. An automatic kind uses
+the published-default snapshot that delivery allocates, not a stale registered checkout.
+Thus a checkout behind published delivery instructions lists Workflow and `checkoutStale:true`,
+and the next spawn uses Workflow too. Unresolvable automatic snapshots refuse rather than guess.
 
 ```text
 crew project set-kind myworkflows --kind workflow --home C:/Users/me/.crew --expected-path D:/Git/MyWorkflows --json
@@ -477,7 +481,10 @@ the following precedence describes legacy registrations without that selection:
   `skills/change-delivery/SKILL.md` skill or a shared delivery caller workflow under
   `.github/workflows/`. This includes the workflow's own source repository, under any
   registered name. Herdr Add project calls the same CLI add without a workflow flag;
-  automatic detection is rechecked in the allocated copy on spawn, not frozen at add. `--workflow plain` turns that off, not a selected
+  automatic detection is rechecked against the allocation-source snapshot at admission, not
+  frozen at add or reinterpreted after allocation. JSON listing uses that same resolver and
+  reports checkout staleness separately. With delivery and origin this is published default;
+  without origin it is committed local HEAD. `--workflow plain` turns that off, not a selected
   gate for legacy registrations. When a new repository signal appears, spawn prints one concise detection line;
   an explicit Plain choice remains Plain with an advisory. Detection never rewrites the
   registration or an older task's delivery records. Re-adding a project replaces its registration: omitted `--workflow` and `--gate-skip`

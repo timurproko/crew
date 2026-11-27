@@ -8,11 +8,11 @@
 
 ## 2. Listed effective kinds match immutable new-task selections
 
-- [ ] 2.1 Share allocation-source effective-kind resolution between JSON list and admission, adding kindSource, available and checkoutStale metadata plus capability flags; fake tests cover published-default signals, stale checkout, explicit choices, legacy overrides, gate precedence and unavailable selections.
-- [ ] 2.2 Save delivery selection with the preparing reservation after a fresh locked registration recheck, and use it for brief/launch rather than allocated-copy re-detection; barriers prove setter-before and setter-after ordering without coordinator restart.
-- [ ] 2.3 Add fake delivery allocation cases with contradictory registered-folder and copy signals in both directions; workflow-detection cases assert list kind, brief, task fields and status agree without registry rewrites.
-- [ ] 2.4 Exercise running and reported Plain, Workflow and Gate tasks through kind changes, review, land, relaunch and automatic hand-over using fake Core/GitHub; original task delivery and briefs remain stable, including legacy task records.
-- [ ] 2.5 Update docs/project-kinds.md and README with selection provenance, published-default detection and checkout staleness, explicit-choice precedence, immutable task behavior and the checkout/copy mismatch explanation; all documented fields match contract tests.
+- [x] 2.1 Share allocation-source effective-kind resolution between JSON list and admission, adding kindSource, available and checkoutStale metadata plus capability flags; fake tests cover published-default signals, stale checkout, explicit choices, legacy overrides, gate precedence and unavailable selections.
+- [x] 2.2 Save delivery selection with the preparing reservation after a fresh locked registration recheck, and use it for brief/launch rather than allocated-copy re-detection; barriers prove setter-before and setter-after ordering without coordinator restart.
+- [x] 2.3 Add fake delivery allocation cases with contradictory registered-folder and copy signals in both directions; workflow-detection cases assert list kind, brief, task fields and status agree without registry rewrites.
+- [x] 2.4 Exercise running and reported Plain, Workflow and Gate tasks through kind changes, review, land, relaunch and automatic hand-over using fake Core/GitHub; original task delivery and briefs remain stable, including legacy task records.
+- [x] 2.5 Update docs/project-kinds.md and README with selection provenance, published-default detection and checkout staleness, explicit-choice precedence, immutable task behavior and the checkout/copy mismatch explanation; all documented fields match contract tests.
 
 ## Workflow follow-up
 

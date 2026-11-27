@@ -15,7 +15,7 @@ crew --capabilities --json
 ```
 
 ```json
-{"capability":"project-kinds","version":1,"listJson":true,"setKind":true,"setKindLocal":true,"explicitHome":true,"expectedPath":true,"kinds":["workflow","plain","gate"]}
+{"capability":"project-kinds","version":1,"listJson":true,"setKind":true,"setKindLocal":true,"kindSource":true,"checkoutStale":true,"explicitHome":true,"expectedPath":true,"kinds":["workflow","plain","gate"]}
 ```
 
 Require the marker/version, existing safety flags, `setKindLocal:true` and all three kinds
@@ -33,7 +33,7 @@ Without `--home`, use normal Crew home discovery; the optional explicit form nev
 back to ambient discovery. The validated canonical home must already be initialized.
 
 ```json
-{"capability":"project-kinds","version":1,"ok":true,"home":"C:/Users/me/.crew","projects":[{"name":"myworkflows","path":"D:/Git/MyWorkflows","kind":"workflow"}]}
+{"capability":"project-kinds","version":1,"ok":true,"home":"C:/Users/me/.crew","projects":[{"name":"myworkflows","path":"D:/Git/MyWorkflows","kind":"workflow","kindSource":"detected","available":true,"checkoutStale":true}]}
 ```
 
 The complete array can be empty. Names and stored absolute paths retain exact registration
@@ -45,6 +45,44 @@ availability, legacy workflow overrides and repository detection itself. Never i
 missing workflow override as Plain in a client. Listing an explicit kind reports the saved
 selection even if its tool later becomes unavailable; a new spawn then refuses that selection,
 not silently switches kind. Restore the tool/remote or explicitly choose another kind.
+
+Additive v1 fields, advertised by `kindSource:true` and `checkoutStale:true` capabilities:
+
+- `kindSource`: `explicit` for a stored `kind`, `legacy` for the effective legacy workflow
+  override, or `detected` for automatic repository/gate selection. Legacy gate precedence is
+  retained, so an automatically selected gate has source `detected` even with a workflow override.
+- `available`: whether the selected kind's required tool/remote is available. An unavailable
+  explicit selection is still shown as selected; spawn refuses rather than substituting Plain.
+- `checkoutStale`: true when registered HEAD is a proven strict ancestor of the inspected
+  published default; false when inspected and not behind; null when not inspected or ancestry
+  cannot be established. It is advisory, never a delivery-kind override. Explicit and legacy
+  selections do not need remote snapshot inspection and normally return null.
+
+### The same kind as the next spawn
+
+Automatic listing and ship admission use one resolver. With `delivery` and an `origin`, it
+reads delivery's allocation source: the published default branch (recorded `origin/HEAD`, or
+remote HEAD when not recorded), not the registered checkout's possibly old instructions.
+Instruction headers, the named skill and delivery callers are read from that commit's blobs.
+Thus a stale registered Plain checkout whose fresh copy contains delivery signals is listed
+as Workflow with `checkoutStale:true`, and the next spawn uses Workflow. The reverse mismatch
+is handled identically. Without origin, committed local HEAD is the allocation source. Without
+delivery, automatic delivery is Plain unless a gate is available.
+
+Each snapshot resolution has a ten-second Git-operation budget, with subprocesses at most
+five seconds; signal reads are bounded to two seconds and 128 KiB each, with at most 100 caller
+files. A remote head lookup may fetch missing objects with no tags or FETCH_HEAD writes; it
+never updates checkout files, HEAD, index or tracking refs. These are Git reads/object retrieval,
+not Core queries, ownership operations or worker allocation. If a published automatic selection
+cannot be resolved, listing and spawn refuse `kind-unavailable` rather than inventing Plain.
+Explicit choices remain listable offline. No home, task or registration is written by listing.
+
+The effective kind predicts the next admission under unchanged registration, repository and
+tool inputs, not across intervening changes. At reservation, spawn rereads the registration
+under `projects.lock` and freezes the resolved delivery fields on the preparing task. Settings
+changes during later copy allocation cannot alter that task; review, land, relaunch and hand-over
+retain its original delivery, including old records with only workflow/gate fields. No bulk task
+migration, terminal restart or notification is required.
 
 ## Change only kind
 
@@ -102,7 +140,7 @@ use a fixed public message and never write crash data to an ambient/default home
 | `home-missing` | 2 | Explicit/default home is absent or not initialized. |
 | `project-missing` | 2 | Name is not registered. |
 | `project-changed` | 2 | Expected path differs, disappeared or changed before publication. |
-| `kind-unavailable` | 2 | Unknown kind or missing required tool/remote at selection. |
+| `kind-unavailable` | 2 | Unknown kind, missing required tool/remote, or unresolved automatic allocation source. |
 | `registry-busy` | 3 | Bounded registry lock contention; retry without removing the lock. |
 | `invalid-registry` | 2 | Malformed registry or invalid stored project identity/kind. |
 | `internal-error` | 4/70 | IO/locking or unexpected failure; success is not confirmed. |
@@ -117,5 +155,6 @@ optional explicit-home list, `invalid-registry` for corrupt stored data, and the
 transport remain Herdr responsibilities; tests use only fake homes, local repositories and Core.
 
 Focused tests: `node crew.test.mjs --gaps=workflow-detection`,
-`node crew.test.mjs --gaps=project-kinds`, `node crew.test.mjs --gaps=project-kinds-concurrency`
-and `node crew.test.mjs --gaps=project-kind-paths` (missing/file targets and locked disappearance).
+`node crew.test.mjs --gaps=project-kinds`, `node crew.test.mjs --gaps=project-kinds-concurrency`,
+`node crew.test.mjs --gaps=project-kind-paths`, `node crew.test.mjs --gaps=project-kind-snapshots`,
+`node crew.test.mjs --gaps=project-kind-ordering` and `node crew.test.mjs --gaps=project-kind-lifecycle`.

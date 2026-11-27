@@ -1040,8 +1040,8 @@ function cmdProject(args) {
   const skipAt = args.indexOf('--gate-skip'), skipText = skipAt < 0 ? null : String(args[skipAt + 1] ?? '');
   const gateSkip = skipText === null ? null : skipText === 'none' ? [] : skipText.split(',').map(s => s.trim()).filter(Boolean);
   if (gateSkip && (!skipText || gateSkip.some(s => !GATE_STEPS.includes(s)))) refuse(`--gate-skip takes ${GATE_STEPS.join(', ')} (comma-separated), or none. Push and pull request cannot be skipped: they are the delivery.`);
-  // Whether the project follows the shared delivery workflow, when detection cannot tell (see
-  // followsWorkflow). Like --gate-skip, it is part of the registration: re-adding without it drops it.
+  // Legacy workflow override. Like --gate-skip, it is part of the registration:
+  // re-adding without it drops it.
   const flowAt = args.indexOf('--workflow'), workflow = flowAt < 0 ? null : String(args[flowAt + 1] ?? '');
   if (workflow !== null && !WORKFLOWS.includes(workflow)) refuse(`--workflow takes ${WORKFLOWS.join(' or ')}.`);
   const folder = path.resolve(source);
@@ -1063,17 +1063,73 @@ function cmdProject(args) {
 }
 
 // A project follows the shared delivery workflow (the `change-delivery` skill) when it was
-// registered with `--workflow delivery`, or, without that choice, when its copy carries the
-// shared instructions. `delivery instructions` is strict (an older template or one stray
-// instruction file fails it), so the template's own header line in AGENTS.md also counts.
+// registered with `--workflow delivery`, or, without that choice, when its allocation
+// snapshot carries a repository signal. The shared header also covers older templates.
 const WORKFLOWS = ['delivery', 'plain'];
 const PROJECT_KINDS = ['workflow', 'plain', 'gate'];
 const PROJECT_KINDS_API = { capability: 'project-kinds', version: 1 };
 function gateAvailable(folder) {
   return Boolean(toolPath('no-mistakes')) && run('git', ['-C', folder, 'remote', 'get-url', 'no-mistakes'], { timeout: 2000 }).code === 0;
 }
-function projectKind(project, folder = project.path) {
-  return project.kind ?? (gateAvailable(folder) ? 'gate' : followsWorkflow(project, folder) ? 'workflow' : 'plain');
+// List and admission resolve the same source that a fresh allocation starts from.
+// Fetch objects only: never move a checkout, tracking ref, index or FETCH_HEAD.
+function allocationSnapshot(folder) {
+  const deadline = Date.now() + 10000;
+  const git = (...args) => run('git', ['-C', folder, ...args], {
+    timeout: Math.max(1, Math.min(5000, deadline - Date.now())),
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }, maxBuffer: 1024 * 1024,
+  });
+  const local = git('rev-parse', '--verify', 'HEAD').stdout.trim();
+  if (!/^[a-f0-9]{40,64}$/.test(local)) return { error: 'The allocation source HEAD cannot be read.' };
+  if (!toolPath('delivery') || git('remote', 'get-url', 'origin').code !== 0) return { head: local, checkoutStale: false };
+  let branch = git('symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD').stdout.trim().replace(/^refs\/remotes\/origin\//, '');
+  if (!branch) {
+    const remote = git('ls-remote', '--symref', 'origin', 'HEAD');
+    branch = remote.code === 0 ? /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(remote.stdout)?.[1] : null;
+  }
+  if (!branch) return { error: 'The published default branch cannot be resolved.' };
+  const listed = git('ls-remote', '--exit-code', '--heads', 'origin', `refs/heads/${branch}`);
+  const head = listed.code === 0 ? /^([a-f0-9]{40,64})\t/m.exec(listed.stdout)?.[1] : null;
+  if (!head) return { error: 'The published default head cannot be read.' };
+  if (git('cat-file', '-e', `${head}^{commit}`).code !== 0
+      && git('fetch', '--quiet', '--no-tags', '--no-write-fetch-head', 'origin', head).code !== 0) {
+    return { error: 'The published default objects cannot be read.' };
+  }
+  const ancestor = local === head ? null : git('merge-base', '--is-ancestor', local, head);
+  return { head, checkoutStale: local === head ? false : ancestor.code === 0 ? true : ancestor.code === 1 ? false : null };
+}
+function snapshotFollowsWorkflow(folder, head) {
+  const git = (...args) => run('git', ['-C', folder, ...args], { timeout: 2000, maxBuffer: 131072 });
+  const listed = git('ls-tree', '-r', '--name-only', head, '--', 'AGENTS.md', 'skills/change-delivery/SKILL.md', '.github/workflows');
+  if (listed.code !== 0) throw Error('The allocation source tree could not be read.');
+  const files = new Set(listed.stdout.trim().split(/\r?\n/));
+  const text = file => {
+    if (!files.has(file)) return '';
+    const read = git('show', `${head}:${file}`);
+    if (read.code !== 0) throw Error('The allocation source delivery signals could not be read.');
+    return read.stdout;
+  };
+  if (text('AGENTS.md').includes(WORKFLOW_HEADER)) return true;
+  if (/^---\r?\n[\s\S]*?^name:\s*['"]?change-delivery['"]?\s*$/m.test(text('skills/change-delivery/SKILL.md'))) return true;
+  return [...files].filter(file => /^\.github\/workflows\/[^/]+\.ya?ml$/i.test(file)).slice(0, 100).some(file =>
+    /^\s*uses:\s*['"]?(?:timurproko\/MyWorkflows\/\.github\/workflows\/delivery\.ya?ml@[^\s'"]+|\.\/\.github\/workflows\/delivery\.ya?ml)['"]?\s*(?:#.*)?$/im.test(text(file)));
+}
+function projectDelivery(project) {
+  let kindSource = project.kind ? 'explicit' : project.workflow ? 'legacy' : 'detected';
+  let kind = project.kind, checkoutStale = null;
+  if (!kind && gateAvailable(project.path)) { kind = 'gate'; kindSource = 'detected'; }
+  if (!kind && project.workflow) kind = project.workflow === 'delivery' ? 'workflow' : 'plain';
+  if (!kind) {
+    if (!toolPath('delivery')) kind = 'plain';
+    else {
+      const snapshot = allocationSnapshot(project.path);
+      if (snapshot.error) return { error: snapshot.error };
+      checkoutStale = snapshot.checkoutStale;
+      try { kind = snapshotFollowsWorkflow(project.path, snapshot.head) ? 'workflow' : 'plain'; }
+      catch (error) { return { error: error.message }; }
+    }
+  }
+  return { kind, kindSource, available: projectKindAvailable(kind, project.path), checkoutStale };
 }
 function projectKindAvailable(kind, folder) {
   return kind === 'plain' || (kind === 'workflow' ? Boolean(toolPath('delivery')) : gateAvailable(folder));
@@ -1082,7 +1138,7 @@ function cmdProjectKinds(args) {
   let h;
   try {
     if (args.length === 2 && args.includes('--capabilities') && args.includes('--json')) {
-      console.log(JSON.stringify({ ...PROJECT_KINDS_API, listJson: true, setKind: true, setKindLocal: true, explicitHome: true, expectedPath: true, kinds: PROJECT_KINDS })); return;
+      console.log(JSON.stringify({ ...PROJECT_KINDS_API, listJson: true, setKind: true, setKindLocal: true, kindSource: true, checkoutStale: true, explicitHome: true, expectedPath: true, kinds: PROJECT_KINDS })); return;
     }
     const verb = args[0], setting = verb === 'set-kind', name = setting ? args[1] : null;
     if (!['list', 'set-kind'].includes(verb) || (setting && projectNameError(name))) {
@@ -1105,7 +1161,9 @@ function cmdProjectKinds(args) {
     if (!setting) {
       const projects = Object.entries(h.config.projects).map(([name, project]) => {
         if (projectNameError(name) || !path.isAbsolute(project.path)) localSettingRefuse('invalid-registry', 'The project registry contains an invalid name or path.');
-        return { name, path: project.path, kind: projectKind(project) };
+        const selection = projectDelivery(project);
+        if (selection.error) localSettingRefuse('kind-unavailable', `${name}: ${selection.error}`);
+        return { name, path: project.path, ...selection };
       });
       console.log(JSON.stringify({ ...PROJECT_KINDS_API, ok: true, home: slash(h.dir), projects })); return;
     }
@@ -1156,15 +1214,6 @@ function workflowRepositorySignal(folder) {
   let files; try { files = fs.readdirSync(dir); } catch { return false; }
   return files.filter(file => /\.ya?ml$/i.test(file)).slice(0, 100).some(file =>
     /^\s*uses:\s*['"]?(?:timurproko\/MyWorkflows\/\.github\/workflows\/delivery\.ya?ml@[^\s'"]+|\.\/\.github\/workflows\/delivery\.ya?ml)['"]?\s*(?:#.*)?$/im.test(text(path.join(dir, file))));
-}
-function followsWorkflow(project, worktree) {
-  if (project.kind) return project.kind === 'workflow';
-  if (project.workflow) return project.workflow === 'delivery';
-  if (!toolPath('delivery')) return false;
-  if (workflowRepositorySignal(worktree)) return true;
-  const said = runTool('delivery', ['instructions'], { cwd: worktree, timeout: 60000 });
-  if (said?.code === 0 && /match the shared template/.test(said.stdout)) return true;
-  try { return fs.readFileSync(path.join(worktree, 'AGENTS.md'), 'utf8').includes(WORKFLOW_HEADER); } catch { return false; }
 }
 
 // The gate's steps a project may leave out. Unless a project says otherwise, the gate's CI
@@ -2106,20 +2155,24 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
       const namingPath = namingProject && namingProject !== SELF_PROJECT ? registeredProject(h, namingProject)?.path : null;
       const name = namingPath ? repositorySpaceName(namingPath) : 'crew';
       const selection = !extra.selfFix && opts.kind === 'ship' ? registeredProject(h, opts.project) : null;
-      if (selection?.kind && !projectKindAvailable(selection.kind, selection.path)) {
-        refuse(`kind-unavailable: project ${opts.project}'s selected ${selection.kind} kind cannot be honored; restore its delivery tool or gate tool and remote. Nothing was launched.`, 4);
+      const delivery = selection ? projectDelivery(selection) : null;
+      if (delivery && (delivery.error || !delivery.available)) {
+        refuse(`kind-unavailable: project ${opts.project}: ${delivery.error ?? `selected ${delivery.kind} requires its delivery tool or gate tool and remote`}. Nothing was launched.`, 4);
       }
       return withRegistry(h, () => {
         // Only registry writers can race us: every task writer and terminal
         // transition needs the placement gate we still hold. No lock snapshots.
         if (!extra.selfFix) project = registeredProject(h, opts.project) ?? refuse(`Unknown project: ${opts.project}. See \`crew project list\`.`);
-        if (selection && (project.path !== selection.path || project.kind !== selection.kind)) return false;
+        if (selection && (project.path !== selection.path || project.kind !== selection.kind || project.workflow !== selection.workflow)) return false;
         if (fs.existsSync(dir)) refuse(`Task ${id} already exists.`);
         if (independent && h.config.workerSpaceMode === 'per-project' && !tasks) return false;
         if (namingProject && namingProject !== SELF_PROJECT && registeredProject(h, namingProject)?.path !== namingPath) {
           refuse(extra.selfFix ? 'The crew registration changed during repair admission; retry. No task or terminal was created.'
             : 'The project registration changed during space-name resolution; retry. No task or terminal was created.');
         }
+        if (delivery) record = { ...record, deliveryKind: delivery.kind,
+          ...(delivery.kind === 'workflow' ? { workflow: 'delivery' } : {}),
+          ...(delivery.kind === 'gate' ? { gate: 'no-mistakes' } : {}) };
         record.workerSpace = admittedWorkerSpace(h, record, repairPlacement, occupancy, name);
         fs.mkdirSync(dir, { recursive: true });
         saveTask(h, record); // reservation and decision share the same gate
@@ -2134,7 +2187,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   }
   fs.mkdirSync(h.worktrees, { recursive: true });
   // Slow tools run outside the transaction; this preparing task now protects the path.
-  const gated = opts.kind === 'ship' && !extra.selfFix && (project.kind ? project.kind === 'gate' : gateAvailable(project.path));
+  const gated = record.deliveryKind === 'gate';
   const intent = gated ? slash(path.join(dir, 'intent.md')) : null;
   // Once reserved, finish/stop cannot revoke this allocation. Wait through other
   // terminal transitions rather than abandon a preparing task on brief contention.
@@ -2147,7 +2200,6 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     return current;
   };
   const savePreparing = value => withPlacementGate(h, () => { assertPreparing(); saveTask(h, value); }, publicationWait);
-  if (gated) { record = { ...record, gate: 'no-mistakes' }; savePreparing(record); }
 
   const failed = why => { savePreparing({ ...record, state: 'failed', error: why.slice(0, 400) }); refuse(`Could not create the working copy: ${why}`, 5); };
   if (delivered) {
@@ -2167,10 +2219,8 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
     if (wt.code !== 0) failed(wt.stderr.trim());
   }
   if (intent) fs.writeFileSync(intent, `${task.trim()}\n`);
-  // Decided once, in the copy the worker gets, and kept on the task so land and status agree
-  // with what the worker was told. The gate, where there is one, delivers instead.
-  const workflow = opts.kind === 'ship' && !extra.selfFix && !gated && followsWorkflow(project, worktree);
-  if (workflow) { record = { ...record, workflow: 'delivery' }; savePreparing(record); }
+  // Frozen at reservation: newer settings or copy signals cannot reclassify this task.
+  const workflow = record.workflow === 'delivery';
   if (opts.kind === 'ship' && !extra.selfFix && workflowRepositorySignal(worktree)) {
     if (project.kind === 'plain' || (!project.kind && project.workflow === 'plain')) console.log(`project ${opts.project}: repository now looks like delivery; explicit plain selection retained, registration unchanged.`);
     else if (!project.kind && !project.workflow) console.log(`project ${opts.project}: repository now looks like delivery; ${workflow ? 'using delivery for this task' : 'current delivery selection retained'}, registration unchanged.`);
