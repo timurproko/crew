@@ -666,7 +666,7 @@ const r=spawnSync('git',['worktree','add',...(detached?['--detach']:['-b',key]),
 if(r.status!==0){console.error(r.stderr);process.exit(1);}console.log(JSON.stringify({path:copy,created:true}));`);
   const env = { CREW_TOOL_DELIVERY: delivery };
   const call = (args, extra = {}) => f.call(args, { ...env, ...extra });
-  return { ...f, call, env, delivery };
+  return { ...f, call, env, delivery, owner: `owner-kinds-${name}` };
 }
 gapTests['workflow-detection'] = () => {
   for (const signal of ['skill', 'caller']) {
@@ -695,6 +695,107 @@ gapTests['workflow-detection'] = () => {
   commit(f.repo, { 'skills/change-delivery/SKILL.md': '---\nname: unrelated\n---\n', '.github/workflows/other.yml': '# uses: timurproko/MyWorkflows/.github/workflows/delivery.yml@main\njobs: {}\n' }, 'Not delivery');
   const r = f.call(['spawn', 'plain', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
   assert.equal(r.code, 0, r.out); assert.equal(f.task('plain').workflow, undefined);
+};
+
+gapTests['project-kinds'] = () => {
+  const f = projectKindFixture('api'), registry = path.join(f.home, 'crew.json');
+  const read = () => JSON.parse(fs.readFileSync(registry, 'utf8'));
+  const json = (args, extra = {}) => { const r = f.call(args, extra); return { ...r, value: JSON.parse(r.out) }; };
+  const setArgs = (kind = 'plain', name = 'demo', expected = f.repo, target = f.home) => ['project', 'set-kind', name, '--kind', kind, '--home', target, '--expected-path', expected, '--json'];
+  const snapshot = () => fs.readFileSync(registry, 'utf8');
+  const beforeProbe = readWorld().log.length;
+  for (const args of [['project', '--capabilities', '--json'], ['--capabilities', '--json']]) {
+    const r = crew(args, { cwd: root }); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(JSON.parse(r.out), { capability: 'project-kinds', version: 1, listJson: true, setKind: true, explicitHome: true, expectedPath: true, kinds: ['workflow', 'plain', 'gate'] });
+  }
+  assert.equal(readWorld().log.length, beforeProbe, 'Discovery never queries Core or opens a home');
+  let r = json(['project', 'list', '--json']); assert.equal(r.code, 0, r.out);
+  const home = slash(fs.realpathSync(f.home));
+  assert.deepEqual(r.value, { capability: 'project-kinds', version: 1, ok: true, home, projects: [{ name: 'demo', path: slash(f.repo), kind: 'plain' }] });
+  const old = f.spawn('historical', ['--kind', 'ship', '--agent', 'pi']);
+  const historical = fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8');
+  const config = read(); config.future = { keep: true };
+  config.projects.demo = { ...config.projects.demo, workflow: 'delivery', gateSkip: ['ci', 'test'], future: { nested: [1, 2] } };
+  fs.writeFileSync(registry, JSON.stringify(config));
+  const original = structuredClone(config.projects.demo), ownerFile = path.join(f.home, 'owner.json'), owner = fs.readFileSync(ownerFile, 'utf8');
+  r = json(setArgs()); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(r.value, { capability: 'project-kinds', version: 1, ok: true, home, project: { name: 'demo', path: slash(f.repo), kind: 'plain' }, changed: true });
+  assert.deepEqual(read().projects.demo, { ...original, kind: 'plain' }); assert.deepEqual(read().future, { keep: true });
+  assert.equal(fs.readFileSync(ownerFile, 'utf8'), owner); assert.equal(fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8'), historical);
+  const noOp = snapshot(); r = json(setArgs()); assert.equal(r.code, 0, r.out); assert.equal(r.value.changed, false); assert.equal(snapshot(), noOp);
+  assert.equal(json(['project', 'list', '--home', f.home, '--json']).value.projects[0].kind, 'plain');
+  const refusal = (args, reason, extra) => {
+    const before = snapshot(), n = readWorld().log.length, r = json(args, extra);
+    assert.notEqual(r.code, 0, r.out); assert.equal(r.value.ok, false); assert.equal(r.value.error.code, reason, r.out);
+    assert.equal(snapshot(), before); assert.equal(readWorld().log.length, n, 'API refusal does not control terminals'); return r;
+  };
+  refusal(setArgs('unknown'), 'kind-unavailable'); refusal(setArgs('plain', 'missing'), 'project-missing');
+  refusal(setArgs('plain', 'demo', path.join(f.dir, 'not-this-folder')), 'project-changed');
+  refusal(setArgs('workflow'), 'kind-unavailable', { CREW_TOOL_DELIVERY: '' });
+  refusal(setArgs('gate'), 'kind-unavailable');
+  for (const args of [setArgs().slice(0, -1), [...setArgs(), '--replace'], [...setArgs(), '--json'], ['project', '--capabilities', '--json', '--home', f.home], ['project', 'list', '--json', '--kind', 'plain'], ['project', 'set-kind', 'demo', '--kind', 'plain', '--home', f.home, '--json']]) refusal(args, 'invalid-arguments');
+  refusal(setArgs('plain', 'demo', f.repo, path.join(f.dir, 'missing-home')), 'home-missing');
+  refusal(setArgs('plain', 'demo', f.repo, 'relative'), 'invalid-arguments');
+  const empty = path.join(f.dir, 'empty'); fs.mkdirSync(empty);
+  refusal(setArgs('plain', 'demo', f.repo, empty), 'home-missing'); assert.deepEqual(fs.readdirSync(empty), []);
+  const external = crew(setArgs(), { cwd: root, env: f.env });
+  assert.equal(external.code, 3, external.out); assert.equal(JSON.parse(external.out).error.code, 'home-owned');
+  assert.equal(snapshot(), noOp, 'Another terminal cannot change kind');
+  fs.writeFileSync(ownerFile, '{bad'); refusal(setArgs(), 'home-owned'); fs.writeFileSync(ownerFile, owner);
+  fs.writeFileSync(path.join(f.home, 'projects.lock'), '{}');
+  try { refusal(setArgs('workflow'), 'registry-busy'); } finally { fs.unlinkSync(path.join(f.home, 'projects.lock')); }
+  // Existing shared initialized-home validation is also used by this API. A hard
+  // linked registry cannot redirect a setting into another home.
+  const linkHome = path.join(f.dir, 'linked-home'); fs.mkdirSync(path.join(linkHome, 'tasks'), { recursive: true });
+  fs.linkSync(registry, path.join(linkHome, 'crew.json'));
+  try { refusal(setArgs('plain', 'demo', f.repo, linkHome), 'invalid-arguments'); } finally { fs.unlinkSync(path.join(linkHome, 'crew.json')); }
+  const gate = path.join(f.dir, 'no-mistakes.mjs'); fs.writeFileSync(gate, 'process.exit(0);');
+  f.env.CREW_TOOL_NO_MISTAKES = gate; git('-C', f.repo, 'remote', 'add', 'no-mistakes', f.repo);
+  for (const kind of ['workflow', 'plain', 'gate']) {
+    r = json(setArgs(kind), { CREW_TOOL_NO_MISTAKES: gate }); assert.equal(r.code, 0, r.out);
+    assert.equal(r.value.project.kind, kind); assert.deepEqual(read().projects.demo, { ...original, kind });
+    assert.equal(json(['project', 'list', '--json'], { CREW_TOOL_NO_MISTAKES: gate }).value.projects[0].kind, kind);
+    r = f.call(['spawn', `selected-${kind}`, '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { CREW_TOOL_NO_MISTAKES: gate });
+    assert.equal(r.code, 0, r.out);
+    const task = f.task(`selected-${kind}`);
+    assert.equal(task.workflow, kind === 'workflow' ? 'delivery' : undefined);
+    assert.equal(task.gate, kind === 'gate' ? 'no-mistakes' : undefined);
+    assert.equal(fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8'), historical);
+  }
+  r = json(setArgs('workflow')); assert.equal(r.code, 0, r.out);
+  const n = readWorld().log.length;
+  r = f.call(['spawn', 'unavailable', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { CREW_TOOL_DELIVERY: '' });
+  assert.equal(r.code, 4, r.out); assert.match(r.out, /kind-unavailable/);
+  assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'unavailable')));
+  assert.ok(!readWorld().log.slice(n).some(c => ['run', 'kill', 'rm'].includes(c[0])));
+  // An unowned explicit home is editable without pretending to own a terminal.
+  fs.unlinkSync(ownerFile);
+  r = crew(setArgs('plain'), { cwd: root, env: f.env }); assert.equal(r.code, 0, r.out);
+  assert.equal(JSON.parse(r.out).project.kind, 'plain'); assert.ok(!fs.existsSync(ownerFile));
+  const g = gapFixture('kinds-empty'); assert.equal(g.call(['project', 'remove', 'demo']).code, 0);
+  r = g.call(['project', 'list', '--json']); assert.equal(r.code, 0, r.out); assert.deepEqual(JSON.parse(r.out).projects, []);
+};
+gapTests['project-kinds-concurrency'] = async () => {
+  const f = projectKindFixture('concurrency'), args = ['project', 'set-kind', 'demo', '--kind', 'workflow', '--home', f.home, '--expected-path', f.repo, '--json'];
+  let gate = projectBarrier(f, 'before', 'kind-repoint'), pending = projectProcess(f, args, { script: gate.script, terminal: f.owner, env: f.env });
+  try {
+    await until(() => fs.existsSync(gate.ready));
+    const other = path.join(f.dir, 'replacement'); git('clone', '-q', f.repo, other);
+    assert.equal(f.call(['project', 'add', 'demo', other, '--replace']).code, 0);
+    fs.writeFileSync(gate.release, 'go'); const r = await pending.result;
+    assert.notEqual(r.code, 0, r.out); assert.equal(JSON.parse(r.out).error.code, 'project-changed');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8')).projects.demo.kind, undefined);
+  } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+  assert.equal(f.call(['project', 'add', 'demo', f.repo, '--replace']).code, 0);
+  gate = projectBarrier(f, 'before', 'kind-preserve'); pending = projectProcess(f, args, { script: gate.script, terminal: f.owner, env: f.env });
+  try {
+    await until(() => fs.existsSync(gate.ready));
+    assert.equal(f.call(['project', 'add', 'other', f.repo]).code, 0);
+    assert.equal(f.call(['config', 'worker-space', '--set-local', 'per-project', '--home', f.home, '--json']).code, 0);
+    fs.writeFileSync(gate.release, 'go'); const r = await pending.result; assert.equal(r.code, 0, r.out);
+    const config = JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8'));
+    assert.ok(config.projects.other); assert.equal(config.workerSpaceMode, 'per-project'); assert.equal(config.projects.demo.kind, 'workflow');
+  } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
 };
 
 // Concurrent CLIs with test-only filesystem barriers: no timing guesses or production hooks.

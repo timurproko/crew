@@ -20,9 +20,9 @@
 
 ## 4. Desktop callers can discover, list and safely change authoritative project kinds without re-registration
 
-- [ ] 4.1 Implement both capability probes and canonical-home JSON listing for workflow/plain/gate, with capability, malformed-argument and legacy/explicit selection tests.
-- [ ] 4.2 Add the strict kind-only setter using initialized explicit-home validation, owner protection, canonical expected-path checks and atomic registry serialization; cover no-op, unknown names/kinds, unavailable tools, concurrent writers and unsafe homes without touching real homes.
-- [ ] 4.3 Honor explicit kind selection for new ship tasks and refuse unavailable selected modes without changing existing tasks; document the API and exact Herdr contract differences, and run targeted project-kinds tests plus the requested whole-suite check before final publication.
+- [x] 4.1 Implement both capability probes and canonical-home JSON listing for workflow/plain/gate, with capability, malformed-argument and legacy/explicit selection tests.
+- [x] 4.2 Add the strict kind-only setter using initialized explicit-home validation, owner protection, canonical expected-path checks and atomic registry serialization; cover no-op, unknown names/kinds, unavailable tools, concurrent writers and unsafe homes without touching real homes.
+- [x] 4.3 Honor explicit kind selection for new ship tasks and refuse unavailable selected modes without changing existing tasks; document the API and exact Herdr contract differences, and run targeted project-kinds tests plus the requested whole-suite check before final publication.
 
 ## Workflow follow-up
 
