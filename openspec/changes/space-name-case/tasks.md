@@ -15,8 +15,8 @@
 
 ## 3. Delivery source repositories are detected by repository signals and plain registrations are rechecked at spawn
 
-- [ ] 3.1 Recognize the delivery skill or shared caller workflow without hard-coded project names; cover CLI/plugin-equivalent add, automatic spawn selection and explicit plain advisories with isolated repository tests.
-- [ ] 3.2 Preserve registration fields and explicit overrides, document source signals and recheck behavior in README, and run the focused workflow-detection group.
+- [x] 3.1 Recognize the delivery skill or shared caller workflow without hard-coded project names; cover CLI/plugin-equivalent add, automatic spawn selection and explicit plain advisories with isolated repository tests.
+- [x] 3.2 Preserve registration fields and explicit overrides, document source signals and recheck behavior in README, and run the focused workflow-detection group.
 
 ## 4. Desktop callers can discover, list and safely change authoritative project kinds without re-registration
 

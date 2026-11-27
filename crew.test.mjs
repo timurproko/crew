@@ -657,6 +657,46 @@ function gapFixture(name, extra = {}) {
   const leave = () => { const w = readWorld(); delete w.terminals[`guest-${name}`]; fs.writeFileSync(world, JSON.stringify(w)); };
   return { dir, home, repo, call, task, save, spawn, guest, leave };
 }
+function projectKindFixture(name) {
+  const f = gapFixture(`kinds-${name}`), delivery = path.join(f.dir, 'delivery.mjs');
+  fs.writeFileSync(delivery, `import fs from 'node:fs'; import path from 'node:path'; import {spawnSync} from 'node:child_process';
+const a=process.argv.slice(2); if(a[0]!=='start')process.exit(1);
+const detached=a[1]==='--detach', key=detached?a[2]:a[1], copy=path.join(${JSON.stringify(f.dir)},'delivery-copies',key.replaceAll('/','-'));
+const r=spawnSync('git',['worktree','add',...(detached?['--detach']:['-b',key]),copy,'HEAD'],{encoding:'utf8'});
+if(r.status!==0){console.error(r.stderr);process.exit(1);}console.log(JSON.stringify({path:copy,created:true}));`);
+  const env = { CREW_TOOL_DELIVERY: delivery };
+  const call = (args, extra = {}) => f.call(args, { ...env, ...extra });
+  return { ...f, call, env, delivery };
+}
+gapTests['workflow-detection'] = () => {
+  for (const signal of ['skill', 'caller']) {
+    const f = projectKindFixture(`detect-${signal}`);
+    let r = f.call(['spawn', 'before', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 0, r.out); assert.equal(f.task('before').workflow, undefined);
+    const file = path.join(f.home, 'crew.json'), before = fs.readFileSync(file, 'utf8');
+    commit(f.repo, signal === 'skill' ? { 'skills/change-delivery/SKILL.md': '---\nname: change-delivery\n---\n# Change delivery\n' }
+      : { '.github/workflows/custom.yaml': 'jobs:\n  deliver:\n    uses: timurproko/MyWorkflows/.github/workflows/delivery.yml@main\n' }, 'Delivery source signal');
+    r = f.call(['spawn', 'after', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 0, r.out); assert.match(r.out, /repository now looks like delivery.*registration unchanged/);
+    assert.equal(f.task('after').workflow, 'delivery'); assert.equal(f.task('before').workflow, undefined);
+    assert.match(fs.readFileSync(f.task('after').brief, 'utf8'), /plan as a draft pull request|plan first as a draft pull request|then STOP/);
+    assert.equal(fs.readFileSync(file, 'utf8'), before, 'Spawn detection never edits registration');
+    r = f.call(['project', 'add', 'arbitrary-alias', f.repo]); assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /repository delivery signal detected/);
+    r = f.call(['spawn', 'alias', '--project', 'arbitrary-alias', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 0, r.out); assert.equal(f.task('alias').workflow, 'delivery');
+    assert.equal(f.call(['project', 'add', 'arbitrary-alias', f.repo, '--workflow', 'plain']).code, 0);
+    const plain = fs.readFileSync(file, 'utf8');
+    r = f.call(['spawn', 'explicit-plain', '--project', 'arbitrary-alias', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(r.code, 0, r.out); assert.match(r.out, /repository now looks like delivery; explicit plain selection retained, registration unchanged/);
+    assert.equal(f.task('explicit-plain').workflow, undefined); assert.equal(fs.readFileSync(file, 'utf8'), plain);
+  }
+  const f = projectKindFixture('not-a-signal');
+  commit(f.repo, { 'skills/change-delivery/SKILL.md': '---\nname: unrelated\n---\n', '.github/workflows/other.yml': '# uses: timurproko/MyWorkflows/.github/workflows/delivery.yml@main\njobs: {}\n' }, 'Not delivery');
+  const r = f.call(['spawn', 'plain', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+  assert.equal(r.code, 0, r.out); assert.equal(f.task('plain').workflow, undefined);
+};
+
 // Concurrent CLIs with test-only filesystem barriers: no timing guesses or production hooks.
 function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), terminal = '', env = {}, cwd = f.home } = {}) {
   const child = spawn(process.execPath, [script, ...args], { cwd, env: {

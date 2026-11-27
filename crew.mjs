@@ -1053,6 +1053,7 @@ function cmdProject(args) {
     writeJson(path.join(h.dir, 'crew.json'), h.config);
   });
   console.log(`project ${name}: ${slash(folder)}${gateSkip ? ` (gate skips: ${gateSkip.join(', ') || 'nothing'})` : ''}${workflow ? ` (workflow: ${workflow})` : ''}`);
+  if (!workflow && workflowRepositorySignal(folder)) console.log(`project ${name}: repository delivery signal detected; future ship tasks use delivery when available (registration unchanged).`);
 }
 
 // A project follows the shared delivery workflow (the `change-delivery` skill) when it was
@@ -1061,9 +1062,23 @@ function cmdProject(args) {
 // instruction file fails it), so the template's own header line in AGENTS.md also counts.
 const WORKFLOWS = ['delivery', 'plain'];
 const WORKFLOW_HEADER = '`templates/AGENTS.md` of';
+function workflowRepositorySignal(folder) {
+  // Read repository data only. Recognize the workflow's own named skill as well
+  // as adopters' callers; neither the project ID nor its folder name is a signal.
+  const text = file => {
+    try { return fs.statSync(file).size <= 131072 ? fs.readFileSync(file, 'utf8') : ''; } catch { return ''; }
+  };
+  const skill = text(path.join(folder, 'skills', 'change-delivery', 'SKILL.md'));
+  if (/^---\r?\n[\s\S]*?^name:\s*['"]?change-delivery['"]?\s*$/m.test(skill)) return true;
+  const dir = path.join(folder, '.github', 'workflows');
+  let files; try { files = fs.readdirSync(dir); } catch { return false; }
+  return files.filter(file => /\.ya?ml$/i.test(file)).slice(0, 100).some(file =>
+    /^\s*uses:\s*['"]?(?:timurproko\/MyWorkflows\/\.github\/workflows\/delivery\.ya?ml@[^\s'"]+|\.\/\.github\/workflows\/delivery\.ya?ml)['"]?\s*(?:#.*)?$/im.test(text(path.join(dir, file))));
+}
 function followsWorkflow(project, worktree) {
   if (project.workflow) return project.workflow === 'delivery';
   if (!toolPath('delivery')) return false;
+  if (workflowRepositorySignal(worktree)) return true;
   const said = runTool('delivery', ['instructions'], { cwd: worktree, timeout: 60000 });
   if (said?.code === 0 && /match the shared template/.test(said.stdout)) return true;
   try { return fs.readFileSync(path.join(worktree, 'AGENTS.md'), 'utf8').includes(WORKFLOW_HEADER); } catch { return false; }
@@ -2058,6 +2073,10 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // with what the worker was told. The gate, where there is one, delivers instead.
   const workflow = opts.kind === 'ship' && !extra.selfFix && !gated && followsWorkflow(project, worktree);
   if (workflow) { record = { ...record, workflow: 'delivery' }; savePreparing(record); }
+  if (opts.kind === 'ship' && !extra.selfFix && workflowRepositorySignal(worktree)) {
+    if (project.workflow === 'plain') console.log(`project ${opts.project}: repository now looks like delivery; explicit plain selection retained, registration unchanged.`);
+    else if (!project.workflow) console.log(`project ${opts.project}: repository now looks like delivery; ${workflow ? 'using delivery for this task' : 'current delivery selection retained'}, registration unchanged.`);
+  }
   fs.writeFileSync(brief, briefText({ id, kind: opts.kind, task, worktree, project: opts.project, report, tools: installedTools(), gate: intent, gateSkip: gateSkipOf(project), workflow, branch }));
 
   withPlacementGate(h, () => {

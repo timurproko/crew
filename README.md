@@ -451,8 +451,14 @@ decided once, at spawn, and recorded on the task so the worker's brief, `crew la
   counts as one when it was added with `--workflow delivery`, or, without that choice, when
   `delivery` is installed and the worker's copy carries the shared instructions (`delivery
   instructions` reports a match, or `AGENTS.md` has the template's header line, which also
-  covers a repository on an older template). `--workflow plain` turns that off, not a selected
-  gate. Re-adding a project replaces its registration: omitted `--workflow` and `--gate-skip`
+  covers a repository on an older template), or contains the named
+  `skills/change-delivery/SKILL.md` skill or a shared delivery caller workflow under
+  `.github/workflows/`. This includes the workflow's own source repository, under any
+  registered name. Herdr Add project calls the same CLI add without a workflow flag;
+  automatic detection is rechecked in the allocated copy on spawn, not frozen at add. `--workflow plain` turns that off, not a selected
+  gate. When a new repository signal appears, spawn prints one concise detection line;
+  an explicit Plain choice remains Plain with an advisory. Detection never rewrites the
+  registration or an older task's delivery records. Re-adding a project replaces its registration: omitted `--workflow` and `--gate-skip`
   choices are dropped, so repeat options you want to keep. The worker is
   told to follow the skill. A change that needs a plan is planned first as a draft pull request,
   then the worker stops and reports. Every report starts with `Plan: <link>` or
