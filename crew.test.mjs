@@ -1369,17 +1369,30 @@ async function endFixtureClient(identity) {
   if (spawnerState(identity) === 'live') process.kill(identity.pid, 'SIGKILL');
   await until(() => spawnerState(identity) === 'dead');
 }
+function assertClaudePermissionLine(line, auto = true) {
+  if (auto) {
+    assert.ok(line.includes("'claude' 'Read the brief at ") && line.includes(" and carry it out exactly.' '--permission-mode' 'auto' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; crew_exit=$?"), line);
+    assert.ok(line.includes(" and carry it out exactly.' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; fi; }; exec bash"), 'An early refusal of auto mode starts it again in acceptEdits');
+  } else {
+    assert.ok(line.includes("'--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; }; exec bash") && !line.includes("'auto'") && !line.includes('crew_exit'), line);
+  }
+  assert.ok(!line.includes('skip-permissions'), 'A worker is never started with its permission checks switched off');
+}
 gapTests['launch-commandline'] = () => {
   const before = fs.readFileSync(world, 'utf8');
   try {
     const f = joinSpaceFixture('launch-commandline');
     const bash = WINDOWS ? 'C:/Program Files/Git/bin/bash.exe' : 'bash';
-    for (const harness of ['pi', 'claude']) {
-      const result = f.call(['spawn', harness, '--project', 'demo', '--agent', harness, 'Count.']); assert.equal(result.code, 0, result.out);
-      const task = f.task(harness), nonce = task.terminalLaunches.at(-1).nonce;
+    const oldClaude = path.join(f.dir, 'old-claude.mjs');
+    fs.writeFileSync(oldClaude, `if(process.argv.includes('--version') && process.argv.includes('auto')){console.error("error: option '--permission-mode <mode>' argument 'auto' is invalid. Allowed choices are acceptEdits, bypassPermissions, default, plan.");process.exit(1);}console.log('1.0.0 (Claude Code)');`);
+    for (const id of ['pi', 'claude', 'claude-old']) {
+      const harness = id === 'pi' ? 'pi' : 'claude';
+      const result = f.call(['spawn', id, '--project', 'demo', '--agent', harness, 'Count.'], id === 'claude-old' ? { CREW_TOOL_CLAUDE: oldClaude } : {}); assert.equal(result.code, 0, result.out);
+      const task = f.task(id), nonce = task.terminalLaunches.at(-1).nonce;
       const line = readWorld().log.filter(args => args[0] === 'run').at(-1).at(-1);
       const check = `${shq(bashPath(process.execPath))} ${shq(bashPath(path.join(here, 'crew.mjs')))} _launch-check ${shq(task.id)} ${shq(nonce)}`;
       assert.ok(line.includes(check)); assert.equal(f.labels(task)['crew.launch'], nonce);
+      if (harness === 'claude') assertClaudePermissionLine(line, id !== 'claude-old');
       const syntax = spawnSync(bash, ['--noprofile', '--norc', '-n', '-c', line], { encoding: 'utf8' }); assert.equal(syntax.status, 0, syntax.stderr);
       // Denial must fence the entire compound Claude auto-mode/fallback script,
       // not merely its first assignment. No actual agent is executed here.
@@ -4937,9 +4950,7 @@ try {
   // Claude Code: the instruction comes before its options, and it keeps its permission system.
   assert.equal(crew(['spawn', 'tc', '--project', 'demo', '--agent', 'claude', 'x'], { terminal: 'c2' }).code, 0);
   const claudeLine = readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
-  assert.ok(claudeLine.includes("'claude' 'Read the brief at ") && claudeLine.includes(" and carry it out exactly.' '--permission-mode' 'auto' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; crew_exit=$?"), claudeLine);
-  assert.ok(claudeLine.includes(" and carry it out exactly.' '--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; fi; exec bash"), 'An early refusal of auto mode starts it again in acceptEdits');
-  assert.ok(!claudeLine.includes('skip-permissions'), 'A worker is never started with its permission checks switched off');
+  assertClaudePermissionLine(claudeLine);
   // Its copy is recorded as trusted in Claude's config, beside what was there; a1/pi copies are not.
   const copyKey = slash(path.join(copies, 'tc'));
   let cc = JSON.parse(fs.readFileSync(claudeConfig, 'utf8'));
@@ -4959,7 +4970,7 @@ console.log('1.0.0 (Claude Code)');`);
     assert.equal(r.code, 0, r.out);
     assert.match(r.out, /spawned tv: claude scout in terminal \S+, .*; auto mode not available \(error: option '--permission-mode <mode>' argument 'auto' is invalid\. .*\), started in acceptEdits/);
     const oldLine = readWorld().log.filter(a => a[0] === 'run').at(-1).at(-1);
-    assert.ok(oldLine.includes("'--permission-mode' 'acceptEdits' '--allowedTools' 'Bash,PowerShell,Read,Edit,Write,Glob,Grep'; exec bash") && !oldLine.includes("'auto'") && !oldLine.includes('crew_exit'), oldLine);
+    assertClaudePermissionLine(oldLine, false);
     assert.equal(crew(['finish', 'tv', '--force'], { terminal: 'c2' }).code, 0);
   }
   // A config crew cannot parse is never overwritten; the worker still starts.
