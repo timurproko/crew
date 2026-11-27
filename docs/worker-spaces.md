@@ -13,17 +13,101 @@ No restart is needed. The change affects **new independent tasks**, not existing
 | Situation | Placement |
 | --- | --- |
 | Combined (default) | Every project's new workers use one home-wide automatic space. |
-| Per-project | New workers use their registered project's reusable automatic space. |
-| Combined to per-project, with A workers still combined | A new independent A task requests A's project space; old workers stay combined. |
+| Per-project | Join an occupied same-home local Crew space whose live unfinished workers are exclusively this project; otherwise request the canonical project identity. |
+| Combined to per-project, with A workers still combined | A new independent A task joins combined if its live unfinished workers are exclusively A; mixed combined is skipped and old workers never move. |
 | Per-project to combined, with A's project space still occupied | New A tasks and tasks for projects without a space all request combined. |
 | Review, relaunch or automatic hand-over | Inherit their source task's space, regardless of the current setting. |
-| Switch back to a previous mode | Reuse its matching space ID if still present; do not move workers from the other layout. |
+| Switch back to a previous mode | Combined always selects its fixed ID; per-project re-evaluates live exclusive occupancy, without moving workers from the other layout. |
 | End then start, possibly with another coordinator | Mode persists; older tasks retain placement; changing mode affects only later independent admissions. |
 
 The ordering point is the registry-locked **task reservation**, before worktree allocation
 and Core launch. A setting change before reservation affects that task; a setting change
 after reservation does not, even if its terminal starts physically after the setting
-command returns. Slow external operations do not hold the registry lock. Switching never
+command returns. Placement uses a home-wide `worker-spaces.lock` gate, not comparisons of task
+records and lock-file existence. **Invariant:** admission owns the gate continuously while reading
+tasks, observing Core, selecting placement and reserving the task; every participating task writer
+and terminal start/stop/replacement owns that same gate. A replacement owns it from before removing
+the old terminal until the replacement is published (or failure is saved). Admission therefore
+cannot observe a temporary empty space, nor can a replacement finish between its task and Core
+reads. Automatic observation-only hand-over, manual relaunch, finish/cleanup retries, review and
+ordinary launches all participate. Task transactions acquire the gate before their per-task locks;
+admission acquires it before the short registry transaction. Registry-only settings and project
+edits do not need it and remain usable during slow Core calls.
+
+Copy allocation stays outside both gate and registry lock. A saved preparing reservation with no
+published terminal constrains later admission but is not positive occupancy; contenders release
+the gate between retries so the launch can publish. Each reservation records a random preparation
+token and the spawner's local host/platform, PID and OS process-start identity. Windows queries
+.NET Process creation ticks directly, without PowerShell cmdlet/module autoload or JSON formatting,
+with a bounded ten-second cold-start allowance and explicit failure diagnostics. Linux uses boot
+ID plus /proc start ticks; other POSIX hosts use
+locale/timezone-stable ps start time. PID existence with the same start identity means live,
+regardless of how long preparation takes. Missing permissions, malformed identity and another
+host are unknown, never dead. An absent PID or a different verified start identity proves the
+recorded spawner ended, including PID reuse and machine restart.
+
+Stop/finish protect a live or unverifiable allocating spawner, including with force. A recorded
+terminal already proves publication completed and retains normal stop/finish behavior, even if
+an older task record still says preparing. For a proven-dead spawner, finish cancels the token
+under the placement gate, then applies ordinary copy/terminal protections; --force is required
+when unfinished work could be discarded. Every preparation update and the final launch check
+its token/state under that gate, so cancelled preparation cannot publish late. New per-project
+admission encountering a dead reservation refuses in one line naming the exact home-qualified
+`crew finish <id> --force` command, rather than endlessly claiming a worker is still launching.
+It does not silently discard another task's partial work. Concurrent recovery commands serialize;
+losers may retry and an already-finished recovery is idempotent.
+
+Every Core launch, including replacements, first persists an immutable per-run intent containing
+a fresh random nonce, publisher OS identity, task/home, cwd, placement and agent. Only then is
+`hc run` called with `crew.launch=<nonce>`. This persisted capability is launch ownership authority,
+not a generic placement label. If Core creates the terminal but its response/receipt is lost,
+reconciliation by another process requires a dead publisher, a unique exact nonce match and the
+entire recorded identity tuple. The publisher can reconcile its own settled failed response. Generic task/home/space labels or cwd alone never suffice. Conflicting or duplicate
+nonce matches fail closed before any terminal is adopted or stopped. Reconciled addresses enter
+the durable owned-terminal history under the placement gate. A normal acknowledgement records
+ownership before final working-state publication, and stale task saves retain launch authority.
+Acknowledgment rereads the task before storing its address, retaining an already accepted report.
+
+Allocator and initial Core stdout are also kept as task-folder receipts. Recovery validates an
+unpublished delivery copy against the project's Git common directory. Unverified copy receipts
+cannot authorize deletion. An unacknowledged Core error keeps the copy and its intent, not an
+assumption that no worker exists. Actual Core start and publication share one gate interval.
+
+The worker shell performs a task-read-only `_launch-check` under the same placement gate before
+executing the agent. Authorization therefore cannot slip between a cleanup's negative inventory
+and its cancellation write. Cancelled,
+superseded or closed generations cannot start agents later, including in a reused folder. If a
+queued Core request creates a terminal after cancellation, admission reconciles its recorded nonce
+and names the same exact finish command. A repeated finish cleans only that generation's owned
+terminals when the old copy already returned; it never returns/deletes a reused folder a second
+time. Superseded late nonces enter ownership history without rewinding the current terminal or
+profile. Replacement reconciles its actual previous worker before stopping it, and an automatic
+wait discards a stale observation when reconciliation changed that worker. A live or unverifiable
+publisher cannot have its pending launch claimed by another process. Already-admitted launches allow up to
+ten minutes to reacquire the gate for publication/failure recording, matching the copy allocator's
+existing long wait instead of stranding preparation on brief contention. Failed reservations do
+not establish occupancy. Core reads share a ten-second
+admission budget with at most two seconds per probe. Gate contention and preparing launches cause
+bounded wait/retry or worker-space-busy refusal, before the contender creates a task or copy;
+background observation writers yield immediately, and done retains its existing longer report wait.
+The placement gate and per-task writer/intent locks are atomically published populated directories
+with unique owner-nonce files containing the same OS identity proof. This includes a publisher
+dying inside the acknowledgement/publication task transaction, not only during allocation. A proven-dead owner is reclaimable. Exactly one
+contender can unlink that nonce; removal of the now-empty directory is non-recursive, so a new
+populated live gate cannot be deleted by a delayed reclaimer. A reclaimer interrupted after
+unlinking its nonce leaves an empty, safely removable gate, not another permanent reservation.
+Release retires the owned directory before deleting it privately. Transient Windows sharing
+errors retry retirement for up to one second with the same populated claim intact; exhaustion
+refuses with the claim retained for later proven-dead recovery, never shared-path deletion.
+Live, unverifiable and old
+file-format gates are never stolen by PID/age guesses. This intentionally serializes terminal
+transitions within a home, so slow cleanup can require another command to retry. Registry locks
+remain regular files with complete OS identity and claim nonce. Under the placement gate, a dead
+registry claim is removed only after death proof and a fresh matching-nonce read; registry-only
+writers stay independent, but all reclaimers serialize through the gate. Legacy/unverifiable file
+locks remain protected. Legacy binaries and direct-file writers cannot participate.
+
+Slow external operations do not hold the registry lock. Switching never
 moves, relabels or reorders already-spawned workers or creates/removes any space.
 
 ## Desktop/local setter contract, version 1
@@ -174,6 +258,45 @@ New launches additionally carry:
 | `crew.space.project` | Placement project key: exact registered name, or `crew:self` for internal repair fallback. |
 | `crew.space.name` | Per-project only: exact registered name, or `crew` for internal repair fallback. Omitted in combined mode to preserve directory-derived headings. |
 
+### Occupancy-aware joins
+
+Independent per-project admission reads task records and bounded local Core inventory/labels.
+Only preparing/working tasks with recorded launched terminals and a live worker (Core agent or
+agent status app) establish occupancy. Reported, closed, stopped and failed tasks, ended terminals
+and agent-less kept shells do not count, even if tabs remain. An empty old combined space is not
+reused. Mixed live placement projects disqualify it. An occupied canonical project space wins
+when an already split home has both eligible identities; otherwise an exclusive combined space
+wins before canonical project creation. Dotted projects compare exactly. Verified repair aliases
+continue to use the registered crew placement project without rewriting task.project.
+
+Crew validates exact task-owned launch identities and matching home/task/space labels, accepting
+old combined labels or the complete v1 tuple. Unreadable records, unavailable Core or unrecorded/
+contradictory same-home Crew terminals refuse admission before task/copy/terminal creation rather
+than claiming exclusivity. Other homes, remote addresses and personal headings never establish
+reuse. Foreign tabs do not establish worker occupancy or grant Crew terminal ownership; native
+manual moves and mod-tab membership are not observable through Core's requested-space labels.
+
+A joining worker gets its own crew.task and herdr.tab, not another worker's identity. Joining
+`fm-crew-<home>` saves version 1, mode combined, project P, name null, and launches with
+crew.space.version=1, crew.space.mode=combined, crew.space.project=P and **no crew.space.name**.
+It keeps that space's directory-derived heading; it does not force P as a title. Joining
+`fm-crew-<home>-project-P` saves/labels version 1, mode per-project, project/name P. Both retain
+crew.home, crew.kind, herdr.right-click=menu and herdr.tab=<home>-<new-task>.
+
+This matches herdr-app main's `src/plugins/crew/fleet.js`: placement validates the mode/project/name
+and constructs the expected identity; bindFleet checks the current task's live terminal and exact
+native same-machine membership, crew.task/home and herdr.space. Neither title nor project
+resemblance grants child binding. A per-project label tuple inside combined is invalid. Combined
+children normalize their project/name internally so legitimate per-task project labels can differ.
+
+Review, relaunch and automatic hand-over never re-run occupancy selection: they inherit even
+when a task was admitted under per-project policy but saved combined placement. Independent
+per-project Q cannot join P-only combined. However, an old Q task's inherited worker or a launch
+reserved before the switch can still return there, and combined rollback deliberately allows
+new projects there. If that makes combined mixed, future independent per-project admissions
+skip it; Crew never evicts or migrates workers to preserve exclusivity. Historical mixed
+combined spaces are handled by the same current-occupancy rule.
+
 In combined mode `crew.space.project` remains the individual task's project, so different
 values legitimately coexist under the same combined ID; it is not a home/space grouping
 key in that mode. Bind by the validated mode/ID and unchanged `crew.home`, not by headings.
@@ -266,6 +389,38 @@ and lack of space/document mutations; they are **not** native rendering, connect
 or actual native zero-tab deletion evidence. Those require compatible companion support
 and separately authorized native validation; this task does not touch the running app,
 coordinator or their spaces/tasks.
+
+`--gaps=join-project-space` covers exclusive legacy/v1 combined joins, occupied canonical
+preference, mixed/finished/empty/shell occupancy, dotted projects, verified repair alias joins,
+foreign/remote/other-home exclusions and conservative malformed/unavailable evidence. Its
+fixture-only barriers cover same/different-project contenders, first launches, failed launches,
+gate-held admission decisions, terminal publication and both sides of a mode-switch reservation.
+An external-process guard asserts that no Core/Git/copy call runs under projects.lock.
+`--gaps=join-project-space-handover` pauses automatic hand-over after old-terminal removal and
+proves admission cannot enter; conversely, pauses after admission task reads and at reservation
+prove hand-over cannot enter the reviewer's former lock-release window. A later retry joins the
+inherited identity. `--gaps=join-project-space-gate` covers manual relaunch, stop, finish and reviewer
+publication gaps, plus replacement releasing its gate while an admission waits to acquire it;
+that admission cannot read task state until it owns the gate. Both groups also run inside the
+broader join-project-space group, alongside two-spawn and gate-free copy-preparation contention.
+`--gaps=preparation-recovery` kills and awaits actual spawner processes after reservation, before/
+after plain copy creation, after delivery returns its copy, after brief creation and after Core
+returns its address. It covers live-but-slow protection without age expiry, coordinator restart,
+racing stale-gate/admission detection and finish recovery, token cancellation, unpublished copy/
+terminal receipts, PID reuse, unknown identity and an interrupted empty-gate reclaimer. It uses
+real local process identity with fake Core and isolated homes, never the live coordinator.
+`--gaps=launch-nonce-recovery` tests the exact Core-created/before-response gap with an empty receipt,
+a queued request arriving after finish, acknowledgement and working-state publication kills,
+wrong/missing nonce foreign terminals, duplicate/conflicting evidence, and agent-start fencing.
+The reused-folder sentinel must survive late terminal-only cleanup. `--gaps=launch-nonce-handover`
+covers lost replacement responses and superseded queued nonces without rewinding a live worker.
+`--gaps=launch-authorization-gate` queues Core creation between negative inventory and cancellation
+publication and proves that authorization waits, then denies. `--gaps=launch-commandline` parses
+Pi/Claude launch scripts and proves that denial fences the entire compound fallback command.
+`--gaps=windows-process-proof`
+checks the native query with module autoload disabled and ensures timeout/permission/invalid output
+never becomes death proof. The minimal-home PR-facts and writer-contention tests retain their
+persistence, nonblocking and lifecycle-preservation assertions under the same locking protocol.
 
 The additional focused groups `--gaps=worker-space-local-setter` and
 `--gaps=worker-space-local-ordering` cover the desktop command, exact capability/results,

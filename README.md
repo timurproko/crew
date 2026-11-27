@@ -146,9 +146,11 @@ are changed by this crew update.
 
 All participating commands must use the updated tool; legacy binaries or direct file edits
 cannot honor this protocol. Lock contention waits up to two seconds and names
-`<crew home>/projects.lock` on refusal. An interrupted transaction can leave that lock behind:
-retry first, and remove it only after confirming that no process is still using it. Crew
-never steals a lock based on its age or a guessed-dead PID. Registry format stays version 1.
+`<crew home>/projects.lock` on refusal. New claims include an OS start identity and nonce;
+placement-gated commands can reclaim a complete, provably dead claim after revalidation.
+Live, unknown and legacy claims remain protected: retry first, and inspect an interrupted
+transaction before any manual recovery. Crew never steals a lock based on age or a guessed-dead
+PID. Registry format stays version 1.
 
 ## Worker spaces
 
@@ -173,11 +175,35 @@ and must keep unsupported, offline and refused homes distinct from successful on
 
 A change applies to **new independent task admissions** only. Existing workers never move,
 relabel or reshuffle; reviews, relaunches and automatic hand-overs inherit their task's
-space, even after a mode switch. In per-project mode a new task uses its project's space
-even when older workers for that project remain combined. Switching back sends new tasks
+space, even after a mode switch. In per-project mode a new task first joins an occupied
+Crew space whose live unfinished workers all belong to that project, including the old
+combined space when it is project-exclusive. Mixed-project and empty spaces are not reused;
+reported/closed/stopped/failed tasks and kept shells do not establish occupancy. If the home
+already has both eligible spaces, its occupied canonical project space wins. With no eligible
+space, the task requests its canonical project identity. Inspection uses task-owned local
+terminals and validated labels, not headings; ambiguous or unavailable evidence refuses before
+creating the task or copy. A combined join keeps combined placement labels and directory-derived
+headings, even though the home's admission policy is per-project. An older other-project task's
+inherited review or replacement can still return to combined; if it becomes mixed, later
+independent per-project admissions skip it rather than moving anyone. Switching back sends new tasks
 into combined even if their project already has its own space. During a spawn, placement
 is frozen when its task is reserved: an already-admitted launch can start after a switch
-using its saved mode.
+using its saved placement. A shared per-home placement gate covers task reads, Core observation,
+the decision and reservation. Task writers and terminal transitions use that same gate, including
+the whole replacement gap, so admission cannot see a transient empty space. Copy allocation stays
+outside the gate; unpublished reservations cause bounded wait/retry rather than a duplicate space
+request. Registry-only settings/registration remain independent and Core/copy operations never hold
+the registry lock. Slow terminal transitions can require another command to retry. Preparation
+records the spawner's PID and OS start identity: live/unknown allocators stay protected, while a
+proven-dead reservation can be cancelled with `crew finish <id> --force` using normal cleanup
+guards. A new spawn identifies abandoned preparation with the exact home-qualified recovery
+command. Gate and task-lock recovery require OS-instance death proof, never an age/PID guess.
+Every Core call first records a unique launch intent and sends its nonce with the terminal;
+reconciliation can recover created-but-unacknowledged launches only by that recorded authority
+and the exact identity tuple, never generic labels/cwd. The shell checks the generation before
+starting its agent, so cancelled late requests cannot work in a returned/reused copy. Repeated
+finish can clean a late owned terminal without deleting that copy again. See the detailed
+recovery/receipt contract in docs/worker-spaces.md.
 
 **Herdr dependency:** per-project grouping requests separate automatic spaces, but connected
 nesting under the coordinator and exact project names require the compatible Herdr companion
