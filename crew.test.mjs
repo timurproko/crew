@@ -4422,6 +4422,16 @@ cp.spawnSync=(command,args,options)=>{
     const s=JSON.parse(fs.readFileSync(${JSON.stringify(state)},'utf8')), endpoint=args.find(a=>a.startsWith('repos/'));
     const suffix={variables:'/actions/variables',manifest:'/contents/labels/base.json',labels:'/issues/42/labels',definition:'/labels/'+encodeURIComponent(${JSON.stringify(under)})}[s.duringAt];
     const record=${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json';let task;try{task=JSON.parse(fs.readFileSync(record,'utf8'))}catch{}
+    if(s.duringVerdict && task?.state==='working' && endpoint?.endsWith(suffix)){
+      // Capture the stale response first, then complete before its caller consumes it.
+      // The real done CLI is a race actor, not work inside the API's two-second budget.
+      const verdict=s.duringVerdict;s.duringVerdict=null;fs.writeFileSync(${JSON.stringify(state)},JSON.stringify(s));
+      const response=original(command,args,options);if(response.status!==0)return response;
+      fs.writeFileSync(task.report,verdict);
+      const done=original(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},'done',task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TERMINAL:task.terminal},encoding:'utf8'});
+      if(done.status!==0 || /crew: review labels:/.test(done.stdout+done.stderr))throw Error(done.stdout+done.stderr);
+      return response;
+    }
     if(s.duringFinish && task?.state==='working' && endpoint?.endsWith(suffix)){
       const barrier=${JSON.stringify(dir)}+'/'+task.id+'.finish-barrier';
       const child=cp.spawn(process.execPath,[${JSON.stringify(finishScript)},task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TEST_FINISH_BARRIER:barrier},stdio:'ignore',detached:true});child.unref();
@@ -5213,7 +5223,7 @@ gapTests['review-label-start-done'] = () => {
   for (const duringAt of ['variables', 'manifest', 'labels', 'definition']) for (const verdict of ['APPROVE', 'CHANGES NEEDED']) {
     const id = `${duringAt}-${verdict === 'APPROVE' ? 'approve' : 'rework'}`, label = verdict === 'APPROVE' ? f.approved : f.changes;
     f.parent(id); f.control({ labels: ['unrelated', f.oldUnder, f.oldChanges], duringVerdict: verdict, duringAt }); const before = f.calls().length;
-    const { task, result } = f.start(id); assert.equal(f.warnings(result).length, 0, result.out);
+    const { task, result } = f.start(id, '', f.cancelStart); assert.equal(f.warnings(result).length, 0, result.out);
     assert.equal(task.state, 'reported'); assert.equal(f.control().duringVerdict, null);
     assert.deepEqual(f.control().labels, ['unrelated', label], 'The delayed start must preserve its completed verdict');
     const calls = f.calls().slice(before), writes = calls.filter(c => ['POST', 'DELETE'].includes(c.method));
@@ -5844,7 +5854,9 @@ else if (a[0] === 'return') spawnSync('git', ['-C', a.at(-1), 'checkout', '-q', 
   fs.writeFileSync(deliveryLog, '[]');
   fs.writeFileSync(fakeDelivery, `import fs from 'node:fs'; import path from 'node:path'; import { spawnSync } from 'node:child_process';
 const a = process.argv.slice(2), file = ${JSON.stringify(deliveryLog)}, log = JSON.parse(fs.readFileSync(file, 'utf8'));
-log.push({ a, cwd: process.cwd() }); fs.writeFileSync(file, JSON.stringify(log));
+const id = a[1] === '--detach' ? a[2] : a[1]?.split('/').at(-1);
+const task = a[0] === 'start' ? JSON.parse(fs.readFileSync(path.join(${JSON.stringify(homeDir)}, 'tasks', id, 'task.json'), 'utf8')) : null;
+log.push({ a, cwd: process.cwd(), ...(task ? { admission: { state: task.state, deliveryKind: task.deliveryKind, workflow: task.workflow } } : {}) }); fs.writeFileSync(file, JSON.stringify(log));
 const git = (...args) => spawnSync('git', args, { encoding: 'utf8' });
 if (a[0] === 'start') {
   const detach = a.indexOf('--detach'), branch = detach < 0 ? a[1] : null;
@@ -5852,7 +5864,11 @@ if (a[0] === 'start') {
   const existing = branch ? listed.find(w => w.branch === branch) : null;
   if (existing) { console.log(JSON.stringify({ path: existing.path, branch, created: false, pooled: true })); process.exit(0); }
   const slot = path.join(${JSON.stringify(poolDir)}, String(log.length), 'demo');
-  const r = git('worktree', 'add', ...(branch ? ['-b', branch] : ['--detach']), slot, 'HEAD');
+  const base = /^ref: refs\\/heads\\/(.+)\\tHEAD$/m.exec(git('ls-remote', '--symref', 'origin', 'HEAD').stdout)?.[1];
+  if (!base) { console.error('No published default branch'); process.exit(2); }
+  const fetched = git('fetch', '--quiet', 'origin', base);
+  if (fetched.status !== 0) { console.error(fetched.stderr); process.exit(2); }
+  const r = git('worktree', 'add', ...(branch ? ['-b', branch] : ['--detach']), slot, 'origin/' + base);
   if (r.status !== 0) { console.error(r.stderr); process.exit(2); }
   console.error('started in a pool slot'); console.log(JSON.stringify({ path: slot, branch, created: true, pooled: true }));
 } else if (a[0] === 'finish') {
@@ -5920,12 +5936,26 @@ if (a[0] === 'start') {
   assert.match(plainInstructions, /commit and push them/);
   assert.match(plainInstructions, /Do not open or merge a pull request yourself; crew land handles its publication/);
   assert.match(plainInstructions, /report at once; do not wait for CI or the delivery bot/);
-  commit(project, { 'AGENTS.md': TEMPLATE }, 'Use the shared workflow');
+  const publishedDefault = git('-C', projectOrigin, 'symbolic-ref', 'HEAD').trim();
+  const publishSnapshot = () => git('-C', project, 'push', '-q', 'origin', `HEAD:${publishedDefault}`);
+  const listedPooled = () => JSON.parse(dl(['project', 'list', '--json']).out).projects.find(p => p.name === 'pooled');
+  const workflowHead = commit(project, { 'AGENTS.md': TEMPLATE }, 'Use the shared workflow');
+  assert.equal(listedPooled().kind, 'plain', 'Unpublished local instructions cannot change the next allocation selection');
+  publishSnapshot();
+  assert.deepEqual([listedPooled().kind, listedPooled().kindSource], ['workflow', 'detected'], 'Published instructions govern automatic admission');
   r = dl(['spawn', 'w1', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'Add a feature.']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /follows the repository's delivery workflow/);
   const w1 = taskOf('w1'), w1brief = fs.readFileSync(w1.brief, 'utf8');
   assert.equal(w1.workflow, 'delivery');
-  assert.deepEqual(calls().filter(e => e.a[0] === 'instructions').map(e => slash(e.cwd).toLowerCase()).at(-1), slash(w1.worktree).toLowerCase(), 'Decided in the copy the worker gets');
+  assert.equal(head(w1.worktree), workflowHead, 'The fake allocator starts from the published default snapshot');
+  assert.deepEqual(calls().find(e => e.a[0] === 'start' && e.a[1] === 'feature/w1').admission,
+    { state: 'preparing', deliveryKind: 'workflow', workflow: 'delivery' }, 'Delivery is captured at reservation before allocation');
+  assert.ok(!calls().some(e => e.a[0] === 'instructions'), 'Admission reads snapshot signals without a post-allocation instructions subprocess');
+  const w1Record = path.join(homeDir, 'tasks', 'w1', 'task.json'), beforeKindChange = fs.readFileSync(w1Record, 'utf8');
+  r = dl(['project', 'set-kind', 'pooled', '--kind', 'plain', '--home', homeDir, '--expected-path', project, '--json']); assert.equal(r.code, 0, r.out);
+  assert.equal(listedPooled().kind, 'plain');
+  assert.equal(fs.readFileSync(w1Record, 'utf8'), beforeKindChange, 'A new Plain choice cannot rewrite the admitted Workflow task');
+  assert.equal(fs.readFileSync(w1.brief, 'utf8'), w1brief, 'An admitted brief stays immutable');
   assert.ok(w1brief.includes('`change-delivery` skill') && w1brief.includes('`delivery start feature/w1`') && w1brief.includes('`Plan: <pull request link>`') && !w1brief.includes('Do not push or open a pull request'), w1brief);
   const ghCalls = () => JSON.parse(fs.readFileSync(ghLog, 'utf8')).map(e => e.a);
   // Its first report is a plan: status says so, and land refuses it until the plan is approved.
@@ -5959,6 +5989,10 @@ if (a[0] === 'start') {
   assert.ok(ghCalls().at(-1).includes('graphql')); assert.ok(ghCalls().at(-1).includes('number=11'));
   assert.ok(taskOf('w1').landed); assert.equal(taskOf('w1').prFacts.state, 'OPEN');
   assert.match(dl(['land', 'w1']).out, /already has a pull request: https:\/\/github\.com\/acme\/demo\/pull\/11/);
+  // The preceding plan/report/land lifecycle retained Workflow even while future admissions were Plain.
+  assert.equal(taskOf('w1').workflow, 'delivery'); assert.equal(taskOf('w1').deliveryKind, 'workflow');
+  assert.equal(dl(['project', 'add', 'pooled', project]).code, 0, 'Re-registration clears the explicit choice for later detection coverage');
+  assert.equal(listedPooled().kind, 'workflow');
   // No link on the first line: the pull request GitHub has for the branch, never another one
   // the report mentions further down.
   assert.equal(dl(['spawn', 'w2', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
@@ -5977,9 +6011,11 @@ if (a[0] === 'start') {
   assert.deepEqual([taskOf('w3').pr, taskOf('w3').landed], [undefined, undefined]);
   fs.rmSync(ghDown);
   // A repository on an older template still counts: the template's header line is enough.
-  commit(project, { 'AGENTS.md': `${TEMPLATE}\nAn older line.\n` }, 'Older template');
+  const olderHead = commit(project, { 'AGENTS.md': `${TEMPLATE}\nAn older line.\n` }, 'Older template');
+  publishSnapshot();
   assert.equal(dl(['spawn', 'w4', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   assert.equal(taskOf('w4').workflow, 'delivery');
+  assert.equal(head(taskOf('w4').worktree), olderHead, 'Older-template coverage uses the published snapshot too');
   // The project's own choice wins over detection, either way, and is shown in the list.
   assert.equal(dl(['project', 'add', 'pooled', project, '--workflow', 'maybe']).code, 2);
   r = dl(['project', 'add', 'pooled', project, '--workflow', 'plain']); assert.equal(r.code, 0, r.out); assert.match(r.out, /\(workflow: plain\)/);
@@ -5990,9 +6026,11 @@ if (a[0] === 'start') {
   assert.match(explicitPlainInstructions, /commit and push them/);
   assert.match(explicitPlainInstructions, /Do not open or merge a pull request yourself; crew land handles its publication/);
   git('-C', project, 'rm', '-q', 'AGENTS.md'); git('-C', project, ...who, 'commit', '-q', '-m', 'Back to plain');
+  publishSnapshot();
   dl(['project', 'add', 'pooled', project, '--workflow', 'delivery']);
   assert.equal(dl(['spawn', 'w6', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   assert.equal(taskOf('w6').workflow, 'delivery', 'Delivered by pull request without the shared instructions');
+  assert.ok(!fs.existsSync(path.join(taskOf('w6').worktree, 'AGENTS.md')), 'The explicit workflow override is exercised on a published Plain copy');
   // Like --gate-skip, the choice is part of the registration: adding again without it drops it.
   dl(['project', 'add', 'pooled', project]); assert.match(dl(['project', 'list']).out, /^pooled\t[^\t\r\n]*\r?$/m);
   assert.equal(dl(['spawn', 'w7', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
