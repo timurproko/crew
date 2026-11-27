@@ -50,7 +50,7 @@ Crew SHALL recognize shared delivery from repository instructions, its named cha
 
 ### Requirement: Project kinds are discoverable and authoritative
 
-Crew SHALL expose home-free project-kinds version-one capability JSON from project-scoped and root probes, advertising JSON listing, kind setting, explicit home, expected path and workflow/plain/gate. Additive capability flags SHALL advertise non-owner kind setting and kind provenance. JSON listing SHALL return canonical home and exact name/path with effective kind, explicit/legacy/detected source and availability. Explicit selections SHALL govern future ships; unavailable selections SHALL refuse, not fall back.
+Crew SHALL expose home-free project-kinds v1 JSON from project and root probes, advertising JSON listing, kind setting, explicit home, expected path and workflow/plain/gate. Capability flags SHALL advertise non-owner kind setting and provenance. JSON listing SHALL return canonical home and exact name/path with effective kind, explicit/legacy/detected source and availability. Explicit selections SHALL govern future ships; unavailable selections SHALL refuse, not fall back.
 
 #### Scenario: Desktop discovers and lists
 
