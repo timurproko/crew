@@ -662,11 +662,19 @@ function projectKindFixture(name) {
   fs.writeFileSync(delivery, `import fs from 'node:fs'; import path from 'node:path'; import {spawnSync} from 'node:child_process';
 const a=process.argv.slice(2); if(a[0]!=='start')process.exit(1);
 const detached=a[1]==='--detach', key=detached?a[2]:a[1], copy=path.join(${JSON.stringify(f.dir)},'delivery-copies',key.replaceAll('/','-'));
-const r=spawnSync('git',['worktree','add',...(detached?['--detach']:['-b',key]),copy,'HEAD'],{encoding:'utf8'});
+let from='HEAD';
+if(spawnSync('git',['remote','get-url','origin']).status===0){
+  let branch=spawnSync('git',['symbolic-ref','--short','refs/remotes/origin/HEAD'],{encoding:'utf8'}).stdout.trim().replace(/^origin\\//,'');
+  if(!branch)branch=/^ref: refs\\/heads\\/(.+)\\tHEAD$/m.exec(spawnSync('git',['ls-remote','--symref','origin','HEAD'],{encoding:'utf8'}).stdout)?.[1];
+  if(spawnSync('git',['fetch','--quiet','origin',branch]).status!==0)process.exit(1);from='origin/'+branch;
+}
+if(process.env.KIND_COPY_READY){fs.writeFileSync(process.env.KIND_COPY_READY,'ready');while(!fs.existsSync(process.env.KIND_COPY_RELEASE))Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}
+const r=spawnSync('git',['worktree','add',...(detached?['--detach']:['-b',key]),copy,from],{encoding:'utf8'});
 if(r.status!==0){console.error(r.stderr);process.exit(1);}console.log(JSON.stringify({path:copy,created:true}));`);
   const env = { CREW_TOOL_DELIVERY: delivery };
   const call = (args, extra = {}) => f.call(args, { ...env, ...extra });
-  return { ...f, call, env, delivery, owner: `owner-kinds-${name}` };
+  const spawn = (id, flags = []) => { const r = call(['spawn', id, '--project', 'demo', ...flags, 'Count lines.']); assert.equal(r.code, 0, r.out); return f.task(id); };
+  return { ...f, call, spawn, env, delivery, owner: `owner-kinds-${name}` };
 }
 gapTests['workflow-detection'] = () => {
   for (const signal of ['skill', 'caller']) {
@@ -706,12 +714,12 @@ gapTests['project-kinds'] = () => {
   const beforeProbe = readWorld().log.length;
   for (const args of [['project', '--capabilities', '--json'], ['--capabilities', '--json']]) {
     const r = crew(args, { cwd: root }); assert.equal(r.code, 0, r.out);
-    assert.deepEqual(JSON.parse(r.out), { capability: 'project-kinds', version: 1, listJson: true, setKind: true, explicitHome: true, expectedPath: true, kinds: ['workflow', 'plain', 'gate'] });
+    assert.deepEqual(JSON.parse(r.out), { capability: 'project-kinds', version: 1, listJson: true, setKind: true, setKindLocal: true, kindSource: true, checkoutStale: true, explicitHome: true, expectedPath: true, kinds: ['workflow', 'plain', 'gate'] });
   }
   assert.equal(readWorld().log.length, beforeProbe, 'Discovery never queries Core or opens a home');
   let r = json(['project', 'list', '--json']); assert.equal(r.code, 0, r.out);
   const home = slash(fs.realpathSync(f.home));
-  assert.deepEqual(r.value, { capability: 'project-kinds', version: 1, ok: true, home, projects: [{ name: 'demo', path: slash(f.repo), kind: 'plain' }] });
+  assert.deepEqual(r.value, { capability: 'project-kinds', version: 1, ok: true, home, projects: [{ name: 'demo', path: slash(f.repo), kind: 'plain', kindSource: 'detected', available: true, checkoutStale: false }] });
   const old = f.spawn('historical', ['--kind', 'ship', '--agent', 'pi']);
   const historical = fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8');
   const config = read(); config.future = { keep: true };
@@ -738,10 +746,23 @@ gapTests['project-kinds'] = () => {
   refusal(setArgs('plain', 'demo', f.repo, 'relative'), 'invalid-arguments');
   const empty = path.join(f.dir, 'empty'); fs.mkdirSync(empty);
   refusal(setArgs('plain', 'demo', f.repo, empty), 'home-missing'); assert.deepEqual(fs.readdirSync(empty), []);
+  const beforeExternal = readWorld().log.length;
   const external = crew(setArgs(), { cwd: root, env: f.env });
-  assert.equal(external.code, 3, external.out); assert.equal(JSON.parse(external.out).error.code, 'home-owned');
-  assert.equal(snapshot(), noOp, 'Another terminal cannot change kind');
-  fs.writeFileSync(ownerFile, '{bad'); refusal(setArgs(), 'home-owned'); fs.writeFileSync(ownerFile, owner);
+  assert.equal(external.code, 0, external.out); assert.equal(JSON.parse(external.out).changed, false);
+  assert.equal(snapshot(), noOp, 'A non-owner no-op does not rewrite registration');
+  for (const metadata of ['{bad', JSON.stringify({ terminal: 'unverifiable-old-owner' })]) {
+    fs.writeFileSync(ownerFile, metadata);
+    const r = crew(setArgs('workflow'), { cwd: root, env: f.env }); assert.equal(r.code, 0, r.out);
+    assert.equal(fs.readFileSync(ownerFile, 'utf8'), metadata);
+    assert.equal(fs.readFileSync(path.join(f.home, 'tasks', old.id, 'task.json'), 'utf8'), historical);
+    assert.equal(crew(setArgs(), { cwd: root, env: f.env }).code, 0);
+  }
+  assert.equal(readWorld().log.length, beforeExternal, 'Local kind edits never query or control Core');
+  fs.writeFileSync(ownerFile, owner);
+  for (const args of [['spawn', 'not-owner', '--project', 'demo', 'Count.'], ['stop', old.id], ['finish', old.id], ['end']]) {
+    const r = crew(args, { cwd: f.home, env: f.env }); assert.equal(r.code, 3, r.out);
+  }
+  assert.equal(fs.readFileSync(ownerFile, 'utf8'), owner);
   fs.writeFileSync(path.join(f.home, 'projects.lock'), '{}');
   try { refusal(setArgs('workflow'), 'registry-busy'); } finally { fs.unlinkSync(path.join(f.home, 'projects.lock')); }
   // Existing shared initialized-home validation is also used by this API. A hard
@@ -796,6 +817,109 @@ gapTests['project-kinds-concurrency'] = async () => {
     const config = JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8'));
     assert.ok(config.projects.other); assert.equal(config.workerSpaceMode, 'per-project'); assert.equal(config.projects.demo.kind, 'workflow');
   } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
+};
+
+gapTests['project-kind-snapshots'] = () => {
+  const signal = '# Agent instructions\nThis file is `templates/AGENTS.md` of `example/workflow`.\n';
+  for (const localWorkflow of [false, true]) {
+    const f = projectKindFixture(`snapshot-${localWorkflow}`);
+    if (localWorkflow) commit(f.repo, { 'AGENTS.md': signal }, 'local workflow');
+    const origin = path.join(f.dir, 'origin.git'), peer = path.join(f.dir, 'peer');
+    git('clone', '--bare', '-q', f.repo, origin); git('-C', f.repo, 'remote', 'add', 'origin', origin);
+    git('clone', '-q', origin, peer);
+    if (localWorkflow) { git('-C', peer, 'rm', 'AGENTS.md'); git('-C', peer, ...who, 'commit', '-qm', 'published plain'); }
+    else commit(peer, { 'AGENTS.md': signal }, 'published workflow');
+    git('-C', peer, 'push', '-q', 'origin', 'HEAD');
+    const before = git('-C', f.repo, 'show-ref'), head = git('-C', f.repo, 'rev-parse', 'HEAD');
+    const fetchHead = path.join(f.repo, '.git', 'FETCH_HEAD'); fs.writeFileSync(fetchHead, 'sentinel\n');
+    const n = readWorld().log.length, listed = f.call(['project', 'list', '--json']); assert.equal(listed.code, 0, listed.out);
+    const item = JSON.parse(listed.out).projects[0], expected = localWorkflow ? 'plain' : 'workflow';
+    assert.deepEqual(item, { name: 'demo', path: slash(f.repo), kind: expected, kindSource: 'detected', available: true, checkoutStale: true });
+    assert.equal(readWorld().log.length, n, 'List never consults Core');
+    assert.equal(git('-C', f.repo, 'show-ref'), before, 'Object fetch never moves refs');
+    assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD'), head); assert.equal(fs.readFileSync(fetchHead, 'utf8'), 'sentinel\n');
+    assert.equal(git('-C', f.repo, 'status', '--porcelain'), '');
+    const t = f.spawn('published', ['--kind', 'ship', '--agent', 'pi']);
+    assert.equal(t.deliveryKind, expected); assert.equal(t.workflow, localWorkflow ? undefined : 'delivery');
+    assert.equal(fs.existsSync(path.join(t.worktree, 'AGENTS.md')), !localWorkflow);
+    const status = JSON.parse(f.call(['status', '--json']).out).tasks.find(t => t.id === 'published'); assert.equal(status.deliveryKind, item.kind);
+    // A local branch ahead/diverged is not falsely advertised as strictly behind.
+    commit(f.repo, { 'local.txt': 'local branch\n' }, 'local change');
+    assert.equal(JSON.parse(f.call(['project', 'list', '--json']).out).projects[0].checkoutStale, false);
+    git('-C', f.repo, 'remote', 'set-url', 'origin', path.join(f.dir, 'missing-origin'));
+    const failed = f.call(['project', 'list', '--json']); assert.equal(failed.code, 2, failed.out); assert.equal(JSON.parse(failed.out).error.code, 'kind-unavailable');
+    const spawn = f.call(['spawn', 'unresolved', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
+    assert.equal(spawn.code, 4, spawn.out); assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'unresolved')));
+    const set = f.call(['project', 'set-kind', 'demo', '--kind', 'plain', '--home', f.home, '--expected-path', f.repo, '--json']); assert.equal(set.code, 0, set.out);
+    const explicit = JSON.parse(f.call(['project', 'list', '--json']).out).projects[0];
+    assert.deepEqual(explicit, { name: 'demo', path: slash(f.repo), kind: 'plain', kindSource: 'explicit', available: true, checkoutStale: null });
+  }
+  const f = projectKindFixture('snapshot-legacy');
+  assert.equal(f.call(['project', 'add', 'demo', f.repo, '--workflow', 'plain']).code, 0);
+  const item = JSON.parse(f.call(['project', 'list', '--json']).out).projects[0]; assert.equal(item.kindSource, 'legacy');
+  assert.equal(item.kind, 'plain'); assert.equal(item.checkoutStale, null);
+  assert.equal(f.call(['project', 'set-kind', 'demo', '--kind', 'workflow', '--home', f.home, '--expected-path', f.repo, '--json']).code, 0);
+  const unavailable = f.call(['project', 'list', '--json'], { CREW_TOOL_DELIVERY: '' }); assert.equal(unavailable.code, 0, unavailable.out);
+  assert.equal(JSON.parse(unavailable.out).projects[0].kind, 'workflow'); assert.equal(JSON.parse(unavailable.out).projects[0].available, false);
+};
+
+gapTests['project-kind-ordering'] = async () => {
+  for (const phase of ['before', 'allocation']) {
+    const f = projectKindFixture(`ordering-${phase}`), gate = projectBarrier(f, 'before', 'kind-reserve');
+    const ready = phase === 'before' ? gate.ready : path.join(f.dir, 'copy-ready'), release = phase === 'before' ? gate.release : path.join(f.dir, 'copy-release');
+    const env = { ...f.env, ...(phase === 'allocation' ? { KIND_COPY_READY: ready, KIND_COPY_RELEASE: release } : {}) };
+    const pending = projectProcess(f, ['spawn', 'racing', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { env, terminal: f.owner, ...(phase === 'before' ? { script: gate.script } : {}) });
+    try {
+      await until(() => fs.existsSync(ready));
+      if (phase === 'allocation') assert.equal(f.task('racing').deliveryKind, 'plain', 'Preparing reservation already freezes Plain');
+      const args = ['project', 'set-kind', 'demo', '--kind', 'workflow', '--home', f.home, '--expected-path', f.repo, '--json'];
+      const r = crew(args, { cwd: root, env: f.env }); assert.equal(r.code, 0, r.out);
+      fs.writeFileSync(release, 'go'); const launched = await pending.result; assert.equal(launched.code, 0, launched.out);
+      assert.equal(f.task('racing').deliveryKind, phase === 'before' ? 'workflow' : 'plain');
+      assert.equal(f.task('racing').workflow, phase === 'before' ? 'delivery' : undefined);
+      const later = f.spawn('later', ['--kind', 'ship', '--agent', 'pi']); assert.equal(later.deliveryKind, 'workflow');
+      const brief = fs.readFileSync(f.task('racing').brief, 'utf8');
+      if (phase === 'before') assert.match(brief, /then STOP/); else assert.ok(!brief.includes('then STOP'));
+    } finally { fs.writeFileSync(release, 'go'); await pending.result; }
+  }
+};
+
+gapTests['project-kind-lifecycle'] = () => {
+  const tools = projectKindFixture('lifecycle-tools'), gate = path.join(tools.dir, 'no-mistakes.mjs'); fs.writeFileSync(gate, 'process.exit(0);');
+  const env = { ...tools.env, CREW_TOOL_NO_MISTAKES: gate, CREW_NO_QUOTA: '1', CREW_RECOVERY_SECONDS: '0' };
+  const f = reviewLabelsFixture('kind-lifecycle', env), registry = path.join(f.home, 'crew.json');
+  git('-C', f.repo, 'remote', 'add', 'no-mistakes', f.repo);
+  const set = kind => {
+    const r = crew(['project', 'set-kind', 'demo', '--kind', kind, '--home', f.home, '--expected-path', f.repo, '--json'], { cwd: root, env });
+    assert.equal(r.code, 0, r.out);
+  };
+  for (const kind of ['plain', 'workflow', 'gate']) {
+    set(kind); const t = f.spawn(`old-${kind}`, ['--kind', 'ship', '--agent', 'pi']);
+    const brief = fs.readFileSync(t.brief, 'utf8'), taskFile = path.join(f.home, 'tasks', t.id, 'task.json');
+    const taskBytes = fs.readFileSync(taskFile, 'utf8'), ownerFile = path.join(f.home, 'owner.json'), owner = fs.readFileSync(ownerFile, 'utf8');
+    const next = kind === 'plain' ? 'workflow' : 'plain', n = readWorld().log.length; set(next);
+    assert.equal(readWorld().log.length, n); assert.equal(fs.readFileSync(taskFile, 'utf8'), taskBytes); assert.equal(fs.readFileSync(ownerFile, 'utf8'), owner);
+    const check = () => {
+      const current = f.task(t.id); assert.equal(current.workflow, kind === 'workflow' ? 'delivery' : undefined);
+      assert.equal(current.gate, kind === 'gate' ? 'no-mistakes' : undefined); assert.equal(fs.readFileSync(current.brief, 'utf8'), brief);
+      const status = JSON.parse(f.call(['status', '--json']).out).tasks.find(item => item.id === t.id); assert.equal(status.deliveryKind, kind);
+      assert.equal(JSON.parse(fs.readFileSync(registry)).projects.demo.kind, next);
+    };
+    check(); let r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'manual']); assert.equal(r.code, 0, r.out); check();
+    // Legacy records also keep their existing fields rather than consulting today's registration.
+    const current = f.task(t.id), { deliveryKind, ...legacy } = current;
+    f.save({ ...legacy, candidates: [{ harness: 'pi', model: 'manual' }, { harness: 'pi', model: 'automatic' }], chain: [{ harness: 'pi', model: 'automatic' }] });
+    setTerminal(current.terminal, { status: { state: 'idle', app: 'pi' }, screen: 'quota exhausted' });
+    r = f.call(['wait', t.id, '--timeout', '0.2']); assert.equal(r.code, 124, r.out); assert.notEqual(f.task(t.id).terminal, current.terminal, r.out); check();
+    commit(t.worktree, { [`${kind}.txt`]: 'implemented\n' }, `fix: implement ${kind}`);
+    reviewRemote(f, f.task(t.id)); f.control({ head: git('-C', t.worktree, 'rev-parse', 'HEAD').trim(), branch: t.branch });
+    r = f.done(f.task(t.id), kind === 'plain' ? 'Done.' : kind === 'workflow' ? 'Implementation: https://github.com/acme/demo/pull/42' : 'https://github.com/acme/demo/pull/42'); assert.equal(r.code, 0, r.out); check();
+    // Reported tasks must also remain byte-identical during a fresh setting write.
+    const reported = fs.readFileSync(taskFile, 'utf8'); set(kind); set(next); assert.equal(fs.readFileSync(taskFile, 'utf8'), reported);
+    const review = f.start(t.id).task; assert.equal(review.kind, 'scout'); check();
+    r = f.call(['land', t.id]); assert.equal(r.code, 0, r.out); check();
+    assert.match(r.out, kind === 'gate' ? /through no-mistakes/ : kind === 'workflow' ? /repository's delivery workflow/ : /against .* commit/);
+  }
 };
 
 gapTests['project-kind-paths'] = async () => {
@@ -4298,6 +4422,16 @@ cp.spawnSync=(command,args,options)=>{
     const s=JSON.parse(fs.readFileSync(${JSON.stringify(state)},'utf8')), endpoint=args.find(a=>a.startsWith('repos/'));
     const suffix={variables:'/actions/variables',manifest:'/contents/labels/base.json',labels:'/issues/42/labels',definition:'/labels/'+encodeURIComponent(${JSON.stringify(under)})}[s.duringAt];
     const record=${JSON.stringify(path.join(f.home, 'tasks'))}+'/'+s.watch+'/task.json';let task;try{task=JSON.parse(fs.readFileSync(record,'utf8'))}catch{}
+    if(s.duringVerdict && task?.state==='working' && endpoint?.endsWith(suffix)){
+      // Capture the stale response first, then complete before its caller consumes it.
+      // The real done CLI is a race actor, not work inside the API's two-second budget.
+      const verdict=s.duringVerdict;s.duringVerdict=null;fs.writeFileSync(${JSON.stringify(state)},JSON.stringify(s));
+      const response=original(command,args,options);if(response.status!==0)return response;
+      fs.writeFileSync(task.report,verdict);
+      const done=original(process.execPath,[${JSON.stringify(path.join(here, 'crew.mjs'))},'done',task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TERMINAL:task.terminal},encoding:'utf8'});
+      if(done.status!==0 || /crew: review labels:/.test(done.stdout+done.stderr))throw Error(done.stdout+done.stderr);
+      return response;
+    }
     if(s.duringFinish && task?.state==='working' && endpoint?.endsWith(suffix)){
       const barrier=${JSON.stringify(dir)}+'/'+task.id+'.finish-barrier';
       const child=cp.spawn(process.execPath,[${JSON.stringify(finishScript)},task.id],{cwd:${JSON.stringify(f.home)},env:{...process.env,CREW_TEST_FINISH_BARRIER:barrier},stdio:'ignore',detached:true});child.unref();
@@ -5089,7 +5223,7 @@ gapTests['review-label-start-done'] = () => {
   for (const duringAt of ['variables', 'manifest', 'labels', 'definition']) for (const verdict of ['APPROVE', 'CHANGES NEEDED']) {
     const id = `${duringAt}-${verdict === 'APPROVE' ? 'approve' : 'rework'}`, label = verdict === 'APPROVE' ? f.approved : f.changes;
     f.parent(id); f.control({ labels: ['unrelated', f.oldUnder, f.oldChanges], duringVerdict: verdict, duringAt }); const before = f.calls().length;
-    const { task, result } = f.start(id); assert.equal(f.warnings(result).length, 0, result.out);
+    const { task, result } = f.start(id, '', f.cancelStart); assert.equal(f.warnings(result).length, 0, result.out);
     assert.equal(task.state, 'reported'); assert.equal(f.control().duringVerdict, null);
     assert.deepEqual(f.control().labels, ['unrelated', label], 'The delayed start must preserve its completed verdict');
     const calls = f.calls().slice(before), writes = calls.filter(c => ['POST', 'DELETE'].includes(c.method));
@@ -5720,7 +5854,9 @@ else if (a[0] === 'return') spawnSync('git', ['-C', a.at(-1), 'checkout', '-q', 
   fs.writeFileSync(deliveryLog, '[]');
   fs.writeFileSync(fakeDelivery, `import fs from 'node:fs'; import path from 'node:path'; import { spawnSync } from 'node:child_process';
 const a = process.argv.slice(2), file = ${JSON.stringify(deliveryLog)}, log = JSON.parse(fs.readFileSync(file, 'utf8'));
-log.push({ a, cwd: process.cwd() }); fs.writeFileSync(file, JSON.stringify(log));
+const id = a[1] === '--detach' ? a[2] : a[1]?.split('/').at(-1);
+const task = a[0] === 'start' ? JSON.parse(fs.readFileSync(path.join(${JSON.stringify(homeDir)}, 'tasks', id, 'task.json'), 'utf8')) : null;
+log.push({ a, cwd: process.cwd(), ...(task ? { admission: { state: task.state, deliveryKind: task.deliveryKind, workflow: task.workflow } } : {}) }); fs.writeFileSync(file, JSON.stringify(log));
 const git = (...args) => spawnSync('git', args, { encoding: 'utf8' });
 if (a[0] === 'start') {
   const detach = a.indexOf('--detach'), branch = detach < 0 ? a[1] : null;
@@ -5728,7 +5864,11 @@ if (a[0] === 'start') {
   const existing = branch ? listed.find(w => w.branch === branch) : null;
   if (existing) { console.log(JSON.stringify({ path: existing.path, branch, created: false, pooled: true })); process.exit(0); }
   const slot = path.join(${JSON.stringify(poolDir)}, String(log.length), 'demo');
-  const r = git('worktree', 'add', ...(branch ? ['-b', branch] : ['--detach']), slot, 'HEAD');
+  const base = /^ref: refs\\/heads\\/(.+)\\tHEAD$/m.exec(git('ls-remote', '--symref', 'origin', 'HEAD').stdout)?.[1];
+  if (!base) { console.error('No published default branch'); process.exit(2); }
+  const fetched = git('fetch', '--quiet', 'origin', base);
+  if (fetched.status !== 0) { console.error(fetched.stderr); process.exit(2); }
+  const r = git('worktree', 'add', ...(branch ? ['-b', branch] : ['--detach']), slot, 'origin/' + base);
   if (r.status !== 0) { console.error(r.stderr); process.exit(2); }
   console.error('started in a pool slot'); console.log(JSON.stringify({ path: slot, branch, created: true, pooled: true }));
 } else if (a[0] === 'finish') {
@@ -5796,12 +5936,26 @@ if (a[0] === 'start') {
   assert.match(plainInstructions, /commit and push them/);
   assert.match(plainInstructions, /Do not open or merge a pull request yourself; crew land handles its publication/);
   assert.match(plainInstructions, /report at once; do not wait for CI or the delivery bot/);
-  commit(project, { 'AGENTS.md': TEMPLATE }, 'Use the shared workflow');
+  const publishedDefault = git('-C', projectOrigin, 'symbolic-ref', 'HEAD').trim();
+  const publishSnapshot = () => git('-C', project, 'push', '-q', 'origin', `HEAD:${publishedDefault}`);
+  const listedPooled = () => JSON.parse(dl(['project', 'list', '--json']).out).projects.find(p => p.name === 'pooled');
+  const workflowHead = commit(project, { 'AGENTS.md': TEMPLATE }, 'Use the shared workflow');
+  assert.equal(listedPooled().kind, 'plain', 'Unpublished local instructions cannot change the next allocation selection');
+  publishSnapshot();
+  assert.deepEqual([listedPooled().kind, listedPooled().kindSource], ['workflow', 'detected'], 'Published instructions govern automatic admission');
   r = dl(['spawn', 'w1', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'Add a feature.']); assert.equal(r.code, 0, r.out);
   assert.match(r.out, /follows the repository's delivery workflow/);
   const w1 = taskOf('w1'), w1brief = fs.readFileSync(w1.brief, 'utf8');
   assert.equal(w1.workflow, 'delivery');
-  assert.deepEqual(calls().filter(e => e.a[0] === 'instructions').map(e => slash(e.cwd).toLowerCase()).at(-1), slash(w1.worktree).toLowerCase(), 'Decided in the copy the worker gets');
+  assert.equal(head(w1.worktree), workflowHead, 'The fake allocator starts from the published default snapshot');
+  assert.deepEqual(calls().find(e => e.a[0] === 'start' && e.a[1] === 'feature/w1').admission,
+    { state: 'preparing', deliveryKind: 'workflow', workflow: 'delivery' }, 'Delivery is captured at reservation before allocation');
+  assert.ok(!calls().some(e => e.a[0] === 'instructions'), 'Admission reads snapshot signals without a post-allocation instructions subprocess');
+  const w1Record = path.join(homeDir, 'tasks', 'w1', 'task.json'), beforeKindChange = fs.readFileSync(w1Record, 'utf8');
+  r = dl(['project', 'set-kind', 'pooled', '--kind', 'plain', '--home', homeDir, '--expected-path', project, '--json']); assert.equal(r.code, 0, r.out);
+  assert.equal(listedPooled().kind, 'plain');
+  assert.equal(fs.readFileSync(w1Record, 'utf8'), beforeKindChange, 'A new Plain choice cannot rewrite the admitted Workflow task');
+  assert.equal(fs.readFileSync(w1.brief, 'utf8'), w1brief, 'An admitted brief stays immutable');
   assert.ok(w1brief.includes('`change-delivery` skill') && w1brief.includes('`delivery start feature/w1`') && w1brief.includes('`Plan: <pull request link>`') && !w1brief.includes('Do not push or open a pull request'), w1brief);
   const ghCalls = () => JSON.parse(fs.readFileSync(ghLog, 'utf8')).map(e => e.a);
   // Its first report is a plan: status says so, and land refuses it until the plan is approved.
@@ -5835,6 +5989,10 @@ if (a[0] === 'start') {
   assert.ok(ghCalls().at(-1).includes('graphql')); assert.ok(ghCalls().at(-1).includes('number=11'));
   assert.ok(taskOf('w1').landed); assert.equal(taskOf('w1').prFacts.state, 'OPEN');
   assert.match(dl(['land', 'w1']).out, /already has a pull request: https:\/\/github\.com\/acme\/demo\/pull\/11/);
+  // The preceding plan/report/land lifecycle retained Workflow even while future admissions were Plain.
+  assert.equal(taskOf('w1').workflow, 'delivery'); assert.equal(taskOf('w1').deliveryKind, 'workflow');
+  assert.equal(dl(['project', 'add', 'pooled', project]).code, 0, 'Re-registration clears the explicit choice for later detection coverage');
+  assert.equal(listedPooled().kind, 'workflow');
   // No link on the first line: the pull request GitHub has for the branch, never another one
   // the report mentions further down.
   assert.equal(dl(['spawn', 'w2', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
@@ -5853,9 +6011,11 @@ if (a[0] === 'start') {
   assert.deepEqual([taskOf('w3').pr, taskOf('w3').landed], [undefined, undefined]);
   fs.rmSync(ghDown);
   // A repository on an older template still counts: the template's header line is enough.
-  commit(project, { 'AGENTS.md': `${TEMPLATE}\nAn older line.\n` }, 'Older template');
+  const olderHead = commit(project, { 'AGENTS.md': `${TEMPLATE}\nAn older line.\n` }, 'Older template');
+  publishSnapshot();
   assert.equal(dl(['spawn', 'w4', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   assert.equal(taskOf('w4').workflow, 'delivery');
+  assert.equal(head(taskOf('w4').worktree), olderHead, 'Older-template coverage uses the published snapshot too');
   // The project's own choice wins over detection, either way, and is shown in the list.
   assert.equal(dl(['project', 'add', 'pooled', project, '--workflow', 'maybe']).code, 2);
   r = dl(['project', 'add', 'pooled', project, '--workflow', 'plain']); assert.equal(r.code, 0, r.out); assert.match(r.out, /\(workflow: plain\)/);
@@ -5866,9 +6026,11 @@ if (a[0] === 'start') {
   assert.match(explicitPlainInstructions, /commit and push them/);
   assert.match(explicitPlainInstructions, /Do not open or merge a pull request yourself; crew land handles its publication/);
   git('-C', project, 'rm', '-q', 'AGENTS.md'); git('-C', project, ...who, 'commit', '-q', '-m', 'Back to plain');
+  publishSnapshot();
   dl(['project', 'add', 'pooled', project, '--workflow', 'delivery']);
   assert.equal(dl(['spawn', 'w6', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
   assert.equal(taskOf('w6').workflow, 'delivery', 'Delivered by pull request without the shared instructions');
+  assert.ok(!fs.existsSync(path.join(taskOf('w6').worktree, 'AGENTS.md')), 'The explicit workflow override is exercised on a published Plain copy');
   // Like --gate-skip, the choice is part of the registration: adding again without it drops it.
   dl(['project', 'add', 'pooled', project]); assert.match(dl(['project', 'list']).out, /^pooled\t[^\t\r\n]*\r?$/m);
   assert.equal(dl(['spawn', 'w7', '--project', 'pooled', '--kind', 'ship', '--agent', 'pi', 'x']).code, 0);
