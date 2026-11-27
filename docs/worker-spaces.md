@@ -337,7 +337,12 @@ placement, irrespective of today's setting. No bulk migration or forced move occ
 Saved per-project names are safe nonempty basename strings, not recomputed from current
 registration spelling. Exact identity and label matching remain required. Occupied canonical
 joins retain the validated saved name, including old lower-case names; conflicting live saved
-names for one identity refuse admission. Crew does not rename occupied spaces: no atomic native
+names for one identity refuse admission. Name continuity is separate from positive occupancy:
+non-closed tasks retain their canonical name even while reported, stopped or failed, because
+they can still launch an inherited review or replacement. Such references do not make combined
+or canonical placement eligible for occupancy-based reuse; they only preserve the title if that
+canonical identity is selected. Closed history does not pin a naturally removed space's name.
+Crew does not rename occupied spaces: no atomic native
 rename exists in this command interface, and task/terminal writes would not atomically change
 native space state. A legacy heading can therefore remain lower-case until natural zero-tab
 removal. Reviews and replacements retain either old or new spelling without registry/path probes.
@@ -468,6 +473,12 @@ exact fleet key and scale guards remain in place. `--gaps=home-discovery-sandbox
 that subprocess fixtures cannot discover a host registry above their temporary root, even
 when temporary output is placed under a real Crew task folder; fixture-local registry
 checks and default-home tests still use the real command implementation.
+
+`--gaps=space-name-lifecycle` walks a lone legacy-named ship through spawn, plan report,
+approval, implementation report, reviewer launch/report/finish, reopen, relaunch, stop/relaunch
+and final finish. Every transition checks name/launch-label agreement and the next admission,
+without a leftover unfinished worker masking reported/stopped gaps. Natural removal releases
+the old name for a fresh canonical space. It also runs within `--gaps=space-name-case`.
 
 `--gaps=space-name-case` covers directory spelling, aliases, real linked fixture copies under
 hash-bearing pool parents, dot-prefixed projects, safe-name and exact-label validation, old

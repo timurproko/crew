@@ -1129,7 +1129,14 @@ function cmdProjectKinds(args) {
     const registered = registeredProject(h, name);
     if (!registered) localSettingRefuse('project-missing', 'The project is not registered.');
     const expected = options.get('--expected-path');
-    const pathMatches = project => Boolean(project && path.isAbsolute(expected) && path.isAbsolute(project.path) && sameLaunchDirectory(project.path, expected));
+    const pathMatches = project => {
+      if (!project || !path.isAbsolute(expected) || !path.isAbsolute(project.path)) return false;
+      try {
+        const actual = fs.realpathSync.native(project.path), wanted = fs.realpathSync.native(expected);
+        return fs.statSync(actual).isDirectory() && fs.statSync(wanted).isDirectory()
+          && comparablePath(actual) === comparablePath(wanted);
+      } catch { return false; }
+    };
     if (!pathMatches(registered)) localSettingRefuse('project-changed', 'The project folder changed; refresh before trying again.');
     if (!projectKindAvailable(kind, registered.path)) localSettingRefuse('kind-unavailable', 'The selected kind requires an available delivery tool or gate tool and remote.');
     const changed = withRegistry(h, () => {
@@ -1991,6 +1998,19 @@ function workerSpaceOccupancy(h, tasks, deadline) {
   const listed = hcJson(['ls', '--json'], options());
   if (listed.code !== 0 || !Array.isArray(listed.value?.terminals)) fail('Core did not provide terminal occupancy');
   const records = new Map(tasks.map(t => [t.id, t])), projects = new Map();
+  const rememberName = space => {
+    if (!projects.has(space.id)) projects.set(space.id, { projects: new Set(), space });
+    const occupied = projects.get(space.id);
+    if (space.mode === 'per-project' && occupied.space.name !== space.name) fail(`space ${space.id} has conflicting saved names`);
+    return occupied;
+  };
+  // Name continuity is not worker occupancy. A reported/stopped/failed task can
+  // still launch an inherited reviewer or replacement after its terminal ends.
+  // Pin its canonical name until closure, without letting it establish reuse.
+  for (const task of tasks.filter(t => t.state !== 'closed')) {
+    const space = resolveWorkerSpace(h, task);
+    if (space.mode === 'per-project') rememberName(space);
+  }
   const owned = new Map();
   for (const task of tasks.filter(unfinishedSpaceWorker)) for (const record of ownedTerminals(task)) {
     if (owned.has(record.address)) fail(`terminal ${record.address} is recorded by multiple tasks`);
@@ -2029,10 +2049,7 @@ function workerSpaceOccupancy(h, tasks, deadline) {
     // Kept shells are live terminals, not live workers. Pi can advertise status.app
     // even on Core versions that do not recognize it in the inventory's agent field.
     if (!entry.agent && !terminal.agent && !terminal.status?.app) continue;
-    if (!projects.has(space.id)) projects.set(space.id, { projects: new Set(), space });
-    const occupied = projects.get(space.id);
-    if (space.mode === 'per-project' && occupied.space.name !== space.name) fail(`space ${space.id} has conflicting saved names`);
-    occupied.projects.add(space.project);
+    rememberName(space).projects.add(space.project);
   }
   return projects;
 }
@@ -2051,7 +2068,7 @@ function admittedWorkerSpace(h, task, repair, occupancy, name) {
   const exclusive = id => occupancy.get(id)?.projects.size === 1 && occupancy.get(id).projects.has(project);
   if (exclusive(canonical.id)) return occupancy.get(canonical.id).space;
   const combined = makeWorkerSpace(h, 'combined', project);
-  return exclusive(combined.id) ? combined : canonical;
+  return exclusive(combined.id) ? combined : occupancy.get(canonical.id)?.space ?? canonical;
 }
 function makeWorkerSpace(h, mode, project, name = project === SELF_PROJECT ? 'crew' : project) {
   const base = `fm-crew-${h.config.tag}`;

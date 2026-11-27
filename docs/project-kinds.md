@@ -56,7 +56,9 @@ crew project set-kind myworkflows --kind workflow --home C:/Users/me/.crew --exp
 ```
 
 All four flags are required exactly once. The existing name must match a valid project ID.
-The expected folder must be absolute and canonically match the registered path; a removed or
+The expected folder must be absolute and resolve to an existing canonical directory matching
+the registered path; lexical equality alone is not proof. Missing folders and files refuse,
+including disappearance before the locked recheck and otherwise no-op requests. A removed or
 repointed name refuses. Canonical-equivalent path aliases can match, but the stored path is
 never rewritten. The setter rereads/rechecks the initialized home, owner, project and path
 under `projects.lock`, merges into the fresh registration and atomically publishes **only**
@@ -112,4 +114,5 @@ intentionally conservative about stale owner records. Native Settings rendering 
 transport remain Herdr responsibilities; tests use only fake homes, local repositories and Core.
 
 Focused tests: `node crew.test.mjs --gaps=workflow-detection`,
-`node crew.test.mjs --gaps=project-kinds` and `node crew.test.mjs --gaps=project-kinds-concurrency`.
+`node crew.test.mjs --gaps=project-kinds`, `node crew.test.mjs --gaps=project-kinds-concurrency`
+and `node crew.test.mjs --gaps=project-kind-paths` (missing/file targets and locked disappearance).

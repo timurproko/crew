@@ -798,6 +798,35 @@ gapTests['project-kinds-concurrency'] = async () => {
   } finally { fs.writeFileSync(gate.release, 'go'); await pending.result; }
 };
 
+gapTests['project-kind-paths'] = async () => {
+  const f = projectKindFixture('path-proof'), registry = path.join(f.home, 'crew.json'), moved = path.join(f.dir, 'moved-repo');
+  const args = kind => ['project', 'set-kind', 'demo', '--kind', kind, '--home', f.home, '--expected-path', f.repo, '--json'];
+  const refuses = (r, before) => {
+    assert.equal(r.code, 2, r.out); assert.equal(JSON.parse(r.out).error.code, 'project-changed');
+    assert.equal(fs.readFileSync(registry, 'utf8'), before, 'Stale path refusal preserves registration bytes');
+  };
+  let before = fs.readFileSync(registry, 'utf8');
+  fs.renameSync(f.repo, moved);
+  try {
+    refuses(f.call(args('plain')), before);
+    fs.writeFileSync(f.repo, 'not a directory');
+    try { refuses(f.call(args('plain')), before); } finally { fs.unlinkSync(f.repo); }
+  } finally { fs.renameSync(moved, f.repo); }
+  assert.equal(f.call(args('plain')).code, 0, 'An existing canonical directory still works');
+  for (const kind of ['workflow', 'plain']) {
+    const gate = projectBarrier(f, 'before', `kind-delete-${kind}`);
+    const pending = projectProcess(f, args(kind), { script: gate.script, terminal: f.owner, env: f.env });
+    try {
+      await until(() => fs.existsSync(gate.ready)); before = fs.readFileSync(registry, 'utf8');
+      fs.renameSync(f.repo, moved); fs.writeFileSync(gate.release, 'go');
+      refuses(await pending.result, before); // locked recheck, including an otherwise no-op request
+    } finally {
+      fs.writeFileSync(gate.release, 'go'); await pending.result;
+      if (fs.existsSync(moved)) fs.renameSync(moved, f.repo);
+    }
+  }
+};
+
 // Concurrent CLIs with test-only filesystem barriers: no timing guesses or production hooks.
 function projectProcess(f, args, { script = path.join(here, 'crew.mjs'), terminal = '', env = {}, cwd = f.home } = {}) {
   const child = spawn(process.execPath, [script, ...args], { cwd, env: {
@@ -1031,7 +1060,66 @@ function spaceNameCompatibilityTests() {
     assert.ok(!readWorld().log.slice(before).some(c => ['run', 'kill', 'rm'].includes(c[0])));
   }
 }
-gapTests['space-name-case'] = () => { spaceNameCaseTests(); spaceNameCompatibilityTests(); };
+function spaceNameLifecycleTests(name) {
+  const f = joinSpaceFixture(name), repo = path.join(f.dir, 'MyWorkflows');
+  git('clone', '-q', f.repo, repo); f.add('myworkflows', repo); f.add('other'); f.mode('per-project');
+  const source = f.spawn('ship', 'myworkflows', ['--kind', 'ship']);
+  const placement = { ...source.workerSpace, name: 'myworkflows' };
+  f.save({ ...source, workflow: 'delivery', workerSpace: placement,
+    terminalLaunches: source.terminalLaunches.map(intent => ({ ...intent, workerSpace: placement })) });
+  setTerminal(source.terminal, { labels: { ...f.labels(source), 'crew.space.name': placement.name } });
+  const w = readWorld(); w.spaces = { [placement.id]: { id: placement.id, name: placement.name, automatic: true, members: [source.terminal] } };
+  w.terminals[source.terminal].space = placement.id; fs.writeFileSync(world, JSON.stringify(w));
+  const tasks = () => fs.readdirSync(path.join(f.home, 'tasks')).map(id => f.task(id));
+  const consistent = stage => {
+    for (const task of tasks().filter(t => t.state !== 'closed' && t.workerSpace?.id === placement.id)) {
+      assert.equal(task.workerSpace.name, placement.name, `${stage}: saved ${task.id}`);
+      for (const intent of task.terminalLaunches ?? []) assert.equal(intent.workerSpace.name, placement.name, `${stage}: launch intent ${task.id}`);
+    }
+    for (const terminal of Object.values(readWorld().terminals).filter(t => t.state === 'live' && t.labels?.['herdr.space'] === placement.id)) {
+      assert.equal(terminal.labels['crew.space.name'], placement.name, `${stage}: live ${terminal.address}`);
+    }
+    assert.equal(readWorld().spaces[placement.id].name, placement.name, `${stage}: no modeled rename`);
+  };
+  const next = stage => {
+    consistent(stage);
+    const admitted = f.spawn(`after-${stage}`, 'myworkflows');
+    assert.deepEqual(admitted.workerSpace, placement, `${stage}: next admission`); consistent(stage);
+    f.done(admitted);
+    const r = f.call(['finish', admitted.id, '--force']); assert.equal(r.code, 0, r.out);
+    consistent(stage); // probes leave no unfinished worker masking the next transition
+  };
+  const reported = (id, text) => {
+    const task = f.task(id); fs.writeFileSync(task.report, text);
+    const r = crew(['done', id], { cwd: f.home, terminal: task.terminal, env: f.env }); assert.equal(r.code, 0, r.out);
+    assert.equal(f.task(id).state, 'reported');
+  };
+  const noWorkers = () => assert.ok(!tasks().some(t => t.workerSpace?.id === placement.id && ['working', 'preparing'].includes(t.state)));
+  const url = 'https://github.com/acme/demo/pull/42';
+  next('spawn');
+  reported(source.id, `Plan: ${url}\n\nA plan.`); assert.equal(f.task(source.id).stage, 'plan'); noWorkers(); next('plan');
+  let r = f.call(['tell', source.id, 'approved, implement']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(source.id).state, 'working'); next('approval');
+  reported(source.id, `Implementation: ${url}\n\nImplemented.`); assert.equal(f.task(source.id).stage, 'implementation'); noWorkers(); next('implementation');
+  r = f.call(['review', source.id, '--agent', 'pi']); assert.equal(r.code, 0, r.out); next('review-spawn');
+  const review = f.task('ship-review'); assert.deepEqual(review.workerSpace, placement);
+  reported(review.id, 'APPROVE\n\n## What I checked\nThe change.'); noWorkers(); next('review-report');
+  r = f.call(['finish', review.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(review.id).state, 'closed'); noWorkers(); next('review-finish');
+  r = f.call(['tell', source.id, 'Continue implementation.']); assert.equal(r.code, 0, r.out); next('reopen');
+  r = f.call(['relaunch', source.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out); next('relaunch');
+  r = f.call(['stop', source.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(source.id).state, 'stopped'); noWorkers(); next('stopped');
+  r = f.call(['relaunch', source.id, '--agent', 'pi', '--model', 'third']); assert.equal(r.code, 0, r.out); next('stopped-relaunch');
+  reported(source.id, `Implementation: ${url}\n\nFinished.`); noWorkers(); next('final-report');
+  // Unrelated projects must remain admissible throughout settled legacy state.
+  const other = f.spawn('unrelated', 'other'); assert.equal(other.workerSpace.project, 'other');
+  r = f.call(['finish', source.id, '--force']); assert.equal(r.code, 0, r.out);
+  assert.equal(f.task(source.id).state, 'closed'); assert.equal(readWorld().spaces[placement.id], undefined);
+  const fresh = f.spawn('fresh', 'myworkflows'); assert.equal(fresh.workerSpace.name, 'MyWorkflows', 'Closed history does not pin a deleted space');
+}
+gapTests['space-name-lifecycle'] = () => spaceNameLifecycleTests('name-lifecycle-focused');
+gapTests['space-name-case'] = () => { spaceNameCaseTests(); spaceNameCompatibilityTests(); spaceNameLifecycleTests('name-lifecycle-group'); };
 
 function workerSpaceInheritanceTests() {
   for (const initial of ['combined', 'per-project']) {
