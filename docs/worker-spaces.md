@@ -37,8 +37,10 @@ edits do not need it and remain usable during slow Core calls.
 Copy allocation stays outside both gate and registry lock. A saved preparing reservation with no
 published terminal constrains later admission but is not positive occupancy; contenders release
 the gate between retries so the launch can publish. Each reservation records a random preparation
-token and the spawner's local host/platform, PID and OS process-start identity. Windows uses
-Get-Process creation ticks; Linux uses boot ID plus /proc start ticks; other POSIX hosts use
+token and the spawner's local host/platform, PID and OS process-start identity. Windows queries
+.NET Process creation ticks directly, without PowerShell cmdlet/module autoload or JSON formatting,
+with a bounded ten-second cold-start allowance and explicit failure diagnostics. Linux uses boot
+ID plus /proc start ticks; other POSIX hosts use
 locale/timezone-stable ps start time. PID existence with the same start identity means live,
 regardless of how long preparation takes. Missing permissions, malformed identity and another
 host are unknown, never dead. An absent PID or a different verified start identity proves the
@@ -55,26 +57,51 @@ admission encountering a dead reservation refuses in one line naming the exact h
 It does not silently discard another task's partial work. Concurrent recovery commands serialize;
 losers may retry and an already-finished recovery is idempotent.
 
-Allocator and initial Core launch stdout are kept as nonce-bound task-folder receipts. Recovery
-can validate an unpublished delivery copy against the project's Git common directory, and a
-returned Core address is durable launch ownership evidence rather than inferred from labels.
-Partial/unverifiable external-tool output cannot authorize adopting foreign terminals or deleting
-an unverified copy. Actual Core start and publication share one gate interval. Already-admitted launches allow up to
+Every Core launch, including replacements, first persists an immutable per-run intent containing
+a fresh random nonce, publisher OS identity, task/home, cwd, placement and agent. Only then is
+`hc run` called with `crew.launch=<nonce>`. This persisted capability is launch ownership authority,
+not a generic placement label. If Core creates the terminal but its response/receipt is lost,
+reconciliation by another process requires a dead publisher, a unique exact nonce match and the
+entire recorded identity tuple. The publisher can reconcile its own settled failed response. Generic task/home/space labels or cwd alone never suffice. Conflicting or duplicate
+nonce matches fail closed before any terminal is adopted or stopped. Reconciled addresses enter
+the durable owned-terminal history under the placement gate. A normal acknowledgement records
+ownership before final working-state publication, and stale task saves retain launch authority.
+
+Allocator and initial Core stdout are also kept as task-folder receipts. Recovery validates an
+unpublished delivery copy against the project's Git common directory. Unverified copy receipts
+cannot authorize deletion. An unacknowledged Core error keeps the copy and its intent, not an
+assumption that no worker exists. Actual Core start and publication share one gate interval.
+
+The worker shell performs a task-read-only `_launch-check` under the same placement gate before
+executing the agent. Authorization therefore cannot slip between a cleanup's negative inventory
+and its cancellation write. Cancelled,
+superseded or closed generations cannot start agents later, including in a reused folder. If a
+queued Core request creates a terminal after cancellation, admission reconciles its recorded nonce
+and names the same exact finish command. A repeated finish cleans only that generation's owned
+terminals when the old copy already returned; it never returns/deletes a reused folder a second
+time. Superseded late nonces enter ownership history without rewinding the current terminal or
+profile. Replacement reconciles its actual previous worker before stopping it, and an automatic
+wait discards a stale observation when reconciliation changed that worker. A live or unverifiable
+publisher cannot have its pending launch claimed by another process. Already-admitted launches allow up to
 ten minutes to reacquire the gate for publication/failure recording, matching the copy allocator's
 existing long wait instead of stranding preparation on brief contention. Failed reservations do
 not establish occupancy. Core reads share a ten-second
 admission budget with at most two seconds per probe. Gate contention and preparing launches cause
 bounded wait/retry or worker-space-busy refusal, before the contender creates a task or copy;
 background observation writers yield immediately, and done retains its existing longer report wait.
-The placement gate is an atomically published populated directory with a unique owner-nonce
-file containing the same OS identity proof. A proven-dead owner is reclaimable. Exactly one
+The placement gate and per-task writer/intent locks are atomically published populated directories
+with unique owner-nonce files containing the same OS identity proof. This includes a publisher
+dying inside the acknowledgement/publication task transaction, not only during allocation. A proven-dead owner is reclaimable. Exactly one
 contender can unlink that nonce; removal of the now-empty directory is non-recursive, so a new
 populated live gate cannot be deleted by a delayed reclaimer. A reclaimer interrupted after
 unlinking its nonce leaves an empty, safely removable gate, not another permanent reservation.
 Release retires the owned directory before deleting it privately. Live, unverifiable and old
 file-format gates are never stolen by PID/age guesses. This intentionally serializes terminal
-transitions within a home, so slow cleanup can require another command to retry. Legacy binaries
-and direct-file writers cannot participate.
+transitions within a home, so slow cleanup can require another command to retry. Registry locks
+remain regular files with complete OS identity and claim nonce. Under the placement gate, a dead
+registry claim is removed only after death proof and a fresh matching-nonce read; registry-only
+writers stay independent, but all reclaimers serialize through the gate. Legacy/unverifiable file
+locks remain protected. Legacy binaries and direct-file writers cannot participate.
 
 Slow external operations do not hold the registry lock. Switching never
 moves, relabels or reorders already-spawned workers or creates/removes any space.
@@ -378,6 +405,18 @@ returns its address. It covers live-but-slow protection without age expiry, coor
 racing stale-gate/admission detection and finish recovery, token cancellation, unpublished copy/
 terminal receipts, PID reuse, unknown identity and an interrupted empty-gate reclaimer. It uses
 real local process identity with fake Core and isolated homes, never the live coordinator.
+`--gaps=launch-nonce-recovery` tests the exact Core-created/before-response gap with an empty receipt,
+a queued request arriving after finish, acknowledgement and working-state publication kills,
+wrong/missing nonce foreign terminals, duplicate/conflicting evidence, and agent-start fencing.
+The reused-folder sentinel must survive late terminal-only cleanup. `--gaps=launch-nonce-handover`
+covers lost replacement responses and superseded queued nonces without rewinding a live worker.
+`--gaps=launch-authorization-gate` queues Core creation between negative inventory and cancellation
+publication and proves that authorization waits, then denies. `--gaps=launch-commandline` parses
+Pi/Claude launch scripts and proves that denial fences the entire compound fallback command.
+`--gaps=windows-process-proof`
+checks the native query with module autoload disabled and ensures timeout/permission/invalid output
+never becomes death proof. The minimal-home PR-facts and writer-contention tests retain their
+persistence, nonblocking and lifecycle-preservation assertions under the same locking protocol.
 
 The additional focused groups `--gaps=worker-space-local-setter` and
 `--gaps=worker-space-local-ordering` cover the desktop command, exact capability/results,

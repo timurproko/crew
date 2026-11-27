@@ -1340,6 +1340,245 @@ fs.writeFileSync=(file,...args)=>{const result=write(file,...args);if(!paused &&
 const { main }=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));`);
   return { ready, release, script };
 }
+function lostResponseClient(f, queued = false) {
+  const ready = path.join(f.dir, 'client-ready'), release = path.join(f.dir, 'client-release'), script = path.join(f.dir, 'lost-response.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs';import {spawnSync} from 'node:child_process';import {spawnerIdentity} from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const args=process.argv.slice(2);let result;
+if(args[0]!=='run'){result=spawnSync(process.execPath,[${JSON.stringify(fake)},...args],{encoding:'utf8'});}
+else {
+  if(!${queued})result=spawnSync(process.execPath,[${JSON.stringify(fake)},...args],{encoding:'utf8'});
+  fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({owner:spawnerIdentity(),args,address:result?JSON.parse(result.stdout).address:null}));
+  const deadline=Date.now()+60000;while(!fs.existsSync(${JSON.stringify(release)})){if(Date.now()>deadline)process.exit(99);Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}
+  if(${queued})result=spawnSync(process.execPath,[${JSON.stringify(fake)},...args],{encoding:'utf8'});
+}
+process.stdout.write(result.stdout??'');process.stderr.write(result.stderr??'');process.exitCode=result.status;`);
+  return { ready, release, script };
+}
+function publicationCheckpoint(f, after) {
+  const ready = path.join(f.dir, 'publication-ready'), release = path.join(f.dir, 'publication-release'), script = path.join(f.dir, 'publication-checkpoint.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs';const rename=fs.renameSync;let paused=false;
+fs.renameSync=(from,to)=>{if(!paused && to===${JSON.stringify(path.join(f.home, 'tasks', 'abandoned', 'task.json'))} && JSON.parse(fs.readFileSync(from,'utf8')).state==='working'){
+  paused=true;const result=${after}?rename(from,to):undefined;fs.writeFileSync(${JSON.stringify(ready)},'ready');const deadline=Date.now()+15000;
+  while(!fs.existsSync(${JSON.stringify(release)})){if(Date.now()>deadline)throw Error('Publication timeout');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}
+  return ${after}?result:rename(from,to);
+}return rename(from,to);};const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));`);
+  return { ready, release, script };
+}
+async function endFixtureClient(identity) {
+  if (!identity) return;
+  if (spawnerState(identity) === 'live') process.kill(identity.pid, 'SIGKILL');
+  await until(() => spawnerState(identity) === 'dead');
+}
+gapTests['launch-commandline'] = () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    const f = joinSpaceFixture('launch-commandline');
+    const bash = WINDOWS ? 'C:/Program Files/Git/bin/bash.exe' : 'bash';
+    for (const harness of ['pi', 'claude']) {
+      const result = f.call(['spawn', harness, '--project', 'demo', '--agent', harness, 'Count.']); assert.equal(result.code, 0, result.out);
+      const task = f.task(harness), nonce = task.terminalLaunches.at(-1).nonce;
+      const line = readWorld().log.filter(args => args[0] === 'run').at(-1).at(-1);
+      const check = `${shq(bashPath(process.execPath))} ${shq(bashPath(path.join(here, 'crew.mjs')))} _launch-check ${shq(task.id)} ${shq(nonce)}`;
+      assert.ok(line.includes(check)); assert.equal(f.labels(task)['crew.launch'], nonce);
+      const syntax = spawnSync(bash, ['--noprofile', '--norc', '-n', '-c', line], { encoding: 'utf8' }); assert.equal(syntax.status, 0, syntax.stderr);
+      // Denial must fence the entire compound Claude auto-mode/fallback script,
+      // not merely its first assignment. No actual agent is executed here.
+      const blocked = line.replace(check, 'false').replaceAll(shq(harness), "printf 'AGENT_RAN'").replace('exec bash --login -i', ':');
+      const denied = spawnSync(bash, ['--noprofile', '--norc', '-c', blocked], { cwd: task.worktree, encoding: 'utf8', env: { ...process.env, HOME: fakeUser, USERPROFILE: fakeUser, TMPDIR: root } });
+      assert.equal(denied.status, 0, denied.stderr); assert.equal(denied.stdout, '', 'No agent/fallback executes after nonce denial');
+    }
+  } finally { fs.writeFileSync(world, before); }
+};
+gapTests['launch-nonce-recovery'] = async () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    for (const phase of ['created', 'report', 'queued', 'generic-foreign', 'wrong-nonce', 'duplicate', 'wrong-cwd', 'ack', 'published']) {
+      const name = `nonce-${phase}`, f = joinSpaceFixture(name); f.mode('per-project');
+      const client = ['ack', 'published'].includes(phase) ? publicationCheckpoint(f, phase === 'published') : lostResponseClient(f, phase === 'queued');
+      const owner = `owner-spaces-${name}`;
+      const pending = projectProcess(f, ['spawn', 'abandoned', '--project', 'demo', '--agent', 'pi', 'Count.'], {
+        script: ['ack', 'published'].includes(phase) ? client.script : path.join(here, 'crew.mjs'), terminal: owner,
+        env: { ...f.env, ...(['ack', 'published'].includes(phase) ? {} : { CREW_HC: client.script }) },
+      });
+      const call = args => crew(args, { cwd: f.home, terminal: owner, env: f.env });
+      let information;
+      try {
+        await until(() => fs.existsSync(client.ready));
+        const task = f.task('abandoned'), intent = task.terminalLaunches.at(-1);
+        assert.equal(intent.task, task.id); assert.equal(intent.home, f.labels ? JSON.parse(fs.readFileSync(path.join(f.home, 'crew.json'), 'utf8')).tag : null);
+        if (!['ack', 'published'].includes(phase)) {
+          information = JSON.parse(fs.readFileSync(client.ready, 'utf8'));
+          assert.equal(fs.statSync(path.join(f.home, 'tasks', task.id, `launch-${task.preparation.token}.json`)).size, 0, 'No address reached the stdout receipt');
+          assert.equal(task.terminal, null);
+        } else {
+          assert.ok(task.terminal, 'Acknowledged address is durably owned before final publication');
+          assert.equal(task.state, phase === 'published' ? 'working' : 'preparing');
+        }
+        pending.child.kill('SIGKILL'); await pending.result;
+        await endFixtureClient(information?.owner);
+        const check = nonce => spawnSync(process.execPath, [path.join(here, 'crew.mjs'), '_launch-check', task.id, nonce], {
+          cwd: task.worktree, encoding: 'utf8', env: { ...process.env, CREW_HOME: f.home, HOME: fakeUser, USERPROFILE: fakeUser, CREW_HC: fake },
+        });
+        assert.equal(check(intent.nonce).status, 0, 'The recorded active generation authorizes its worker');
+        assert.equal(check('00000000-0000-4000-8000-000000000000').status, 6, 'Generic task/cwd is not launch authority');
+        let foreign;
+        if (['generic-foreign', 'wrong-nonce', 'duplicate'].includes(phase)) {
+          const w = readWorld(), source = w.terminals[information.address];
+          foreign = 'foreign'; w.terminals[foreign] = { ...structuredClone(source), address: foreign };
+          if (phase === 'generic-foreign') delete w.terminals[foreign].labels['crew.launch'];
+          if (phase === 'wrong-nonce') w.terminals[foreign].labels['crew.launch'] = '00000000-0000-4000-8000-000000000000';
+          fs.writeFileSync(world, JSON.stringify(w));
+        }
+        if (phase === 'wrong-cwd') setTerminal(information.address, { cwd: f.dir });
+        if (phase === 'duplicate' || phase === 'wrong-cwd') {
+          const log = readWorld().log.length, refused = call(['finish', task.id, '--force']);
+          assert.equal(refused.code, 4, refused.out); assert.match(refused.out, /ambiguous launch nonce|identity conflicts/);
+          assert.ok(!readWorld().log.slice(log).some(a => ['kill', 'rm'].includes(a[0])));
+          assert.ok(!f.task(task.id).terminals?.length, 'Ambiguous/conflicting nonce evidence cannot claim any terminal');
+          if (foreign) { const w = readWorld(); delete w.terminals[foreign]; fs.writeFileSync(world, JSON.stringify(w)); foreign = null; }
+          else setTerminal(information.address, { cwd: task.worktree });
+        }
+        if (phase === 'report') {
+          fs.writeFileSync(task.report, 'Completed by the unacknowledged worker.');
+          const reported = crew(['done', task.id], { cwd: f.home, terminal: information.address, env: f.env });
+          assert.equal(reported.code, 0, reported.out); assert.equal(f.task(task.id).terminal, information.address);
+          assert.equal(f.task(task.id).state, 'reported');
+        }
+        let result = call(['finish', task.id, '--force']); assert.equal(result.code, 0, result.out);
+        const closed = f.task(task.id); assert.equal(closed.state, 'closed');
+        if (information?.address) {
+          assert.ok(closed.terminals.some(item => item.address === information.address), 'Created-but-unacknowledged terminal is reconciled by its persisted nonce');
+          assert.ok(!readWorld().terminals[information.address]);
+        }
+        if (foreign) {
+          assert.equal(readWorld().terminals[foreign].state, 'live', 'Force never adopts generic/wrong-nonce terminals');
+          assert.ok(closed.copyToReturn);
+          const w = readWorld(); delete w.terminals[foreign]; fs.writeFileSync(world, JSON.stringify(w));
+          result = call(['finish', task.id, '--force']); assert.equal(result.code, 0, result.out);
+        }
+        if (phase === 'queued') {
+          // Model a Core service executing its already-sent request only AFTER
+          // cancellation. The client is dead; no publisher can attach an address.
+          fs.mkdirSync(task.worktree, { recursive: true }); fs.writeFileSync(path.join(task.worktree, 'unrelated.txt'), 'must survive terminal-only cleanup');
+          const late = spawnSync(process.execPath, [fake, ...information.args], { encoding: 'utf8' }); assert.equal(late.status, 0, late.stderr);
+          const address = JSON.parse(late.stdout).address;
+          assert.equal(check(intent.nonce).status, 6, 'A cancelled delayed generation cannot start its agent in a reused folder');
+          result = call(['spawn', 'next', '--project', 'demo', '--agent', 'pi', 'Count.']);
+          assert.equal(result.code, 4, result.out); assert.match(result.out, /late nonce-owned launch.*crew finish abandoned --force/);
+          result = call(['finish', task.id, '--force']); assert.equal(result.code, 0, result.out);
+          assert.ok(!readWorld().terminals[address]);
+          assert.equal(fs.readFileSync(path.join(task.worktree, 'unrelated.txt'), 'utf8'), 'must survive terminal-only cleanup');
+        }
+        result = call(['spawn', 'next', '--project', 'demo', '--agent', 'pi', 'Count.']); assert.equal(result.code, 0, result.out);
+      } finally {
+        fs.writeFileSync(client.release, 'go');
+        if (pending.child.exitCode === null && pending.child.signalCode === null) pending.child.kill('SIGKILL');
+        await pending.result; await endFixtureClient(information?.owner);
+      }
+    }
+  } finally { fs.writeFileSync(world, before); }
+};
+gapTests['launch-nonce-handover'] = async () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    for (const queued of [false, true]) {
+      const name = `nonce-handover-${queued}`, f = joinSpaceFixture(name); f.mode('per-project');
+      const original = f.spawn('abandoned'), client = lostResponseClient(f, queued), owner = `owner-spaces-${name}`;
+      const pending = projectProcess(f, ['relaunch', original.id, '--agent', 'pi', '--model', 'second'], { terminal: owner, env: { ...f.env, CREW_HC: client.script } });
+      let information;
+      try {
+        await until(() => fs.existsSync(client.ready)); information = JSON.parse(fs.readFileSync(client.ready, 'utf8'));
+        pending.child.kill('SIGKILL'); await pending.result; await endFixtureClient(information.owner);
+        const result = f.call(['relaunch', original.id, '--agent', 'pi', '--model', 'third']); assert.equal(result.code, 0, result.out);
+        const current = f.task(original.id), untouched = structuredClone(readWorld().terminals[current.terminal]);
+        assert.equal(current.launch.model, 'third');
+        if (!queued) {
+          assert.ok(current.terminals.some(item => item.address === information.address));
+          assert.ok(!readWorld().terminals[information.address], 'Replacement reconciles and stops the actual unacknowledged worker first');
+        } else {
+          const late = spawnSync(process.execPath, [fake, ...information.args], { encoding: 'utf8' }); assert.equal(late.status, 0, late.stderr);
+          const probe = f.call(['spawn', 'probe', '--project', 'demo', '--agent', 'pi', 'Count.']); assert.equal(probe.code, 0, probe.out);
+          const updated = f.task(original.id);
+          assert.equal(updated.terminal, current.terminal, 'A superseded nonce may enter owned history but never rewind the current worker');
+          assert.equal(updated.launch.model, 'third'); assert.deepEqual(readWorld().terminals[current.terminal], untouched);
+          assert.ok(updated.terminals.some(item => item.address === JSON.parse(late.stdout).address));
+          const denied = await projectProcess(f, ['_launch-check', original.id, updated.terminalLaunches[1].nonce], { cwd: current.worktree, env: f.env }).result;
+          assert.equal(denied.code, 6, denied.out);
+        }
+      } finally {
+        fs.writeFileSync(client.release, 'go');
+        if (pending.child.exitCode === null && pending.child.signalCode === null) pending.child.kill('SIGKILL');
+        await pending.result; await endFixtureClient(information?.owner);
+      }
+    }
+  } finally { fs.writeFileSync(world, before); }
+};
+gapTests['launch-authorization-gate'] = async () => {
+  const before = fs.readFileSync(world, 'utf8'), f = joinSpaceFixture('nonce-authorization'); f.mode('per-project');
+  const client = lostResponseClient(f, true), owner = 'owner-spaces-nonce-authorization';
+  const pending = projectProcess(f, ['spawn', 'abandoned', '--project', 'demo', '--agent', 'pi', 'Count.'], { terminal: owner, env: { ...f.env, CREW_HC: client.script } });
+  const ready = path.join(f.dir, 'cancel-ready'), release = path.join(f.dir, 'cancel-release'), marker = path.join(f.dir, 'guard-waiting');
+  let information, finish, guard;
+  try {
+    await until(() => fs.existsSync(client.ready)); information = JSON.parse(fs.readFileSync(client.ready, 'utf8'));
+    const task = f.task('abandoned'), nonce = task.terminalLaunches[0].nonce;
+    pending.child.kill('SIGKILL'); await pending.result; await endFixtureClient(information.owner);
+    const script = path.join(f.dir, 'cancel-checkpoint.mjs');
+    fs.writeFileSync(script, `import fs from 'node:fs';const rename=fs.renameSync;let paused=false;
+fs.renameSync=(from,to,...args)=>{if(!paused && to===${JSON.stringify(path.join(f.home, 'tasks', task.id, 'task.json'))} && JSON.parse(fs.readFileSync(from,'utf8')).preparation?.cancelled){paused=true;fs.writeFileSync(${JSON.stringify(ready)},'ready');const deadline=Date.now()+15000;while(!fs.existsSync(${JSON.stringify(release)})){if(Date.now()>deadline)throw Error('Cancellation timeout');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}}return rename(from,to,...args);};const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));`);
+    finish = projectProcess(f, ['finish', task.id, '--force'], { script, terminal: owner, env: f.env });
+    await until(() => fs.existsSync(ready));
+    // Core creates its queued terminal after finish's negative inventory but
+    // before cancellation is persisted. Authorization must wait on that gate.
+    const late = spawnSync(process.execPath, [fake, ...information.args], { encoding: 'utf8' }); assert.equal(late.status, 0, late.stderr);
+    const checker = path.join(f.dir, 'guard-checkpoint.mjs');
+    fs.writeFileSync(checker, `import fs from 'node:fs';const rename=fs.renameSync;fs.renameSync=(from,to,...args)=>{if(String(to).endsWith('worker-spaces.lock'))fs.writeFileSync(${JSON.stringify(marker)},'waiting');return rename(from,to,...args);};const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));`);
+    guard = projectProcess(f, ['_launch-check', task.id, nonce], { script: checker, cwd: task.worktree, env: f.env });
+    await until(() => fs.existsSync(marker));
+    fs.writeFileSync(release, 'go');
+    const finished = await finish.result; assert.equal(finished.code, 0, finished.out);
+    const denied = await guard.result; assert.equal(denied.code, 6, denied.out);
+    const cleaned = f.call(['finish', task.id, '--force']); assert.equal(cleaned.code, 0, cleaned.out);
+    assert.ok(!readWorld().terminals[JSON.parse(late.stdout).address]);
+    const next = f.call(['spawn', 'next', '--project', 'demo', '--agent', 'pi', 'Count.']); assert.equal(next.code, 0, next.out);
+  } finally {
+    fs.writeFileSync(release, 'go'); fs.writeFileSync(client.release, 'go');
+    for (const process of [pending, finish, guard].filter(Boolean)) {
+      if (process.child.exitCode === null && process.child.signalCode === null) process.child.kill('SIGKILL');
+      await process.result;
+    }
+    await endFixtureClient(information?.owner); fs.writeFileSync(world, before);
+  }
+};
+gapTests['windows-process-proof'] = () => {
+  const script = path.join(root, 'windows-process-proof.mjs');
+  fs.writeFileSync(script, `import cp from 'node:child_process';import assert from 'node:assert/strict';import {syncBuiltinESMExports} from 'node:module';
+Object.defineProperty(process,'platform',{value:'win32'});
+const original=cp.spawnSync;let phase='cold',calls=0;
+cp.spawnSync=(command,args,options)=>{
+  if(command!=='powershell.exe')return original(command,args,options);
+  calls++;assert.equal(options.timeout,10000);const code=args.at(-1);
+  assert.ok(code.includes('[System.Diagnostics.Process]::GetProcessById'));assert.ok(!code.includes('Get-Process'));assert.ok(!code.includes('ConvertTo-Json'));
+  if(phase==='timeout')return {status:null,stdout:'',stderr:'',error:Object.assign(Error('timeout'),{code:'ETIMEDOUT'})};
+  if(phase==='denied')return {status:1,stdout:'',stderr:'access denied'};
+  return {status:0,stdout:phase==='malformed'?'invalid-time':'639313301214878699\\r\\n',stderr:''};
+};syncBuiltinESMExports();
+const api=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});
+const owner=api.spawnerIdentity();assert.equal(owner.started,'windows:639313301214878699');assert.equal(api.spawnerState(owner),'live');
+for(const value of ['denied','malformed','timeout']){phase=value;assert.equal(api.spawnerState(owner),'unknown');}
+const fresh=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href + '?native-probe-failure')});
+assert.throws(()=>fresh.spawnerIdentity(),/ETIMEDOUT/);assert.ok(calls>=6);`);
+  let result = spawnSync(process.execPath, [script], { encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr);
+  if (WINDOWS) {
+    // Exercise the actual Windows OS API with cmdlet/module autoload disabled,
+    // the environment in which the old Get-Process/ConvertTo-Json query fails.
+    const real = path.join(root, 'windows-no-modules.mjs');
+    fs.writeFileSync(real, `import cp from 'node:child_process';import assert from 'node:assert/strict';import {syncBuiltinESMExports} from 'node:module';
+const original=cp.spawnSync;cp.spawnSync=(command,args,options)=>{if(command==='powershell.exe'){args=[...args];args[args.length-1]="$PSModuleAutoLoadingPreference='None';"+args.at(-1);}return original(command,args,options);};syncBuiltinESMExports();
+const {spawnerIdentity,spawnerState}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});const owner=spawnerIdentity();assert.ok(/^windows:\\d+$/.test(owner.started));assert.equal(spawnerState(owner),'live');`);
+    result = spawnSync(process.execPath, [real], { encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr);
+  }
+};
 gapTests['preparation-process-proof'] = () => {
   const script = path.join(root, 'linux-process-proof.mjs');
   fs.writeFileSync(script, `import fs from 'node:fs';import assert from 'node:assert/strict';
@@ -1356,10 +1595,17 @@ process.kill=()=>{throw Object.assign(Error('gone'),{code:'ESRCH'});};assert.equ
 assert.equal(spawnerState({...owner,host:'other-host'}),'unknown');`);
   const result = spawnSync(process.execPath, [script], { encoding: 'utf8' }); assert.equal(result.status, 0, result.stderr);
 };
+function preparationRegistryBarrier(f) {
+  const ready = path.join(f.dir, 'registry-ready'), release = path.join(f.dir, 'registry-release'), script = path.join(f.dir, 'registry-held.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs';const unlink=fs.unlinkSync;let paused=false;
+fs.unlinkSync=(file,...args)=>{if(!paused && String(file).endsWith('projects.lock')){paused=true;fs.writeFileSync(${JSON.stringify(ready)},'ready');const deadline=Date.now()+15000;while(!fs.existsSync(${JSON.stringify(release)})){if(Date.now()>deadline)throw Error('Registry timeout');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}}return unlink(file,...args);};
+const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});main(process.argv.slice(2));`);
+  return { ready, release, script };
+}
 gapTests['preparation-recovery'] = async () => {
   const before = fs.readFileSync(world, 'utf8');
   try {
-    for (const phase of ['reserved', 'before-copy', 'after-copy', 'delivery', 'brief', 'launch']) {
+    for (const phase of ['reservation-lock', 'reserved', 'before-copy', 'after-copy', 'delivery', 'brief', 'launch']) {
       const name = `recovery-${phase}`, f = joinSpaceFixture(name); f.mode('per-project');
       const deliveredCopy = path.join(f.dir, 'allocated-copy');
       if (phase === 'delivery') {
@@ -1369,7 +1615,7 @@ const args=a[0]==='start'?['-C',${JSON.stringify(f.repo)},'worktree','add','-b',
 const r=spawnSync('git',args,{encoding:'utf8'});if(r.status!==0){console.error(r.stderr);process.exit(1)}if(a[0]==='start')console.log(JSON.stringify({path:folder,created:true,pooled:false}));`);
         f.env.CREW_TOOL_DELIVERY = delivery;
       }
-      const barrier = phase === 'reserved' ? projectBarrier(f, 'after') : phase === 'brief' ? preparationBriefBarrier(f)
+      const barrier = phase === 'reservation-lock' ? preparationRegistryBarrier(f) : phase === 'reserved' ? projectBarrier(f, 'after') : phase === 'brief' ? preparationBriefBarrier(f)
         : joinCoreBarrier(f, phase, phase === 'delivery' ? 'start' : phase === 'launch' ? 'run' : 'worktree', ['delivery', 'launch'].includes(phase) ? null : 'add', phase !== 'before-copy');
       let owner = `owner-spaces-${name}`;
       const pending = projectProcess(f, ['spawn', 'abandoned', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.'], { script: barrier.script, terminal: owner, env: f.env });
@@ -2943,7 +3189,10 @@ gapTests['pr-facts'] = () => {
   assert.equal(waits, 0, 'observations skip both active writers and pending lifecycle intent without waiting');
   const rename = fs.renameSync; let attempts = 0;
   try {
-    fs.renameSync = () => { attempts++; throw Object.assign(Error('injected sharing error'), { code: 'EACCES' }); };
+    fs.renameSync = (from, to, ...args) => {
+      if (to === file) { attempts++; throw Object.assign(Error('injected sharing error'), { code: 'EACCES' }); }
+      return rename(from, to, ...args);
+    };
     rememberTaskPr(h, f.task, prObservation({ state: 'OPEN' }, read().pr));
   } finally { fs.renameSync = rename; }
   assert.equal(attempts, 1, 'observations yield on sharing errors instead of holding the lock for retries');
@@ -2986,10 +3235,10 @@ fs.renameSync = (from,to) => {
 const task = JSON.parse(fs.readFileSync(file));
 rememberTaskPr({tasks:${JSON.stringify(path.join(f.home, 'tasks'))}},task,prObservation({state:'OPEN'},'https://github.com/acme/demo/pull/12'));`);
     fs.writeFileSync(lifecycle, `import fs from 'node:fs'; import {main} from ${module};
-const open = fs.openSync; let marked = false;
-fs.openSync = (file,...args) => {
- if (!marked && file === ${JSON.stringify(lock)} && args[0] === 'wx') { marked = true; fs.writeFileSync(${JSON.stringify(waiting)},'waiting'); }
- return open(file,...args);
+const rename = fs.renameSync; let marked = false;
+fs.renameSync = (from,to,...args) => {
+ if (!marked && String(to).endsWith('worker-spaces.lock')) { marked = true; fs.writeFileSync(${JSON.stringify(waiting)},'waiting'); }
+ return rename(from,to,...args);
 }; main(process.argv.slice(2));`);
     const observation = projectProcess(f, [], { script: observer });
     await until(() => fs.existsSync(ready));
@@ -3010,10 +3259,10 @@ fs.openSync = (file,...args) => {
   const task = f.spawn('busy-refusal', ['--agent', 'pi']); fs.writeFileSync(task.report, 'Complete.');
   const file = path.join(f.home, 'tasks', task.id, 'task.json'), script = path.join(f.dir, 'busy.mjs');
   fs.writeFileSync(script, `import fs from 'node:fs'; import {main} from ${module};
-const open = fs.openSync, clock = Date.now; let attempts = 0;
-fs.openSync = (file,...args) => {
- if (file === ${JSON.stringify(`${file}.lock`)} && ++attempts === 2) Date.now = () => clock()+10000;
- return open(file,...args);
+const stat = fs.lstatSync, clock = Date.now; let attempts = 0;
+fs.lstatSync = (file,...args) => {
+ if (file === ${JSON.stringify(`${file}.lock`)} && ++attempts === 2) Date.now = () => clock()+100000;
+ return stat(file,...args);
 }; main(process.argv.slice(2));`);
   fs.writeFileSync(`${file}.lock`, 'held');
   let r = await projectProcess(f, ['done', task.id], { script, terminal: task.terminal }).result;
@@ -3626,16 +3875,21 @@ console.log(JSON.stringify({providers:providers.map(provider=>({provider,quotaSe
   fs.writeFileSync(path.join(f.home, 'config', 'crew-dispatch.json'), JSON.stringify({ default: [{ harness: 'pi' }] }));
   const quotaReads = () => fs.readFileSync(quotaLog, 'utf8').trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
   const finishResult = id => path.join(dir, `${id}.finish.json`), finishScript = path.join(dir, 'finish.mjs');
-  fs.writeFileSync(finishScript, `import fs from 'node:fs'; import path from 'node:path'; import {main} from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
-const barrier=process.env.CREW_TEST_FINISH_BARRIER, taskFile=path.join(${JSON.stringify(f.home)},'tasks',process.argv[2],'task.json'), rename=fs.renameSync;let paused=false;
+  fs.writeFileSync(finishScript, `import fs from 'node:fs'; import path from 'node:path'; import {main,spawnerIdentity} from ${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)};
+const barrier=process.env.CREW_TEST_FINISH_BARRIER, taskFile=path.join(${JSON.stringify(f.home)},'tasks',process.argv[2],'task.json'), rename=fs.renameSync;let paused=false,delayed=false;
 fs.renameSync=(from,to)=>{
   if(barrier && !paused && to===taskFile && JSON.parse(fs.readFileSync(from,'utf8')).state==='closed'){
     paused=true;fs.writeFileSync(barrier+'.ready','ready');const deadline=Date.now()+15000;
     while(!fs.existsSync(barrier+'.go')){if(Date.now()>deadline)throw Error('finish publication barrier timed out');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5);}
   }
-  return rename(from,to);
+  const result=rename(from,to);
+  if(!delayed && to===taskFile && JSON.parse(fs.readFileSync(to,'utf8')).state==='closed'){
+    delayed=true;const ms=JSON.parse(fs.readFileSync(${JSON.stringify(state)},'utf8')).finishPauseMs??0;
+    if(ms)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,ms);
+  }
+  return result;
 };
-main(['finish',process.argv[2]]); const file=path.join(${JSON.stringify(dir)},process.argv[2]+'.finish.json');fs.writeFileSync(file+'.tmp',JSON.stringify({code:process.exitCode??0}));fs.renameSync(file+'.tmp',file);`);
+main(['finish',process.argv[2]]); const file=path.join(${JSON.stringify(dir)},process.argv[2]+'.finish.json');fs.writeFileSync(file+'.tmp',JSON.stringify({code:process.exitCode??0,owner:spawnerIdentity()}));fs.renameSync(file+'.tmp',file);`);
   // Prewarm expensive copy/Core checks before a bounded API request, then publish
   // closure during that request. This tests the race, not local process speed.
   const cancelStart = path.join(dir, 'cancel-start.mjs');
@@ -4058,10 +4312,12 @@ gapTests['review-label-abandon'] = () => {
 gapTests['review-label-cancel-start'] = async () => {
   const f = reviewLabelsFixture('cancel-start');
   for (const duringAt of ['variables', 'manifest', 'labels', 'definition']) {
-    f.parent(duringAt); f.control({ labels: ['unrelated', f.changes], duringFinish: true, duringAt });
+    f.parent(duringAt); f.control({ labels: ['unrelated', f.changes], duringFinish: true, duringAt, finishPauseMs: 3000 });
     const { task, result } = f.start(duringAt, '', f.cancelStart);
     await until(() => fs.existsSync(f.finishResult(task.id)));
-    assert.equal(JSON.parse(fs.readFileSync(f.finishResult(task.id))).code, 0, 'Real finish must complete successfully');
+    const finished = JSON.parse(fs.readFileSync(f.finishResult(task.id)));
+    assert.equal(finished.code, 0, 'Real finish must complete successfully');
+    await until(() => spawnerState(finished.owner) === 'dead'); // Windows cwd handle closes only on actual child exit
     assert.equal(f.warnings(result).length, 0, result.out);
     assert.equal(task.state, 'closed');
     assert.deepEqual(f.control().labels, ['unrelated', f.changes], 'Cancelling during a start lookup cannot leave or re-add activity');
@@ -4634,7 +4890,7 @@ try {
   assert.equal(call[call.indexOf('--cwd') + 1], slash(wt));
   const line = call.at(-1);
   assert.ok(line.includes(`PATH=${shq(bashPath(path.join(here, 'bin')))}`), 'Workers use this root-layout tool bin');
-  assert.match(line, /^export CREW_HOME='[^']+' CREW_TASK='t1' PATH='[^']+\/bin':"\$PATH"; 'pi' 'Read the brief at [^']+brief\.md and carry it out exactly\.'; exec bash --login -i$/);
+  assert.match(line, /^export CREW_HOME='[^']+' CREW_TASK='t1' PATH='[^']+\/bin':"\$PATH"; '[^']+' '[^']+\/crew\.mjs' _launch-check 't1' '[a-f0-9-]{36}' && \{ 'pi' 'Read the brief at [^']+brief\.md and carry it out exactly\.'; \}; exec bash --login -i$/);
   assert.equal(crew(['spawn', 't1', '--project', 'demo', 'again'], { terminal: 'c1' }).code, 2, 'An id is used once');
 
   // Done: only the task's own terminal, and only with a report.

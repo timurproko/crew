@@ -146,9 +146,11 @@ are changed by this crew update.
 
 All participating commands must use the updated tool; legacy binaries or direct file edits
 cannot honor this protocol. Lock contention waits up to two seconds and names
-`<crew home>/projects.lock` on refusal. An interrupted transaction can leave that lock behind:
-retry first, and remove it only after confirming that no process is still using it. Crew
-never steals a lock based on its age or a guessed-dead PID. Registry format stays version 1.
+`<crew home>/projects.lock` on refusal. New claims include an OS start identity and nonce;
+placement-gated commands can reclaim a complete, provably dead claim after revalidation.
+Live, unknown and legacy claims remain protected: retry first, and inspect an interrupted
+transaction before any manual recovery. Crew never steals a lock based on age or a guessed-dead
+PID. Registry format stays version 1.
 
 ## Worker spaces
 
@@ -195,9 +197,13 @@ the registry lock. Slow terminal transitions can require another command to retr
 records the spawner's PID and OS start identity: live/unknown allocators stay protected, while a
 proven-dead reservation can be cancelled with `crew finish <id> --force` using normal cleanup
 guards. A new spawn identifies abandoned preparation with the exact home-qualified recovery
-command. Gate recovery also requires OS-instance death proof, never an age/PID guess; token checks
-prevent cancelled preparation from publishing late. See the detailed recovery/receipt contract
-in docs/worker-spaces.md.
+command. Gate and task-lock recovery require OS-instance death proof, never an age/PID guess.
+Every Core call first records a unique launch intent and sends its nonce with the terminal;
+reconciliation can recover created-but-unacknowledged launches only by that recorded authority
+and the exact identity tuple, never generic labels/cwd. The shell checks the generation before
+starting its agent, so cancelled late requests cannot work in a returned/reused copy. Repeated
+finish can clean a late owned terminal without deleting that copy again. See the detailed
+recovery/receipt contract in docs/worker-spaces.md.
 
 **Herdr dependency:** per-project grouping requests separate automatic spaces, but connected
 nesting under the coordinator and exact project names require the compatible Herdr companion

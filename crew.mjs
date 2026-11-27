@@ -335,8 +335,10 @@ function cmdLocalWorkerSpace(args) {
 
 // Atomic rename alone cannot serialize read-modify-write or protect task admission.
 // All registry writers and the first task record share this short critical section.
-// Never steal a lock on age/PID guesses: an abandoned lock needs deliberate recovery.
+// No age/PID guessing: only a placement-gated reclaimer may remove a complete,
+// nonce-revalidated OS-instance claim that is provably dead.
 function withRegistry(h, action, { read = readRegistry, lockError } = {}) {
+  const identity = spawnerIdentity(); // OS lookup stays outside the registry lock
   const lock = path.join(h.dir, 'projects.lock'), deadline = Date.now() + 2000;
   let fd;
   for (;;) {
@@ -354,7 +356,7 @@ function withRegistry(h, action, { read = readRegistry, lockError } = {}) {
     }
   }
   try {
-    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, token: randomUUID() }));
+    fs.writeFileSync(fd, JSON.stringify({ ...identity, token: randomUUID() }));
     h.config = read(h.dir); // never write a snapshot read before taking the lock
     return action();
   } finally {
@@ -416,7 +418,7 @@ const sameWorker = (a, b) => a && b && a.state === b.state && a.terminal === b.t
 function processInstance(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return { state: 'unknown' };
   try { process.kill(pid, 0); }
-  catch (error) { return { state: error.code === 'ESRCH' ? 'dead' : 'unknown' }; }
+  catch (error) { return error.code === 'ESRCH' ? { state: 'dead' } : { state: 'unknown', reason: `Process liveness query failed (${error.code ?? 'unknown'})` }; }
   try {
     if (process.platform === 'linux') {
       const text = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'), end = text.lastIndexOf(') ');
@@ -428,10 +430,14 @@ function processInstance(pid) {
       return { state: 'live', started: `linux:${boot}:${stat[19]}` };
     }
     if (WINDOWS) {
-      const script = `$ErrorActionPreference='Stop';try {$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue;if($null -eq $p){'{"state":"unknown"}'}else{@{state='live';started=('windows:'+ $p.StartTime.ToUniversalTime().Ticks)}|ConvertTo-Json -Compress}}catch{'{"state":"unknown"}'}`;
-      const got = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { timeout: 3000 });
-      const value = got.code === 0 ? JSON.parse(got.stdout) : null;
-      return value?.state === 'live' && /^windows:\d+$/.test(value.started) ? value : { state: 'unknown' };
+      // Query the same native creation time without Get-Process/ConvertTo-Json
+      // module autoload. Cold hosted Windows shells can exceed three seconds.
+      const script = `$ErrorActionPreference='Stop';[Console]::Write([System.Diagnostics.Process]::GetProcessById(${pid}).StartTime.ToUniversalTime().Ticks.ToString([System.Globalization.CultureInfo]::InvariantCulture))`;
+      const got = run('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], { timeout: 10000 });
+      const ticks = got.stdout.trim();
+      if (got.code === 0 && /^\d+$/.test(ticks)) return { state: 'live', started: `windows:${ticks}` };
+      const detail = String(got.error?.code ?? got.stderr ?? '').replace(/[\p{Cc}\p{Cf}]/gu, ' ').trim().slice(0, 200);
+      return { state: 'unknown', reason: `Windows creation-time query failed (${got.code ?? 'no exit'}${detail ? `: ${detail}` : '; invalid output'})` };
     }
     const got = run('ps', ['-p', String(pid), '-o', 'lstart='], { timeout: 2000, env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' } });
     if (got.code === 0 && got.stdout.trim()) return { state: 'live', started: `ps:${got.stdout.trim()}` };
@@ -442,7 +448,7 @@ let ownProcessInstance;
 export function spawnerIdentity() {
   if (!ownProcessInstance) {
     const instance = processInstance(process.pid);
-    if (instance.state !== 'live' || !instance.started) refuse('preparation-unavailable: cannot record the spawner OS start identity; nothing was reserved.', 4);
+    if (instance.state !== 'live' || !instance.started) refuse(`preparation-unavailable: cannot record the spawner OS start identity${instance.reason ? `: ${instance.reason}` : ''}; nothing was reserved.`, 4);
     ownProcessInstance = { version: 1, host: os.hostname(), platform: process.platform, pid: process.pid, started: instance.started };
   }
   return ownProcessInstance;
@@ -466,7 +472,8 @@ function recoverPreparingTask(h, task) {
   if (state !== 'dead') refuse(`Task ${task.id} is still preparing: its spawner is ${state === 'live' ? 'alive' : 'unverifiable'}; nothing was cancelled. Retry after publication${state === 'unknown' ? ' or restore process-identity access' : ''}.`, state === 'live' ? 6 : 4);
   const token = task.preparation?.token;
   if (typeof token !== 'string' || !/^[a-f0-9-]+$/.test(token)) refuse(`Task ${task.id} has unverifiable preparation ownership; nothing was cancelled.`, 4);
-  let recovered = { ...task, state: 'failed', error: 'The spawning process ended during preparation.',
+  task = reconcileTerminalLaunches(h, task);
+  let recovered = { ...task, state: task.terminal ? 'working' : 'failed', error: 'The spawning process ended during preparation.',
     preparation: { ...task.preparation, cancelled: now() } };
   const copy = lastReceipt(path.join(taskDir(h, task.id), `copy-${token}.json`));
   if (copy?.created === true && typeof copy.path === 'string' && path.isAbsolute(copy.path)) {
@@ -481,6 +488,7 @@ function recoverPreparingTask(h, task) {
     recovered = { ...recovered, state: 'working', terminal: launch.address, terminals: launchedTerminals(task, launch.address, task.agent) };
     delete recovered.error;
   }
+  if (recovered.terminal) delete recovered.error;
   saveTask(h, recovered); // cancellation is fenced by the shared placement gate
   return recovered;
 }
@@ -488,31 +496,63 @@ function lastReceipt(file) {
   try { return JSON.parse(lastLine(fs.readFileSync(file, 'utf8'))); } catch { return null; }
 }
 const placementGates = new Set();
-function withPlacementGate(h, action, { observation = false, waitMs = 2000 } = {}) {
-  const lock = path.join(h.dir, 'worker-spaces.lock');
-  if (placementGates.has(lock)) return action(); // synchronous nested task writes
+function withPlacementGate(h, action, options = {}) {
+  // Exported task helpers also accept the longstanding minimal { tasks } home.
+  const dir = h.dir ?? path.dirname(h.tasks);
+  const lock = path.join(dir, 'worker-spaces.lock'), nested = placementGates.has(lock);
+  return withOwnedProcessLock(lock, () => {
+    if (!nested) {
+      // Registry-only writers remain independent. Reclaimers, however, all use
+      // this gate. After death proof, re-read the immutable claim nonce: a live
+      // writer may have released/replaced its file while the OS query ran. If
+      // the dead claim still matches, neither it nor another reclaimer can now
+      // remove it before us, and a fresh writer cannot claim an existing file.
+      const registry = path.join(dir, 'projects.lock'), claim = readJson(registry);
+      if (claim?.token && spawnerState(claim) === 'dead') {
+        const current = readJson(registry);
+        if (current?.token === claim.token && current.pid === claim.pid && current.started === claim.started) {
+          const stat = fs.lstatSync(registry);
+          if (stat.isFile() && stat.nlink === 1) fs.unlinkSync(registry);
+        }
+      }
+    }
+    return action();
+  }, options);
+}
+function withOwnedProcessLock(lock, action, { observation = false, waitMs = 2000, reentrant = true, busyCode = 4, busyMessage } = {}) {
+  if (reentrant && placementGates.has(lock)) return action();
+  const busy = () => refuse(busyMessage ?? `worker-space-busy: placement gate is held or unverifiable at ${slash(lock)}; retry.`, busyCode);
   const owner = spawnerIdentity(), deadline = Date.now() + waitMs;
   // Publish a populated directory atomically: there is never an empty gate owned
   // by a live process. A dead claimant's unique owner file is the reclaim token.
-  const candidate = fs.mkdtempSync(path.join(h.dir, '.worker-spaces-'));
+  const candidate = fs.mkdtempSync(path.join(path.dirname(lock), `.${path.basename(lock)}-`));
   const token = `owner-${randomUUID()}.json`;
   fs.writeFileSync(path.join(candidate, token), JSON.stringify(owner));
-  let acquired = false, tried = false;
+  let acquired = false;
   try {
     for (;;) {
-      if (tried && Date.now() >= deadline) {
+      // Windows rename can replace a regular file with a directory. Older or
+      // externally held file locks are unverifiable, never migration targets.
+      let legacy = false;
+      try { const stat = fs.lstatSync(lock); legacy = !stat.isDirectory() || stat.isSymbolicLink(); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (legacy) {
         if (observation) return;
-        refuse(`worker-space-busy: placement gate could not be acquired at ${slash(lock)}; retry.`, 4);
+        if (Date.now() >= deadline) busy();
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+        continue;
       }
-      tried = true;
       try { fs.renameSync(candidate, lock); acquired = true; break; }
       catch (error) {
+        // Always try an atomic claim before expiring: the previous owner may
+        // have released while its OS identity was being queried.
+        if (Date.now() >= deadline) { if (observation) return; busy(); }
         if (!['EEXIST', 'ENOTEMPTY', 'EACCES', 'EPERM', 'ENOTDIR', 'EISDIR'].includes(error.code)) {
           refuse(`worker-space-unavailable: cannot acquire placement gate (${error.code}); retry.`, 4);
         }
         if (!fs.existsSync(lock)) {
           if (observation) return;
-          if (Date.now() >= deadline) refuse('worker-space-busy: placement gate changed during acquisition; retry.', 4);
+          if (Date.now() >= deadline) busy();
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
           continue;
         }
@@ -534,17 +574,16 @@ function withPlacementGate(h, action, { observation = false, waitMs = 2000 } = {
           continue;
         }
         if (observation) return;
-        if (Date.now() >= deadline) refuse(`worker-space-busy: placement gate is held or unverifiable at ${slash(lock)}; retry after its writer completes. Never remove a live or unverifiable gate.`, 4);
+        if (Date.now() >= deadline) busy();
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
       }
     }
     placementGates.add(lock);
     return action();
   } finally {
-    placementGates.delete(lock);
     // A live owner's nonce cannot be reclaimed. Retire its entire directory
     // before deleting privately, so contenders never mistake release for death.
-    if (acquired) fs.renameSync(lock, candidate);
+    if (acquired) { placementGates.delete(lock); fs.renameSync(lock, candidate); }
     fs.rmSync(candidate, { recursive: true, force: true });
   }
 }
@@ -555,30 +594,16 @@ function taskTransaction(h, id, action, options = {}) {
 // An already-started atomic replacement retains its supported sharing-retry window.
 function lockedTaskTransaction(h, id, action, { observation = false, waitMs = 2000 } = {}) {
   const lock = `${taskFile(h, id)}.lock`, priority = `${taskFile(h, id)}.lifecycle.lock`;
-  const deadline = Date.now() + waitMs;
-  const acquire = (file, wait) => {
-    for (;;) {
-      try { return fs.openSync(file, 'wx'); }
-      catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        if (!wait) return null;
-        if (Date.now() >= deadline) refuse(`task-busy: ${id}; retry the command after the current writer releases ${slash(file)}. Do not remove a lock while its writer may still be running.`, 6);
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-      }
-    }
-  };
-  const release = (file, fd) => { fs.closeSync(fd); fs.rmSync(file, { force: true }); };
-  if (observation && fs.existsSync(priority)) return;
-  const intent = observation ? null : acquire(priority, true);
-  try {
-    const fd = acquire(lock, !observation);
-    if (fd === null) return;
-    try {
-      // Close the race with lifecycle intent arriving after the first check.
-      if (observation && fs.existsSync(priority)) return;
-      return action(readJson(taskFile(h, id)));
-    } finally { release(lock, fd); }
-  } finally { if (intent !== null) release(priority, intent); }
+  const options = { observation, waitMs, reentrant: false, busyCode: 6,
+    busyMessage: `task-busy: ${id}; retry the command after its writer releases the task locks. Do not remove a live or unverifiable lock.` };
+  const write = () => withOwnedProcessLock(lock, () => {
+    if (observation && fs.existsSync(priority)) return;
+    return action(readJson(taskFile(h, id)));
+  }, options);
+  if (observation) return fs.existsSync(priority) ? undefined : write();
+  // These locks need the same atomic populated ownership proof as the outer
+  // gate: a publisher can die between acknowledgement and its final task write.
+  return withOwnedProcessLock(priority, write, options);
 }
 // Historical addresses are ownership evidence, not a cwd/label-based adoption list.
 function ownedTerminals(task) {
@@ -590,7 +615,12 @@ const launchedTerminals = (task, address, agent) => [...ownedTerminals(task).fil
 const saveTask = (h, task, options) => taskTransaction(h, task.id, current => {
   const prFacts = current?.prFacts;
   const terminals = [...new Map([...(current?.terminals ?? []), ...(task.terminals ?? [])].map(t => [t.address, t])).values()];
-  writeJson(taskFile(h, task.id), { ...task, ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), ...(current && Object.hasOwn(current, 'workerSpace') ? { workerSpace: current.workerSpace } : {}), ...(current && Object.hasOwn(current, 'reviewRound') ? { reviewRound: current.reviewRound, lastFinding: current.lastFinding, reviewChanges: current.reviewChanges } : {}), updated: now() });
+  const launches = new Map((current?.terminalLaunches ?? []).map(item => [item.nonce, item]));
+  for (const item of task.terminalLaunches ?? []) {
+    const previous = launches.get(item.nonce);
+    launches.set(item.nonce, previous ? { ...previous, ...item, address: previous.address ?? item.address, cancelled: previous.cancelled ?? item.cancelled } : item);
+  }
+  writeJson(taskFile(h, task.id), { ...task, ...(launches.size ? { terminalLaunches: [...launches.values()] } : {}), ...(terminals.length ? { terminals } : {}), ...(prFacts ? { prFacts } : {}), ...(current && Object.hasOwn(current, 'workerSpace') ? { workerSpace: current.workerSpace } : {}), ...(current && Object.hasOwn(current, 'reviewRound') ? { reviewRound: current.reviewRound, lastFinding: current.lastFinding, reviewChanges: current.reviewChanges } : {}), updated: now() });
 }, options);
 
 const prTime = value => {
@@ -1659,23 +1689,114 @@ const PICK_USAGE = `[--agent ${Object.keys(AGENTS).join('|')}] [--model <id>] [-
 // Starts the terminal in which `pick` works on a task. The agent starts with one instruction
 // as its argument, so nothing is typed into it and there is no race with its startup. The
 // shell stays afterwards so the terminal survives the agent leaving; `crew finish` removes it.
-function startTerminal(h, { id, worktree, label, pick, instruction, workerSpace, receipt }) {
+function startTerminal(h, { id, worktree, label, pick, instruction, workerSpace, receipt, nonce }) {
   const agent = AGENTS[pick.harness];
   if (agent.trust === 'claude' && !trustClaudeFolder(worktree)) console.error('crew: could not record the working copy as trusted for Claude Code; it may stop at its trust question.');
   const { command, note } = workerLaunch(agent, instruction, pick);
   const line = [
     `export CREW_HOME=${shq(bashPath(h.dir))} CREW_TASK=${shq(id)} PATH=${shq(`${bashPath(path.join(HERE, 'bin'))}`)}:"$PATH"`,
-    command,
+    `${shq(bashPath(process.execPath))} ${shq(bashPath(path.join(HERE, 'crew.mjs')))} _launch-check ${shq(id)} ${shq(nonce)} && { ${command}; }`,
     'exec bash --login -i',
   ].join('; ');
   const tag = h.config.tag;
   return { note, ...hcJson(['run', '--json', '--bg', '--keep', '--no-parent', '--no-notify', '--cwd', worktree,
     // crew.kind is what the worker is, for anything that shows terminals (Herdr's pane header).
     '--label', `crew.task=${id}`, '--label', `crew.home=${tag}`, '--label', `crew.kind=${label}`,
+    '--label', `crew.launch=${nonce}`,
     '--label', `herdr.space=${workerSpace.id}`, '--label', `herdr.tab=${tag}-${id}`, '--label', 'herdr.right-click=menu',
     '--label', 'crew.space.version=1', '--label', `crew.space.mode=${workerSpace.mode}`, '--label', `crew.space.project=${workerSpace.project}`,
     ...(workerSpace.name === null ? [] : ['--label', `crew.space.name=${workerSpace.name}`]),
     '--', bashProgram(), '--login', '-i', '-c', line], receipt ? { stdoutFile: receipt } : undefined) };
+}
+function sameLaunchDirectory(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (comparablePath(a) === comparablePath(b)) return true;
+  try { return comparablePath(fs.realpathSync(a)) === comparablePath(fs.realpathSync(b)); } catch { return false; }
+}
+function cmdLaunchCheck(args) {
+  const [id, nonce] = args;
+  if (args.length !== 2 || !validId(id) || !/^[a-f0-9-]{36}$/.test(nonce ?? '')) refuse('launch-cancelled: invalid launch authority.', 6);
+  const h = home();
+  // The terminal already exists before this check runs. Serialize authorization
+  // with cancellation/replacement: a terminal born after their inventory cannot
+  // slip an agent start between that snapshot and generation cancellation.
+  return withPlacementGate(h, () => {
+    const task = readJson(taskFile(h, id));
+    const intent = Array.isArray(task?.terminalLaunches) ? task.terminalLaunches.find(item => item?.version === 1 && item.nonce === nonce && item.home === h.config.tag && item.task === id) : null;
+    if (!['preparing', 'working'].includes(task?.state) || !intent || intent.cancelled
+        || intent.preparation && task.preparation?.cancelled || !sameLaunchDirectory(process.cwd(), intent.worktree)) {
+      refuse(`launch-cancelled: ${id} no longer authorizes this worker.`, 6);
+    }
+  }, { waitMs: 30000 });
+}
+// Persist a capability-like, one-run ownership nonce BEFORE Core can create a
+// terminal. Receipt loss cannot erase this recorded launch authority. Generic
+// task/home/space labels and cwd alone never authorize reconciliation.
+function launchTaskTerminal(h, task, pick, instruction, persist, receipt) {
+  const intent = { version: 1, nonce: randomUUID(), owner: spawnerIdentity(), at: now(), preparation: task.state === 'preparing' ? task.preparation?.token : null,
+    home: h.config.tag, task: task.id, worktree: task.worktree, workerSpace: resolveWorkerSpace(h, task), pick };
+  task = { ...task, terminalLaunches: [...(task.terminalLaunches ?? []), intent] };
+  persist(task);
+  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, instruction,
+    workerSpace: intent.workerSpace, nonce: intent.nonce, receipt });
+  const address = started.value?.address, acknowledged = started.code === 0 && typeof address === 'string' && /^[a-zA-Z0-9-]+$/.test(address);
+  if (acknowledged) {
+    task = { ...task, agent: pick.harness, terminal: address, terminals: launchedTerminals(task, address, pick.harness),
+      terminalLaunches: task.terminalLaunches.map(item => item.nonce === intent.nonce ? { ...item, address } : item) };
+    persist(task);
+  } else {
+    // An error/empty response is not proof Core created nothing. Keep the copy
+    // and reconcile this exact request before the caller records a failed launch.
+    task = reconcileTerminalLaunches(h, task, { allowCurrent: true, persist });
+  }
+  return { task, started, address: acknowledged ? address : null };
+}
+function reconcileTerminalLaunches(h, task, { candidate, allowCurrent = false, persist = value => saveTask(h, value) } = {}) {
+  if (task.terminalLaunches !== undefined && !Array.isArray(task.terminalLaunches)) refuse(`worker-space-unavailable: invalid launch ledger for ${task.id}.`, 4);
+  const pending = (task.terminalLaunches ?? []).filter(item => item?.version === 1 && !item.address
+    && /^[a-f0-9-]{36}$/.test(item.nonce ?? '') && item.home === h.config.tag && item.task === task.id
+    && typeof item.worktree === 'string' && AGENTS[item.pick?.harness]);
+  if (new Set(pending.map(item => item.nonce)).size !== pending.length) refuse(`worker-space-unavailable: ambiguous launch ledger for ${task.id}.`, 4);
+  if (!pending.length) return task;
+  const eligible = pending.filter(item => spawnerState(item.owner) === 'dead'
+    || allowCurrent && item.owner.pid === process.pid && item.owner.started === spawnerIdentity().started);
+  if (!eligible.length) return task;
+  if (candidate && !eligible.some(item => item.nonce === candidate.labels?.['crew.launch'])) return task;
+  let terminals;
+  {
+    const list = hcJson(['ls', '--json'], { timeout: 2000 });
+    if (list.code !== 0 || !Array.isArray(list.value?.terminals)) refuse(`worker-space-unavailable: cannot reconcile launch ownership for ${task.id}; retry.`, 4);
+    terminals = [];
+    const deadline = Date.now() + 10000;
+    for (const entry of list.value.terminals) {
+      if (entry.state !== 'live' || typeof entry.address === 'string' && entry.address.includes('/')) continue;
+      if (typeof entry.address !== 'string' || !/^[a-zA-Z0-9-]+$/.test(entry.address)) refuse('worker-space-unavailable: invalid local terminal inventory during launch reconciliation.', 4);
+      if (Date.now() >= deadline) refuse(`worker-space-unavailable: launch reconciliation timed out for ${task.id}; retry.`, 4);
+      const seen = probe(entry.address, { timeout: Math.min(2000, deadline - Date.now()) });
+      if (seen.state === 'unknown') refuse(`worker-space-unavailable: launch ownership of ${entry.address} is unknown; retry.`, 4);
+      if (seen.state === 'live') terminals.push(seen.t);
+    }
+  }
+  for (const intent of eligible) {
+    const matches = terminals.filter(t => t.labels?.['crew.launch'] === intent.nonce);
+    if (!matches.length) continue;
+    if (matches.length !== 1) refuse(`worker-space-unavailable: ambiguous launch nonce for ${task.id}; nothing was adopted.`, 4);
+    const t = matches[0], labels = t.labels ?? {}, space = intent.workerSpace;
+    const expected = resolveWorkerSpace(h, { ...task, workerSpace: space });
+    if (typeof t.address !== 'string' || !/^[a-zA-Z0-9-]+$/.test(t.address) || labels['crew.home'] !== intent.home || labels['crew.task'] !== intent.task
+        || labels['herdr.space'] !== expected.id || !sameLaunchDirectory(t.cwd, intent.worktree)
+        || labels['crew.space.version'] !== '1' || labels['crew.space.mode'] !== expected.mode || labels['crew.space.project'] !== expected.project
+        || (expected.name === null ? Object.hasOwn(labels, 'crew.space.name') : labels['crew.space.name'] !== expected.name)) {
+      refuse(`worker-space-unavailable: launch nonce identity conflicts for ${task.id}; nothing was adopted.`, 4);
+    }
+    const current = !intent.cancelled && task.state !== 'closed' && task.terminalLaunches.at(-1)?.nonce === intent.nonce;
+    task = { ...task, terminals: launchedTerminals(task, t.address, intent.pick.harness),
+      ...(current ? { agent: intent.pick.harness, terminal: t.address, launch: { ...intent.pick, source: 'reconciled' },
+        tried: intent.preparation === null ? [...new Set([...(task.tried ?? []), pickKey(task.launch ?? { harness: task.agent })])] : task.tried } : {}),
+      terminalLaunches: task.terminalLaunches.map(item => item.nonce === intent.nonce ? { ...item, address: t.address, reconciled: now(), late: !current } : item) };
+    persist(task);
+  }
+  return task;
 }
 const kindLabel = task => (task.selfFix ? 'fix' : task.reviews ? 'review' : task.kind);
 const roleOf = kindLabel;
@@ -1740,12 +1861,19 @@ function workerSpaceOccupancy(h, tasks, deadline) {
     const observed = probe(entry.address, options());
     if (observed.state === 'unknown') fail(`Core did not answer about terminal ${entry.address}`);
     if (observed.state !== 'live') continue; // a terminal can end after the inventory read
-    const terminal = observed.t, labels = terminal.labels ?? {}, task = records.get(labels['crew.task']);
+    const terminal = observed.t, labels = terminal.labels ?? {};
+    let task = records.get(labels['crew.task']);
     if (labels['crew.home'] !== h.config.tag) {
       if (owned.has(entry.address)) fail(`worker ${entry.address} has contradictory home labels`);
       continue; // foreign terminals and other homes never establish occupancy
     }
+    if (task && !ownedTerminals(task).some(t => t.address === entry.address)) {
+      task = reconcileTerminalLaunches(h, task, { candidate: terminal }); records.set(task.id, task);
+    }
     if (!task || !ownedTerminals(task).some(t => t.address === entry.address)) fail(`terminal ${entry.address} has no recorded task-owned launch`);
+    if (task.state === 'closed' && task.terminalLaunches?.some(item => item.address === entry.address && item.late)) {
+      refuse(`worker-space-abandoned: closed task ${task.id} has a late nonce-owned launch; clear it with ${preparationClearCommand(h, task.id)}.`, 4);
+    }
     if (!unfinishedSpaceWorker(task)) continue; // finished history, even a live report terminal, does not count
     const space = resolveWorkerSpace(h, task);
     if (terminal.address !== entry.address || labels['herdr.space'] !== space.id) fail(`worker ${entry.address} has contradictory placement labels`);
@@ -1887,13 +2015,14 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
 
   withPlacementGate(h, () => {
     assertPreparing();
-    const started = startTerminal(h, { id, worktree, label: kindLabel(record), pick, workerSpace: record.workerSpace, receipt: path.join(dir, `launch-${record.preparation.token}.json`), instruction: `Read the brief at ${brief} and carry it out exactly.` });
-    const address = started.value?.address;
+    const launch = launchTaskTerminal(h, record, pick, `Read the brief at ${brief} and carry it out exactly.`, value => saveTask(h, value), path.join(dir, `launch-${record.preparation.token}.json`));
+    record = launch.task;
+    const started = launch.started, address = launch.address;
     if (started.code !== 0 || !address) {
-      if (delivered) runTool('delivery', ['finish', worktree, '--force'], { cwd: project.path, timeout: 120000 });
-      else run('git', ['-C', project.path, 'worktree', 'remove', '--force', worktree]);
-      saveTask(h, { ...record, state: 'failed', ...(address ? { terminals: launchedTerminals(record, address, pick.harness) } : {}), error: JSON.stringify(started.value).slice(0, 400) });
-      refuse(`Core did not start the worker terminal: ${JSON.stringify(started.value)}`, 5);
+      // No acknowledgement is not evidence of an empty space. Preserve the
+      // allocated copy and nonce authority for finish/retry reconciliation.
+      saveTask(h, { ...record, state: 'failed', error: JSON.stringify(started.value).slice(0, 400) });
+      refuse(`Core did not acknowledge the worker terminal: ${JSON.stringify(started.value)}. Its copy and launch intent are kept; recover with ${preparationClearCommand(h, id)}.`, 5);
     }
     // Publish ownership before releasing the gate: a fast worker's done command
     // waits for this address. Reread rather than overwrite earlier cancellation.
@@ -1938,6 +2067,12 @@ function relaunch(h, task, reason, flags = null) {
 }
 function replaceWorker(h, task, reason, flags) {
   const store = value => writeJson(taskFile(h, task.id), { ...value, updated: now() });
+  const previous = task.terminal;
+  task = reconcileTerminalLaunches(h, task, { persist: store });
+  if ((task.terminalLaunches ?? []).some(item => !item.address && !item.cancelled && spawnerState(item.owner) !== 'dead')) {
+    refuse(`worker-space-unavailable: ${task.id} has a live or unverifiable launch publisher; retry before replacing its worker.`, 4);
+  }
+  if (flags === null && task.terminal !== previous) return { superseded: true }; // discard an automatic wait's stale observation
   task = { ...task, workerSpace: resolveWorkerSpace(h, task) };
   const before = task.launch ?? { harness: task.agent }, tried = new Set([...(task.tried ?? []), pickKey(before)]);
   const role = roleOf(task), named = flags && [...PICK_FLAGS, 'no-fallback'].some(key => flags[key] !== undefined);
@@ -1958,6 +2093,9 @@ function replaceWorker(h, task, reason, flags) {
   }
   const [pick, ...rest] = usable;
   const chain = original.filter(c => pickKey(c) !== pickKey(pick) && !tried.has(pickKey(c)));
+  // Superseded generations remain owned for cleanup but cannot start an agent
+  // if a delayed Core client creates their terminal after this replacement.
+  task = { ...task, terminalLaunches: (task.terminalLaunches ?? []).map(item => ({ ...item, cancelled: item.cancelled ?? now() })) };
   // Freeze legacy placement before ending its terminal; recovery cannot consult a new mode.
   store(task);
   if (task.terminal) {
@@ -1967,10 +2105,11 @@ function replaceWorker(h, task, reason, flags) {
     if (seen !== 'absent') refuse(`Core still has terminal ${task.terminal}; task ${task.id} was not handed over.`, 6);
   }
   const instruction = `Read the brief at ${task.brief} and carry it out exactly. Another worker (${pickLabel(before)}) began this task and had to stop: ${reason}. What it did is already in this working copy: look at \`git status\` and \`git log\`, and at ${task.report} if it exists, then continue from there instead of starting again.`;
-  const started = startTerminal(h, { id: task.id, worktree: task.worktree, label: kindLabel(task), pick, workerSpace: task.workerSpace, instruction });
-  const address = started.value?.address;
+  const launch = launchTaskTerminal(h, task, pick, instruction, store);
+  task = launch.task;
+  const started = launch.started, address = launch.address;
   if (started.code !== 0 || !address) {
-    store({ ...task, state: 'failed', terminal: null, terminals: address ? launchedTerminals(task, address, pick.harness) : ownedTerminals(task), error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
+    store({ ...task, state: 'failed', terminal: task.terminal ?? null, terminals: ownedTerminals(task), error: `Core did not start the next worker: ${JSON.stringify(started.value).slice(0, 300)}` });
     refuse(`Core did not start the next worker for ${task.id}: ${JSON.stringify(started.value)}. Its working copy is kept: ${task.worktree}`, 5);
   }
   const { error, ...kept } = task;
@@ -2083,14 +2222,17 @@ function cmdDone(args) {
   const id = args[0] ?? process.env.CREW_TASK;
   if (!id) refuse('Usage: crew done [<id>]');
   loadTask(h, id);
-  const task = taskTransaction(h, id, current => {
-    const task = reviveRelaunchedTask(h, current), mine = me();
-    if (task.terminal && mine && task.terminal !== mine) refuse(`Task ${id} belongs to terminal ${task.terminal}, not this one.`, 3);
-    if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
-    if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
-    writeJson(taskFile(h, id), { ...task, state: 'reported', reported: now(), updated: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
-    return task;
-  }, { waitMs: 30000 }); // a new worker can finish before Core acknowledges its start
+  const task = withPlacementGate(h, () => {
+    reconcileTerminalLaunches(h, readJson(taskFile(h, id)));
+    return taskTransaction(h, id, current => {
+      const task = reviveRelaunchedTask(h, current), mine = me();
+      if (task.terminal && mine && task.terminal !== mine) refuse(`Task ${id} belongs to terminal ${task.terminal}, not this one.`, 3);
+      if (!fs.existsSync(task.report) || !fs.readFileSync(task.report, 'utf8').trim()) refuse(`Write your result to ${task.report} first.`);
+      if (task.state === 'closed') refuse(`Task ${id} is already closed.`);
+      writeJson(taskFile(h, id), { ...task, state: 'reported', reported: now(), updated: now(), ...(task.workflow ? reportedStage(task.report) : {}) });
+      return task;
+    }, { waitMs: 30000 });
+  }, { waitMs: 30000 }); // a worker can report before its creator publishes the address
   const reported = loadTask(h, id);
   publishTaskTerminal(reported, reviewPrUrl(reported));
   if (task.reviews) {
@@ -2288,9 +2430,9 @@ function cmdStop(args) {
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   if (!id) refuse('Usage: crew stop <id> [--force]');
   return withPlacementGate(h, () => {
-    const task = recoverPreparingTask(h, loadTask(h, id));
+    const task = reconcileTerminalLaunches(h, recoverPreparingTask(h, loadTask(h, id)));
     const result = stopWorker(task, { force });
-    if (result.stopped && task.state !== 'closed') saveTask(h, { ...loadTask(h, id), state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now() });
+    if (result.stopped && task.state !== 'closed') saveTask(h, { ...loadTask(h, id), state: task.state === 'reported' ? 'reported' : 'stopped', stopped: now(), terminalLaunches: (task.terminalLaunches ?? []).map(item => ({ ...item, cancelled: item.cancelled ?? now() })) });
     if (result.stopped) reviewLabels(h, id, 'abandon');
     console.log(`${result.stopped ? 'stopped' : 'not stopped'} ${id}: ${result.how}`);
     if (!result.stopped) process.exitCode = 6;
@@ -2711,8 +2853,17 @@ function cmdFinish(args, options = {}) {
 function finishTask(h, args, { scratchProof } = {}) {
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
   if (!id) refuse('Usage: crew finish <id> [--force]');
-  const task = recoverPreparingTask(h, loadTask(h, id));
+  const task = reconcileTerminalLaunches(h, recoverPreparingTask(h, loadTask(h, id)));
   if (task.state === 'closed') {
+    if (!task.copyToReturn && task.terminalLaunches?.some(item => item.late)) {
+      // The copy may already be returned/reused. Only clean this generation's
+      // proven terminals; never return or delete that folder for a second time.
+      const stopped = stopTaskWorkers(task, { force });
+      if (!stopped.stopped) refuse(`Late launch cleanup for ${id} is not confirmed; retry.`, 6);
+      const pending = removeStoppedTerminal(task);
+      if (pending) refuse(pending.text, pending.state === 'silent' ? 4 : 6);
+      saveTask(h, { ...task, terminalLaunches: task.terminalLaunches.map(item => ({ ...item, late: false })) });
+    }
     reviewLabels(h, id, 'abandon');
     // A closed task whose copy still waits: --force is the person's word to discard what was
     // found in it and return it now. A terminal in it still keeps it, forced or not.
@@ -2752,7 +2903,8 @@ function finishTask(h, args, { scratchProof } = {}) {
   if (!result.stopped && !attempted) refuse(`Task ${id} could not be stopped (${result.how}); nothing was removed.`, 6);
   const project = projectOf(h, task);
   const forget = () => (AGENTS[task.agent]?.trust === 'claude' || task.fallbacks?.length) && forgetClaudeFolder(task.worktree);
-  const closed = { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state };
+  const closed = { ...task, state: 'closed', closed: now(), outcome: task.state === 'reported' ? 'reported' : task.state,
+    terminalLaunches: (task.terminalLaunches ?? []).map(item => ({ ...item, cancelled: item.cancelled ?? now() })) };
   // Record the remaining work before asking Core again, so an interrupted removal is retried.
   const waiting = { ...closed, copyToReturn: { since: now(), heldBy: [], left, stopPending: !result.stopped, pendingTerminals: result.pending ?? ownedTerminals(task).map(t => t.address), stoppedTerminals: ownedTerminals(task).filter(t => result.stopped || result.pending && !result.pending.includes(t.address)).map(t => t.address), cleanupTerminal: true } };
   saveTask(h, waiting);
@@ -3166,9 +3318,13 @@ function reviewLabels(h, id, action = 'start') {
       const prior = [1, 2].filter(assigned);
       const inherited = assigned(0) ? allTasks(h).find(t => t.id !== id && t.reviews === task.id && ['preparing', 'working'].includes(t.state) && t.reviewLabelBefore?.pr === url && !t.reviewVerdict && !t.reviewLabelEnded)?.reviewLabelBefore : null;
       const reviewLabelBefore = inherited ?? { pr: url, key: prior.length === 1 ? keys[prior[0]] : null, tells: task.tells ?? 0, relaunched: task.relaunched ?? null };
-      taskTransaction(h, id, latest => {
-        if (latest.state === 'working') writeJson(taskFile(h, id), { ...latest, reviewLabelBefore, updated: now() });
-      });
+      if (loadTask(h, id).state !== 'working') return;
+      const saved = taskTransaction(h, id, latest => {
+        if (latest.state !== 'working') return false;
+        writeJson(taskFile(h, id), { ...latest, reviewLabelBefore, updated: now() });
+        return true;
+      }, { observation: true });
+      if (!saved) return; // expected cancellation/contention, not an advisory error
     }
     if (abandon) {
       // Preserve newer verdicts/follow-ups; an interrupted start may have removed
@@ -3821,7 +3977,7 @@ function copyWaiting(task) {
   return { worktree: task.worktree, since: task.copyToReturn.since ?? null, why, heldBy: holders?.length ? describeHolders(holders, task.worktree) : null, kept: kept?.text ?? null, pending, free: why === 'free' };
 }
 
-const COMMANDS = { init: cmdInit, config: cmdConfig, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
+const COMMANDS = { '_launch-check': cmdLaunchCheck, init: cmdInit, config: cmdConfig, project: cmdProject, start: cmdStart, end: cmdEnd, spawn: cmdSpawn, done: cmdDone, wait: cmdWait, stop: cmdStop, finish: cmdFinish, status: cmdStatus,
   home: cmdHome, tools: cmdTools, backlog: cmdBacklog, show: cmdShow, tell: cmdTell, review: cmdReview, land: cmdLand, fix: cmdFix, agents: cmdAgents, relaunch: cmdRelaunch, selfrepair: cmdSelfmerge, selfmerge: cmdSelfmerge, update: cmdUpdate, rollback: cmdRollback };
 const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew init [folder]                       create a crew home (default ~/.crew)
