@@ -61,8 +61,8 @@ Additive v1 fields, advertised by `kindSource:true` and `checkoutStale:true` cap
 ### The same kind as the next spawn
 
 Automatic listing and ship admission use one resolver. With `delivery` and an `origin`, it
-reads delivery's allocation source: the published default branch (recorded `origin/HEAD`, or
-remote HEAD when not recorded), not the registered checkout's possibly old instructions.
+reads the published default branch advertised by remote HEAD, not the registered checkout's
+possibly old instructions or its cached `origin/HEAD`, which can outlive a default-branch rename.
 Instruction headers, the named skill and delivery callers are read from that commit's blobs.
 Thus a stale registered Plain checkout whose fresh copy contains delivery signals is listed
 as Workflow with `checkoutStale:true`, and the next spawn uses Workflow. The reverse mismatch
@@ -157,4 +157,5 @@ transport remain Herdr responsibilities; tests use only fake homes, local reposi
 Focused tests: `node crew.test.mjs --gaps=workflow-detection`,
 `node crew.test.mjs --gaps=project-kinds`, `node crew.test.mjs --gaps=project-kinds-concurrency`,
 `node crew.test.mjs --gaps=project-kind-paths`, `node crew.test.mjs --gaps=project-kind-snapshots`,
+`node crew.test.mjs --gaps=project-kind-stale-origin-head`,
 `node crew.test.mjs --gaps=project-kind-ordering` and `node crew.test.mjs --gaps=project-kind-lifecycle`.

@@ -664,8 +664,7 @@ const a=process.argv.slice(2); if(a[0]!=='start')process.exit(1);
 const detached=a[1]==='--detach', key=detached?a[2]:a[1], copy=path.join(${JSON.stringify(f.dir)},'delivery-copies',key.replaceAll('/','-'));
 let from='HEAD';
 if(spawnSync('git',['remote','get-url','origin']).status===0){
-  let branch=spawnSync('git',['symbolic-ref','--short','refs/remotes/origin/HEAD'],{encoding:'utf8'}).stdout.trim().replace(/^origin\\//,'');
-  if(!branch)branch=/^ref: refs\\/heads\\/(.+)\\tHEAD$/m.exec(spawnSync('git',['ls-remote','--symref','origin','HEAD'],{encoding:'utf8'}).stdout)?.[1];
+  const branch=/^ref: refs\\/heads\\/(.+)\\tHEAD$/m.exec(spawnSync('git',['ls-remote','--symref','origin','HEAD'],{encoding:'utf8'}).stdout)?.[1];
   if(spawnSync('git',['fetch','--quiet','origin',branch]).status!==0)process.exit(1);from='origin/'+branch;
 }
 if(process.env.KIND_COPY_READY){fs.writeFileSync(process.env.KIND_COPY_READY,'ready');while(!fs.existsSync(process.env.KIND_COPY_RELEASE))Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}
@@ -861,6 +860,35 @@ gapTests['project-kind-snapshots'] = () => {
   assert.equal(f.call(['project', 'set-kind', 'demo', '--kind', 'workflow', '--home', f.home, '--expected-path', f.repo, '--json']).code, 0);
   const unavailable = f.call(['project', 'list', '--json'], { CREW_TOOL_DELIVERY: '' }); assert.equal(unavailable.code, 0, unavailable.out);
   assert.equal(JSON.parse(unavailable.out).projects[0].kind, 'workflow'); assert.equal(JSON.parse(unavailable.out).projects[0].available, false);
+};
+
+gapTests['project-kind-stale-origin-head'] = () => {
+  for (const retained of [false, true]) {
+    const f = projectKindFixture(`stale-origin-head-${retained}`);
+    git('-C', f.repo, 'branch', '-M', 'main');
+    const local = git('-C', f.repo, 'rev-parse', 'HEAD').trim();
+    git('-C', f.repo, 'branch', 'develop');
+    const published = commit(f.repo, { 'AGENTS.md': '# Agent instructions\nThis file is `templates/AGENTS.md` of `example/workflow`.\n' }, 'published workflow');
+    const origin = path.join(f.dir, 'origin.git');
+    git('clone', '--bare', '-q', f.repo, origin);
+    if (!retained) git('-C', origin, 'branch', '-D', 'develop');
+    git('-C', f.repo, 'remote', 'add', 'origin', origin);
+    git('-C', f.repo, 'reset', '--hard', local);
+    git('-C', f.repo, 'update-ref', 'refs/remotes/origin/develop', local);
+    git('-C', f.repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop');
+    const refs = git('-C', f.repo, 'show-ref'), fetchHead = path.join(f.repo, '.git', 'FETCH_HEAD');
+    fs.writeFileSync(fetchHead, 'sentinel\n');
+    const listed = f.call(['project', 'list', '--json']);
+    assert.equal(listed.code, 0, listed.out);
+    assert.deepEqual(JSON.parse(listed.out).projects[0], { name: 'demo', path: slash(f.repo), kind: 'workflow', kindSource: 'detected', available: true, checkoutStale: true });
+    assert.equal(git('-C', f.repo, 'show-ref'), refs, 'Listing leaves the stale cached default and tracking refs untouched');
+    assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), local);
+    assert.equal(fs.readFileSync(fetchHead, 'utf8'), 'sentinel\n');
+    assert.equal(git('-C', f.repo, 'status', '--porcelain'), '');
+    const task = f.spawn('published-default', ['--kind', 'ship', '--type', 'refactor', '--agent', 'pi']);
+    assert.equal(task.deliveryKind, 'workflow'); assert.equal(task.workflow, 'delivery');
+    assert.equal(git('-C', task.worktree, 'rev-parse', 'HEAD').trim(), published);
+  }
 };
 
 gapTests['project-kind-ordering'] = async () => {

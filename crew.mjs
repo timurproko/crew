@@ -1082,11 +1082,9 @@ function allocationSnapshot(folder) {
   const local = git('rev-parse', '--verify', 'HEAD').stdout.trim();
   if (!/^[a-f0-9]{40,64}$/.test(local)) return { error: 'The allocation source HEAD cannot be read.' };
   if (!toolPath('delivery') || git('remote', 'get-url', 'origin').code !== 0) return { head: local, checkoutStale: false };
-  let branch = git('symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD').stdout.trim().replace(/^refs\/remotes\/origin\//, '');
-  if (!branch) {
-    const remote = git('ls-remote', '--symref', 'origin', 'HEAD');
-    branch = remote.code === 0 ? /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(remote.stdout)?.[1] : null;
-  }
+  // origin/HEAD is only a local cache: the remote's default may have changed.
+  const remote = git('ls-remote', '--symref', 'origin', 'HEAD');
+  const branch = remote.code === 0 ? /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(remote.stdout)?.[1] : null;
   if (!branch) return { error: 'The published default branch cannot be resolved.' };
   const listed = git('ls-remote', '--exit-code', '--heads', 'origin', `refs/heads/${branch}`);
   const head = listed.code === 0 ? /^([a-f0-9]{40,64})\t/m.exec(listed.stdout)?.[1] : null;
