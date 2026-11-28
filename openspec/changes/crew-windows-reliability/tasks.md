@@ -29,10 +29,10 @@ Each numbered group maps to one draft-PR Implementation outcome, in this order. 
 
 ## 5. Finish settling allows unrelated foreground work to progress
 
-- [ ] 5.1 Move read-only reported-worker settling before gate acquisition and revalidate current task/terminal generation under the gate without repeating the wait; cover unrelated tell/spawn progress and same-task change protection in `finish-contention`.
-- [ ] 5.2 Move optional post-close label/backlog work and sweep driving out of the outer gate, retaining a guarded return attempt for each copy and safe current-state transactions; use deterministic barriers to cover newer task state and foreign-terminal preservation.
-- [ ] 5.3 Bound opportunistic branch-proof reads and allow ten seconds for brief foreground placement contention without altering observation yield, dead-owner proof or publication fences; cover successful brief release and safe bounded refusal in `finish-contention`.
-- [ ] 5.4 Run `node crew.test.mjs --gaps=finish-contention`, `node crew.test.mjs --gaps=join-project-space-gate` and `node crew.test.mjs --gaps=launch-authorization-gate`; document the new settle/gate boundary and retained slow-copy-return limitation in `docs/worker-spaces.md`.
+- [x] 5.1 Move read-only reported-worker settling before gate acquisition and revalidate current task/terminal generation under the gate without repeating the wait; cover unrelated tell/spawn progress and same-task change protection in `finish-contention`.
+- [x] 5.2 Move optional post-close label/backlog work and sweep driving out of the outer gate, retaining a guarded return attempt for each copy and safe current-state transactions; use deterministic barriers to cover newer task state and foreign-terminal preservation.
+- [x] 5.3 Bound opportunistic branch-proof reads and allow ten seconds for brief foreground placement contention without altering observation yield, dead-owner proof or publication fences; cover successful brief release and safe bounded refusal in `finish-contention`.
+- [x] 5.4 Run `node crew.test.mjs --gaps=finish-contention`, `node crew.test.mjs --gaps=join-project-space-gate` and `node crew.test.mjs --gaps=launch-authorization-gate`; document the new settle/gate boundary and retained slow-copy-return limitation in `docs/worker-spaces.md`.
 
 ## 6. Internal repair-space names preserve repository directory spelling
 

@@ -1805,7 +1805,7 @@ const original = cp.spawnSync; let paused = false;
 cp.spawnSync = (...args) => {
   if (paused || !args[1]?.includes(${JSON.stringify(verb)}) || (${JSON.stringify(address)} && !args[1]?.includes(${JSON.stringify(address)}))) return original(...args);
   paused = true; const result = ${after} ? original(...args) : undefined;
-  fs.writeFileSync(${JSON.stringify(ready)}, JSON.stringify({command:args[0],args:args[1],status:result?.status,stderr:result?.stderr})); const deadline = Date.now() + 15000;
+  fs.writeFileSync(${JSON.stringify(ready)}, JSON.stringify({command:args[0],args:args[1],status:result?.status,stderr:result?.stderr})); const deadline = Date.now() + 30000;
   while (!fs.existsSync(${JSON.stringify(release)})) { if (Date.now() > deadline) throw Error('Core barrier timeout'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
   return ${after} ? result : original(...args);
 }; syncBuiltinESMExports();
@@ -1865,6 +1865,68 @@ async function joinProjectSpaceHandoverRaceTests(scope = 'integrated') {
     }
   }
 }
+gapTests['finish-contention'] = async () => {
+  for (const change of ['none', 'tell', 'relaunch']) {
+    const f = joinSpaceFixture(`finish-settle-${change}`), old = f.spawn('old'), other = f.spawn('other');
+    f.done(old); setTerminal(old.terminal, { status: { app: 'pi', state: 'working' } });
+    const ready = path.join(f.dir, 'settle-ready'), release = path.join(f.dir, 'settle-release'), script = path.join(f.dir, 'settle.mjs');
+    fs.writeFileSync(script, `import fs from 'node:fs';const wait=Atomics.wait;let paused=false;
+Atomics.wait=(a,i,v,ms)=>{if(!paused&&ms===1000){paused=true;fs.writeFileSync(${JSON.stringify(ready)},'ready');const end=Date.now()+30000;
+while(!fs.existsSync(${JSON.stringify(release)})){if(Date.now()>end)throw Error('settle barrier timeout');wait(a,i,v,10);}return 'timed-out';}return wait(a,i,v,ms);};
+const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});await main(process.argv.slice(2));`);
+    const owner = `owner-spaces-finish-settle-${change}`;
+    const pending = projectProcess(f, ['finish', old.id], { script, terminal: owner, env: f.env });
+    try {
+      await until(() => fs.existsSync(ready));
+      assert.ok(!fs.existsSync(path.join(f.home, 'worker-spaces.lock')), 'Reported-worker settling leaves placement free');
+      let r = f.call(['tell', other.id, 'Continue unrelated work.']); assert.equal(r.code, 0, r.out);
+      f.spawn('during-settle');
+      setTerminal(old.terminal, { status: { app: 'pi', state: 'idle' } });
+      if (change !== 'none') {
+        r = f.call(['tell', old.id, 'New work.']); assert.equal(r.code, 0, r.out);
+        if (change === 'relaunch') {
+          r = f.call(['relaunch', old.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+        }
+      } else {
+        f.guest(old); fs.writeFileSync(path.join(old.worktree, 'foreign-sentinel'), 'keep');
+      }
+      fs.writeFileSync(release, 'go'); r = await pending.result;
+      if (change === 'none') {
+        assert.equal(r.code, 0, r.out); assert.equal(f.task(old.id).state, 'closed');
+        assert.ok(fs.existsSync(path.join(old.worktree, 'foreign-sentinel')), 'Foreign holders still protect the copy');
+        f.leave(); assert.equal(f.call(['finish', old.id]).code, 0);
+      } else {
+        assert.equal(r.code, 6, r.out); assert.match(r.out, /changed while finish waited/);
+        assert.equal(f.task(old.id).state, 'working');
+        assert.equal(readWorld().terminals[f.task(old.id).terminal].state, 'live', 'Newer work was not stopped');
+      }
+    } finally { fs.writeFileSync(release, 'go'); await pending.result; }
+  }
+  for (const action of ['tell', 'spawn']) {
+    const f = joinSpaceFixture(`finish-brief-${action}`), old = f.spawn('old'), other = f.spawn('other');
+    const barrier = joinCoreBarrier(f, 'finish-blocked', 'rm', old.terminal, true), owner = `owner-spaces-finish-brief-${action}`;
+    const writer = projectProcess(f, ['finish', old.id], { script: barrier.script, terminal: owner, env: f.env });
+    let contender;
+    try {
+      await until(() => fs.existsSync(barrier.ready));
+      const ready = path.join(f.dir, 'contender-ready'), script = path.join(f.dir, 'contender.mjs'), lock = path.join(f.home, 'worker-spaces.lock');
+      fs.writeFileSync(script, `import fs from 'node:fs';const rename=fs.renameSync;
+fs.renameSync=(from,to,...args)=>{if(to===${JSON.stringify(lock)})fs.writeFileSync(${JSON.stringify(ready)},'ready');return rename(from,to,...args);};
+const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});await main(process.argv.slice(2));`);
+      contender = projectProcess(f, action === 'tell' ? ['tell', other.id, 'Continue.'] : ['spawn', 'new', '--project', 'demo', '--agent', 'pi', 'Count.'], { script, terminal: owner, env: f.env });
+      await until(() => fs.existsSync(ready)); fs.writeFileSync(barrier.release, 'go');
+      const stopped = await writer.result; assert.equal(stopped.code, 0, stopped.out);
+      const admitted = await contender.result; assert.equal(admitted.code, 0, admitted.out);
+    } finally { fs.writeFileSync(barrier.release, 'go'); await writer.result; if (contender) await contender.result; }
+  }
+  const f = joinSpaceFixture('finish-optional'), old = f.spawn('old'); f.done(old);
+  const marker = path.join(f.dir, 'optional.json'), tool = path.join(f.dir, 'tasks.mjs');
+  fs.writeFileSync(path.join(f.home, 'backlog.md'), '- [ ] old A backlog item\n');
+  fs.writeFileSync(tool, `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({locked:fs.existsSync(${JSON.stringify(path.join(f.home, 'worker-spaces.lock'))})}));`);
+  const r = f.call(['finish', old.id], { CREW_TOOL_TASKS_AXI: tool }); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(JSON.parse(fs.readFileSync(marker, 'utf8')), { locked: false }, 'Optional backlog work is outside placement');
+};
+
 async function joinPlacementGateTests(scope = 'integrated') {
   for (const action of ['relaunch', 'finish', 'stop', 'review']) {
     const f = joinSpaceFixture(`join-gate-${scope}-${action}`), old = f.spawn('old', 'demo', action === 'review' ? ['--kind', 'ship'] : []);

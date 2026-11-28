@@ -100,8 +100,17 @@ Release retires the owned directory before deleting it privately. Transient Wind
 errors retry retirement for up to one second with the same populated claim intact; exhaustion
 refuses with the claim retained for later proven-dead recovery, never shared-path deletion.
 Live, unverifiable and old
-file-format gates are never stolen by PID/age guesses. This intentionally serializes terminal
-transitions within a home, so slow cleanup can require another command to retry. Registry locks
+file-format gates are never stolen by PID/age guesses. Actual terminal transitions and copy-return safety checks remain serialized within a home.
+Finish waits for a reported worker's last turn **outside** the placement gate, then reloads
+and compares its task/terminal generation before mutation. A follow-up or replacement during
+that wait refuses the stale finish attempt without stopping newer work. Optional post-close
+labels/backlog work and the sweep driver also run outside the outer finish gate; each waiting
+copy is reloaded and returned under its own guarded attempt. Opportunistic merged-branch proof
+uses a five-second shared budget with at most two seconds per subprocess; unknown proof keeps
+the branch. Foreground tell/spawn acquisition allows ten seconds for brief gate contention;
+observation writers still yield immediately and publication keeps its longer allowance.
+Delivery-managed copy return and actual stop confirmation can still be slow and remain
+serialized for safety, so a longer transition can still require another command to retry. Registry locks
 remain regular files with complete OS identity and claim nonce. Under the placement gate, a dead
 registry claim is removed only after death proof and a fresh matching-nonce read; registry-only
 writers stay independent, but all reclaimers serialize through the gate. Legacy/unverifiable file
@@ -484,6 +493,11 @@ the old name for a fresh canonical space. It also runs within `--gaps=space-name
 hash-bearing pool parents, dot-prefixed projects, safe-name and exact-label validation, old
 lower-case and directory-cased canonical joins, canonical-over-combined preference, review/
 relaunch/hand-over inheritance and conflicting saved-name refusal. All evidence is fake-Core only.
+
+`--gaps=finish-contention` uses deterministic settle/transition barriers to prove unrelated
+tell/spawn progress, same-task follow-up/replacement protection, foreign-holder preservation,
+brief-contention retry and optional backlog work outside placement. Existing gate and
+launch-authorization groups continue to cover exclusion during actual terminal transitions.
 
 ## Named limits
 

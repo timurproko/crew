@@ -2230,7 +2230,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
         saveTask(h, record); // reservation and decision share the same gate
         return true;
       });
-    });
+    }, { waitMs: 10000 });
     if (reserved) break;
     if (Date.now() >= deadline || (pending && Date.now() >= pendingDeadline)) {
       refuse('worker-space-busy: a worker is still being published; retry. Nothing was launched.', 4);
@@ -2624,13 +2624,13 @@ function a1Api(type, target) {
 // `stopped: true` is returned only for something that was observed: Core says the terminal
 // is finished or gone, or A1 itself says the session no longer exists. A Core that does not
 // answer is never read as "gone".
-function workerToStop(task, force) {
+function workerToStop(task, force, settle = true) {
   let { state, t } = probe(task.terminal);
   if (state === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was stopped or removed. Try again.`, 4);
   if (state !== 'live') return { state, t };
   // A worker reports from inside its last turn; give that turn a moment to end before
   // deciding it is still busy.
-  for (let i = 0; task.state === 'reported' && !force && state === 'live' && t.status?.state === 'working' && i < (Number(process.env.CREW_SETTLE_SECONDS) || 45); i++) {
+  for (let i = 0; settle && task.state === 'reported' && !force && state === 'live' && t.status?.state === 'working' && i < (Number(process.env.CREW_SETTLE_SECONDS) || 45); i++) {
     sleep(1000);
     ({ state, t } = probe(task.terminal));
   }
@@ -2638,16 +2638,16 @@ function workerToStop(task, force) {
   if (state === 'live' && t.status?.state === 'working' && !force) refuse(`Task ${task.id} is still working. Wait for it, or pass --force to cancel it.`, 6);
   return { state, t };
 }
-function stopTaskWorkers(task, { force = false, onStop = null } = {}) {
+function stopTaskWorkers(task, { force = false, onStop = null, settle = true } = {}) {
   const workers = ownedTerminals(task).map(t => ({ ...task, terminal: t.address, agent: t.agent }));
   // Refuse a busy or unobservable owned worker before stopping any of the set.
   // A singleton's stopWorker already does this check before any mutation.
-  if (workers.length > 1) for (const worker of workers) workerToStop(worker, force);
+  if (workers.length > 1) for (const worker of workers) workerToStop(worker, force, settle);
   const pending = [], results = [];
   let attempted = false;
   for (const worker of workers) {
     try {
-      const result = stopWorker(worker, { force, onStop: () => { attempted = true; onStop?.(); } });
+      const result = stopWorker(worker, { force, settle, onStop: () => { attempted = true; onStop?.(); } });
       results.push(result.how);
       if (!result.stopped) pending.push(worker.terminal);
     } catch (error) {
@@ -2657,8 +2657,8 @@ function stopTaskWorkers(task, { force = false, onStop = null } = {}) {
   }
   return { stopped: !pending.length, pending, how: workers.length === 1 ? results[0] : `${workers.length - pending.length} of ${workers.length} owned terminals stopped${pending.length ? '; stops pending' : ''}` };
 }
-function stopWorker(task, { force = false, onStop = null } = {}) {
-  const { state, t } = workerToStop(task, force);
+function stopWorker(task, { force = false, onStop = null, settle = true } = {}) {
+  const { state, t } = workerToStop(task, force, settle);
   if (state !== 'live') return { stopped: true, how: 'terminal already gone' };
   const working = t.status?.state === 'working';
   if (AGENTS[task.agent]?.exit === 'a1-api' && t.status?.app === 'a1' && t.labels?.['a1.session'] && t.labels?.['a1.runtime']) {
@@ -2711,7 +2711,10 @@ function cmdStop(args) {
 // head is exactly this commit (a squash merge leaves no ancestry). Anything unsure keeps it.
 function dropMergedBranch(h, project, task) {
   if (task.kind !== 'ship' || !project?.path) return '';
-  const branch = branchOf(task), git = (...a) => run('git', ['-C', project.path, ...a], { timeout: 60000 });
+  const deadline = Date.now() + 5000;
+  const budget = () => ({ timeout: Math.max(1, Math.min(2000, deadline - Date.now())) });
+  const branch = branchOf(task), git = (...a) => Date.now() >= deadline ? { code: 124, stdout: '', stderr: '' }
+    : run('git', ['-C', project.path, ...a], budget());
   const tip = git('rev-parse', '--verify', '-q', `refs/heads/${branch}`).stdout.trim();
   if (!tip) return '';
   let merged = ['HEAD', 'refs/remotes/origin/HEAD'].some(ref => git('merge-base', '--is-ancestor', tip, ref).code === 0);
@@ -2724,11 +2727,11 @@ function dropMergedBranch(h, project, task) {
     if (recorded && repository && recorded.toLowerCase().startsWith(`https://github.com/${repository.toLowerCase()}/pull/`)) {
       // Replace the existing branch read, not add another request. Exact URL reads
       // can also prove absence; a missing PR never proves the branch was merged.
-      const found = readPrAtUrl(task.pr, 'headRefOid', { cwd: project.path, timeout: 60000 });
+      const found = Date.now() < deadline ? readPrAtUrl(task.pr, 'headRefOid', { cwd: project.path, ...budget() }) : null;
       if (found) rememberTaskPr(h, task, found.facts);
       merged = found?.pr?.headRefOid === tip && found.pr.state === 'MERGED';
     } else {
-      const asked = gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid,url,state,mergedAt,closedAt'], { cwd: project.path, timeout: 60000 });
+      const asked = Date.now() < deadline ? gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid,url,state,mergedAt,closedAt'], { cwd: project.path, ...budget() }) : { code: 124, stdout: '' };
       let pr; try { pr = JSON.parse(asked.stdout)?.[0]; } catch { /* No proof. */ }
       merged = asked.code === 0 && pr?.headRefOid === tip && pr.state === 'MERGED';
       if (merged) rememberTaskPr(h, task, prObservation(pr));
@@ -3060,7 +3063,11 @@ function removeOneStoppedTerminal(task) {
 // now (`crew finish <id> --force` on the closed task). A --force given at finish covered only
 // what was there then. { state: returned | gone | held | silent | kept | failed, line }.
 function returnWaiting(h, task, options = {}) {
-  const back = withPlacementGate(h, () => tryReturnWaiting(h, task, options));
+  const back = withPlacementGate(h, () => {
+    const current = readJson(taskFile(h, task.id));
+    if (current?.state !== 'closed' || !current.copyToReturn) return { state: 'gone', line: `the working copy of ${task.id} is no longer pending; nothing was removed` };
+    return tryReturnWaiting(h, current, options);
+  });
   return { ...back, line: back.line + discardSummary(back.disposal) };
 }
 function tryReturnWaiting(h, task, { force = false } = {}) {
@@ -3111,10 +3118,26 @@ function tryReturnWaiting(h, task, { force = false } = {}) {
   return { state: 'returned', disposal: { ...back, unseen: Boolean(check.unseen) || back.unseen }, line: `returned the working copy of finished task ${task.id}${back.said}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}` };
 }
 
+const finishGeneration = task => JSON.stringify([task.state, task.terminal, task.relaunched, task.reported, task.told, task.tells,
+  task.terminals, task.terminalLaunches, task.preparation]);
 function cmdFinish(args, options = {}) {
   const h = home();
   requireOwner(h, 'finish work');
-  return withPlacementGate(h, () => finishTask(h, args, options));
+  const id = args.find(a => !a.startsWith('--')), force = args.includes('--force');
+  if (!id) refuse('Usage: crew finish <id> [--force]');
+  const before = loadTask(h, id), generation = finishGeneration(before);
+  // This is advisory/read-only. Never monopolize placement during the worker's
+  // last reporting turn; recheck its generation and busy state under the gate.
+  if (before.state === 'reported' && !force) {
+    for (const worker of ownedTerminals(before)) workerToStop({ ...before, terminal: worker.address, agent: worker.agent }, false);
+  }
+  const result = withPlacementGate(h, () => {
+    if (finishGeneration(loadTask(h, id)) !== generation) refuse(`Task ${id} changed while finish waited; retry. Nothing was stopped.`, 6);
+    return finishTask(h, args, options);
+  });
+  reviewLabels(h, id, 'abandon');
+  if (result?.backlog && loadTask(h, id).state === 'closed') backlogMove(h, id, 'done');
+  returnWaitingCopies(h, { skip: id });
 }
 function finishTask(h, args, { scratchProof } = {}) {
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
@@ -3130,7 +3153,6 @@ function finishTask(h, args, { scratchProof } = {}) {
       if (pending) refuse(pending.text, pending.state === 'silent' ? 4 : 6);
       saveTask(h, { ...task, terminalLaunches: task.terminalLaunches.map(item => ({ ...item, late: false })) });
     }
-    reviewLabels(h, id, 'abandon');
     // A closed task whose copy still waits: --force is the person's word to discard what was
     // found in it and return it now. A terminal in it still keeps it, forced or not.
     if (task.copyToReturn && force) {
@@ -3142,8 +3164,7 @@ function finishTask(h, args, { scratchProof } = {}) {
       const back = returnWaiting(h, task);
       console.log(back.state === 'returned' || back.state === 'gone' ? `${id} is already closed; ${back.line}` : `${id} is already closed; its working copy still waits to be returned: ${back.line}`);
     } else console.log(`${id} is already closed; discarded none`);
-    returnWaitingCopies(h, { skip: id });
-    return;
+    return { backlog: false };
   }
   // Somebody else's terminal in the copy is never ended with it, forced or not: the copy then
   // stays until it is free, and everything else is finished. Core is asked before anything is
@@ -3161,7 +3182,7 @@ function finishTask(h, args, { scratchProof } = {}) {
   if (work.keep) refuse(`Task ${id} is marked to keep by .artifacts/KEEP in ${task.worktree}. Nothing was removed. Delete the marker, or pass --force.`, 6);
   if (scratch && left.operations.length) refuse(`Task ${id} has a protected Git operation or lock; nothing was removed.`, 6);
   let attempted = false, result;
-  try { result = stopTaskWorkers(task, { force, onStop: () => { attempted = true; } }); }
+  try { result = stopTaskWorkers(task, { force, settle: false, onStop: () => { attempted = true; } }); }
   catch (error) {
     if (!attempted || !(error instanceof Refusal)) throw error;
     result = { stopped: false, how: error.message };
@@ -3179,7 +3200,7 @@ function finishTask(h, args, { scratchProof } = {}) {
   const published = loadTask(h, id);
   if (ownedTerminals(published).some(t => !ownedTerminals(task).some(old => old.address === t.address))) {
     waiting.terminals = published.terminals;
-    try { result = stopTaskWorkers(published, { force }); }
+    try { result = stopTaskWorkers(published, { force, settle: false }); }
     catch (error) {
       if (!(error instanceof Refusal)) throw error;
       result = { stopped: false, how: error.message, pending: ownedTerminals(published).map(t => t.address) };
@@ -3209,10 +3230,8 @@ function finishTask(h, args, { scratchProof } = {}) {
     saveTask(h, closed);
     console.log(`finished ${id} (${result.how})${back.said}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}${discardSummary({ ...back, unseen: Boolean(comparison?.unseen) || back.unseen })}`);
   }
-  reviewLabels(h, id, 'abandon');
-  // A legacy treehouse task moves its scout's item even after a review, as it always did.
-  if (task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews)) backlogMove(h, id, 'done');
-  returnWaitingCopies(h, { skip: id });
+  // Optional effects run after releasing placement, never over an old task save.
+  return { backlog: task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews) };
 }
 
 // --- follow-ups, review and delivery ------------------------------------------------
@@ -3241,12 +3260,12 @@ function sendTaskTell(h, task, message) {
   taskTransaction(h, id, current => {
     if (!sameWorker(current, task) || current.state !== task.state || current.reported !== task.reported || current.told !== task.told) no('worker or report changed; nothing was sent');
     writeJson(taskFile(h, id), { ...current, state: 'working', told, tells: (current.tells ?? 0) + 1, updated: now() });
-  });
+  }, { waitMs: 10000 });
   const sent = hc(['send', task.terminal, text]);
   taskTransaction(h, id, current => {
     if (!sameWorker({ ...current, state: task.state }, task) || current.told !== told) return;
     if (sent.code !== 0 && current.state === 'working') writeJson(taskFile(h, id), { ...current, state: task.state, updated: now() });
-  });
+  }, { waitMs: 10000 });
   if (sent.code !== 0) no(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
   reviewLabels(h, id, 'rework');
 }
