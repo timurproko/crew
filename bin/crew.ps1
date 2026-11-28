@@ -11,7 +11,9 @@ if ($args.Count -eq 1 -and $args[0] -eq '--crew-batch-guard') {
         exit 2
     }
 }
-$json = ConvertTo-Json -InputObject @($args) -Compress
+# PowerShell literals can be numbers or other typed values; CLI argv is strings.
+$argv = @($args | ForEach-Object { [string]$_ })
+$json = ConvertTo-Json -InputObject $argv -Compress
 $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
 & node (Join-Path $PSScriptRoot '../crew.mjs') _argv $encoded
 exit $LASTEXITCODE

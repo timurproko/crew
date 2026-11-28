@@ -484,7 +484,9 @@ console.log('https://github.com/acme/crew/pull/' + log.filter(x => x.a[1] === 'c
   fs.writeFileSync(delivery, `import fs from 'node:fs'; const a = process.argv.slice(2), f = ${JSON.stringify(deliveryLog)}; fs.writeFileSync(f, JSON.stringify([...JSON.parse(fs.readFileSync(f, 'utf8')), a])); if (a[0] !== 'check-body' || !a.includes('--final')) process.exit(1);`);
   const script = path.join(repo, 'crew.mjs');
   const w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
-  const env = { CREW_CLAUDE_ACCOUNTS: '', CREW_GH: fakeGh, CREW_SELFTEST: 'node docs/selftest.mjs', CREW_WORKTREES: path.join(dir, 'copies') };
+  const agents = path.join(dir, 'agents'); fs.mkdirSync(agents);
+  fs.writeFileSync(path.join(agents, WINDOWS ? 'pi.cmd' : 'pi'), 'fixture availability marker; never executed\n');
+  const env = { CREW_CLAUDE_ACCOUNTS: '', CREW_GH: fakeGh, CREW_SELFTEST: 'node docs/selftest.mjs', CREW_WORKTREES: path.join(dir, 'copies'), CREW_AGENT_PATH: agents };
   const call = (args, extra = {}) => crew(args, { script, cwd: home, terminal: owner, env: { ...env, ...extra } });
   assert.equal(call(['init', home]).code, 0); assert.equal(call(['start']).code, 0);
   const task = id => JSON.parse(fs.readFileSync(path.join(home, 'tasks', id, 'task.json'), 'utf8'));
@@ -767,6 +769,10 @@ const r=spawnSync('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-E
       return f.call([], {}, driver);
     };
     r = invoke('crew.ps1', 'native'); assert.equal(r.code, 0, r.out); check('native');
+    r = invoke('crew.ps1', '123'); assert.equal(r.code, 0, r.out); check('123');
+    assert.equal(f.task('123').id, '123', 'Unquoted numeric PowerShell task IDs become string argv');
+    fs.writeFileSync(script, `& '${slash(path.join(here, 'bin', 'crew.ps1'))}' --help --rule 1\r\nexit $LASTEXITCODE\r\n`);
+    r = f.call([], {}, driver); assert.equal(r.code, 0, r.out); assert.match(r.out, /crew spawn/);
     r = invoke('crew.cmd', 'batch-lossy'); assert.equal(r.code, 2, r.out); assert.match(r.out, /unsafe batch.*crew.ps1|task-file/);
     assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'batch-lossy')), 'Batch guard rejects before a shortened task is created');
     r = invoke('crew.cmd', 'batch-file', "--task-file 'task.txt'"); assert.equal(r.code, 0, r.out); check('batch-file');
@@ -1457,7 +1463,7 @@ function workerSpaceFixTests(prefix = 'spaces') {
     assert.equal(readWorld().terminals[t.terminal].labels['crew.space.project'], binding.project, 'Fleet task identity never rewrites the repair placement alias');
     assert.equal(binding.name, 'core', 'Repair names use the source repository directory, including internal fallback'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
     assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
-    r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: '' }); assert.equal(r.code, 0, r.out);
+    r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
     assert.deepEqual(f.task(t.id).workerSpace, binding);
     assert.equal(readWorld().terminals[f.task(t.id).terminal].labels['herdr.space'], binding.id);
     if (registration === 'matching') {
@@ -1482,6 +1488,9 @@ gapTests['repair-space-name'] = () => {
     fs.writeFileSync(path.join(f.home, 'tasks', t.id, 'task.json'), JSON.stringify({ ...t, workerSpace: oldName,
       terminalLaunches: t.terminalLaunches.map(launch => ({ ...launch, workerSpace: oldName })) }));
     const w = readWorld(); w.terminals[t.terminal].labels['crew.space.name'] = 'crew'; fs.writeFileSync(world, JSON.stringify(w));
+    const absent = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: path.join(f.dir, 'no-agents') });
+    assert.equal(absent.code, 8, absent.out); assert.match(absent.out, /pi is not installed/);
+    assert.equal(f.task(t.id).terminal, t.terminal, 'Missing agents still refuse before stopping the current worker');
     r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
     assert.deepEqual(f.task(t.id).workerSpace, oldName, 'Existing occupied repair names are not renamed');
     assert.equal(readWorld().terminals[f.task(t.id).terminal].labels['crew.space.name'], 'crew');
