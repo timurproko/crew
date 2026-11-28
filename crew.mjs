@@ -3965,8 +3965,11 @@ function cmdSelfmerge(args) {
   if (tested.error || tested.code !== 0) {
     const reason = tested.error?.code === 'ETIMEDOUT' ? `timed out after ${suiteTimeout / 1000} seconds`
       : tested.error ? `could not complete (${tested.error.code ?? tested.error.message})`
-        : tested.code === null ? 'terminated without an exit code' : `fails (exit ${tested.code})`;
-    no(`the test suite ${reason} (${command}; deadline ${suiteTimeout / 1000} seconds):\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
+        : tested.code === null ? 'terminated without an exit code' : 'fails';
+    const detail = !tested.error && tested.code !== null
+      ? `(${command}, exit ${tested.code}); deadline ${suiteTimeout / 1000} seconds`
+      : `(${command}; deadline ${suiteTimeout / 1000} seconds)`;
+    no(`the test suite ${reason} ${detail}:\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
   }
   const subject = git('log', '--reverse', '--format=%s', 'origin/main..HEAD').stdout.split(/\r?\n/).find(Boolean) || 'Repair the reported crew defect';
   // Commit subjects are untrusted prose, not PR-body markup. Keep the outcome one bounded line.

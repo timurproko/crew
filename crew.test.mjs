@@ -546,6 +546,21 @@ gapTests['root-layout'] = () => {
   const crash = fs.readFileSync(path.join(crashes, fs.readdirSync(crashes)[0]), 'utf8');
   assert.ok(crash.includes(`at ${repaired.slice(0, 8)} (${slash(t.worktree)})`), crash);
 };
+gapTests['selfrepair-failure-diagnostic'] = () => {
+  const f = repairFixture('failure-diagnostic');
+  assert.equal(f.call(['fix', '--agent', 'pi', 'Repair a failing suite.']).code, 0);
+  const t = f.task('fix-1'); f.reported(t);
+  commit(t.worktree, { 'docs/check.mjs': "console.error('expected fixture assertion'); process.exit(1);\n" }, 'failing repair');
+  const r = f.call(['selfmerge', t.id], { CREW_SELFTEST: 'node docs/check.mjs' });
+  assert.equal(r.code, 6, r.out);
+  // Keep the legacy integration assertion as well as the new deadline detail.
+  assert.match(r.out, /the test suite fails \(node docs\/check\.mjs, exit 1\)/);
+  assert.match(r.out, /deadline 3600 seconds/); assert.match(r.out, /expected fixture assertion/);
+  assert.equal(f.task(t.id).pr, undefined);
+  assert.equal(spawnSync('git', ['-C', f.origin, 'rev-parse', '--verify', `refs/heads/${t.branch}`]).status, 128);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.log, 'utf8')), [], 'A failing suite never reaches GitHub publication');
+};
+
 gapTests['selfrepair-deadline'] = () => {
   const f = repairFixture('deadline');
   assert.equal(f.call(['fix', '--agent', 'pi', 'A bounded repair.']).code, 0);
@@ -570,7 +585,7 @@ cp.spawnSync=function(command,args,options){
     assert.equal(r.code, 2, r.out); assert.match(r.out, /integer from 1 to 7200/);
     assert.ok(!fs.existsSync(observed), 'Invalid timeout refuses before running the suite');
   }
-  for (const [value, pattern] of [['fail', /fails \(exit 1\)/], ['ETIMEDOUT', /timed out after 2 seconds/], ['ENOENT', /could not complete \(ENOENT\)/], ['ENOBUFS', /could not complete \(ENOBUFS\)/]]) {
+  for (const [value, pattern] of [['fail', /the test suite fails \(node crew\.test\.mjs, exit 1\); deadline 2 seconds:/], ['ETIMEDOUT', /timed out after 2 seconds/], ['ENOENT', /could not complete \(ENOENT\)/], ['ENOBUFS', /could not complete \(ENOBUFS\)/]]) {
     fs.writeFileSync(mode, value);
     const r = f.call(['selfrepair', t.id], { ...env, CREW_SELFTEST_TIMEOUT_SECONDS: '2' });
     assert.equal(r.code, 6, r.out); assert.match(r.out, pattern);
