@@ -4,9 +4,9 @@ Each numbered group maps to one draft-PR Implementation outcome, in this order. 
 
 ## 1. Published-default selection survives branch renames with one remote read
 
-- [ ] 1.1 Integrate the supplied be7c5ad8 and 7d5cdcb9 changes in this worktree; confirm branch and commit come from one live ls-remote advertisement without cached origin/HEAD authority.
-- [ ] 1.2 Keep deleted-old-default and retained-old-default listing/spawn fixtures plus a remote-call-count assertion; run `node crew.test.mjs --gaps=project-kind-stale-origin-head` and `node crew.test.mjs --gaps=project-kind-snapshots`.
-- [ ] 1.3 Update `docs/project-kinds.md` to describe live remote HEAD and one advertisement; compare documented output fields with the unchanged v1 contract.
+- [x] 1.1 Integrate the supplied be7c5ad8 and 7d5cdcb9 changes in this worktree; confirm branch and commit come from one live ls-remote advertisement without cached origin/HEAD authority.
+- [x] 1.2 Keep deleted-old-default and retained-old-default listing/spawn fixtures plus a remote-call-count assertion; run `node crew.test.mjs --gaps=project-kind-stale-origin-head` and `node crew.test.mjs --gaps=project-kind-snapshots`.
+- [x] 1.3 Update `docs/project-kinds.md` to describe live remote HEAD and one advertisement; compare documented output fields with the unchanged v1 contract.
 
 ## 2. JSON project listing overlaps independent resolution without stale admission
 

@@ -878,14 +878,22 @@ gapTests['project-kind-stale-origin-head'] = () => {
     git('-C', f.repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop');
     const refs = git('-C', f.repo, 'show-ref'), fetchHead = path.join(f.repo, '.git', 'FETCH_HEAD');
     fs.writeFileSync(fetchHead, 'sentinel\n');
-    const listed = f.call(['project', 'list', '--json']);
+    const trace = path.join(f.dir, 'remote-trace.jsonl');
+    const listed = f.call(['project', 'list', '--json'], { GIT_TRACE2_EVENT: slash(trace) });
     assert.equal(listed.code, 0, listed.out);
+    const remoteCalls = () => fs.readFileSync(trace, 'utf8').trim().split(/\r?\n/).map(JSON.parse)
+      .filter(e => e.event === 'start' && e.argv.includes('ls-remote'));
+    assert.equal(remoteCalls().length, 1, 'One live advertisement supplies branch and commit');
     assert.deepEqual(JSON.parse(listed.out).projects[0], { name: 'demo', path: slash(f.repo), kind: 'workflow', kindSource: 'detected', available: true, checkoutStale: true });
     assert.equal(git('-C', f.repo, 'show-ref'), refs, 'Listing leaves the stale cached default and tracking refs untouched');
     assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), local);
     assert.equal(fs.readFileSync(fetchHead, 'utf8'), 'sentinel\n');
     assert.equal(git('-C', f.repo, 'status', '--porcelain'), '');
-    const task = f.spawn('published-default', ['--kind', 'ship', '--type', 'refactor', '--agent', 'pi']);
+    fs.writeFileSync(trace, '');
+    const admitted = f.call(['spawn', 'published-default', '--project', 'demo', '--kind', 'ship', '--type', 'refactor', '--agent', 'pi', 'Count.'], { GIT_TRACE2_EVENT: slash(trace) });
+    assert.equal(admitted.code, 0, admitted.out);
+    assert.equal(remoteCalls().length, 2, 'Admission and the fake allocator each read live HEAD once');
+    const task = f.task('published-default');
     assert.equal(task.deliveryKind, 'workflow'); assert.equal(task.workflow, 'delivery');
     assert.equal(git('-C', task.worktree, 'rev-parse', 'HEAD').trim(), published);
   }

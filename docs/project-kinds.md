@@ -63,6 +63,7 @@ Additive v1 fields, advertised by `kindSource:true` and `checkoutStale:true` cap
 Automatic listing and ship admission use one resolver. With `delivery` and an `origin`, it
 reads the published default branch advertised by remote HEAD, not the registered checkout's
 possibly old instructions or its cached `origin/HEAD`, which can outlive a default-branch rename.
+One `git ls-remote --symref origin HEAD` advertisement supplies both branch and commit.
 Instruction headers, the named skill and delivery callers are read from that commit's blobs.
 Thus a stale registered Plain checkout whose fresh copy contains delivery signals is listed
 as Workflow with `checkoutStale:true`, and the next spawn uses Workflow. The reverse mismatch
