@@ -1892,6 +1892,34 @@ async function joinProjectSpaceHandoverRaceTests(scope = 'integrated') {
     }
   }
 }
+gapTests['finish-idempotent-race'] = async () => {
+  const original = fs.readFileSync(world, 'utf8');
+  try {
+    for (const force of [false, true]) {
+      const f = joinSpaceFixture(`finish-idempotent-${force}`), task = f.spawn('racing'); f.done(task);
+      const lock = path.join(f.home, 'worker-spaces.lock'), ready = path.join(f.dir, 'before-gate'), release = path.join(f.dir, 'gate-release');
+      const script = path.join(f.dir, 'late-finisher.mjs');
+      fs.writeFileSync(script, `import fs from 'node:fs';const rename=fs.renameSync;let paused=false;
+fs.renameSync=(from,to,...args)=>{if(!paused&&to===${JSON.stringify(lock)}){paused=true;fs.writeFileSync(${JSON.stringify(ready)},'ready');const end=Date.now()+30000;
+while(!fs.existsSync(${JSON.stringify(release)})){if(Date.now()>end)throw Error('finish race barrier timeout');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}}
+return rename(from,to,...args);};
+const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});await main(process.argv.slice(2));`);
+      const args = ['finish', task.id, ...(force ? ['--force'] : [])];
+      const pending = projectProcess(f, args, { script, terminal: `owner-spaces-finish-idempotent-${force}`, env: f.env });
+      try {
+        await until(() => fs.existsSync(ready));
+        const first = f.call(args); assert.equal(first.code, 0, first.out); assert.equal(f.task(task.id).state, 'closed');
+        assert.ok(!fs.existsSync(task.worktree));
+        fs.mkdirSync(task.worktree); const sentinel = path.join(task.worktree, 'reused-folder'); fs.writeFileSync(sentinel, 'new owner');
+        fs.writeFileSync(release, 'go'); const second = await pending.result;
+        assert.equal(second.code, 0, second.out); assert.match(second.out, /already closed/);
+        assert.equal(fs.readFileSync(sentinel, 'utf8'), 'new owner', 'A duplicate finish never deletes a reused copy');
+        assert.ok(!f.task(task.id).copyToReturn);
+      } finally { fs.writeFileSync(release, 'go'); await pending.result; }
+    }
+  } finally { fs.writeFileSync(world, original); }
+};
+
 gapTests['finish-contention'] = async () => {
   for (const change of ['none', 'tell', 'relaunch']) {
     const f = joinSpaceFixture(`finish-settle-${change}`), old = f.spawn('old'), other = f.spawn('other');

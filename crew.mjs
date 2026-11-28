@@ -3126,14 +3126,22 @@ function cmdFinish(args, options = {}) {
   requireOwner(h, 'finish work');
   const id = args.find(a => !a.startsWith('--')), force = args.includes('--force');
   if (!id) refuse('Usage: crew finish <id> [--force]');
-  const before = loadTask(h, id), generation = finishGeneration(before);
+  const before = loadTask(h, id), settling = before.state === 'reported' && !force;
+  const generation = settling ? finishGeneration(before) : null;
   // This is advisory/read-only. Never monopolize placement during the worker's
   // last reporting turn; recheck its generation and busy state under the gate.
-  if (before.state === 'reported' && !force) {
+  if (settling) {
     for (const worker of ownedTerminals(before)) workerToStop({ ...before, terminal: worker.address, agent: worker.agent }, false);
   }
   const result = withPlacementGate(h, () => {
-    if (finishGeneration(loadTask(h, id)) !== generation) refuse(`Task ${id} changed while finish waited; retry. Nothing was stopped.`, 6);
+    if (settling) {
+      const current = loadTask(h, id);
+      // A competing finish may already have closed this task. Its current closed
+      // cleanup path is idempotent and must not reuse the preflight's old copy.
+      if (current.state !== 'closed' && finishGeneration(current) !== generation) refuse(`Task ${id} changed while finish waited; retry. Nothing was stopped.`, 6);
+    }
+    // No unlocked settling observation authorizes force/preparation cleanup;
+    // finishTask always reloads and validates the current task under this gate.
     return finishTask(h, args, options);
   });
   reviewLabels(h, id, 'abandon');

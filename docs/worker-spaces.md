@@ -103,7 +103,10 @@ Live, unverifiable and old
 file-format gates are never stolen by PID/age guesses. Actual terminal transitions and copy-return safety checks remain serialized within a home.
 Finish waits for a reported worker's last turn **outside** the placement gate, then reloads
 and compares its task/terminal generation before mutation. A follow-up or replacement during
-that wait refuses the stale finish attempt without stopping newer work. Optional post-close
+that wait refuses the stale finish attempt without stopping newer work. A competing finish
+that already closed the task uses the current idempotent closed-task cleanup path instead.
+Forced/preparation cleanup has no unlocked settling authorization to reuse: it always reloads
+and validates current preparation/terminal authority under the gate. Optional post-close
 labels/backlog work and the sweep driver also run outside the outer finish gate; each waiting
 copy is reloaded and returned under its own guarded attempt. Opportunistic merged-branch proof
 uses a five-second shared budget with at most two seconds per subprocess; unknown proof keeps
@@ -499,6 +502,10 @@ relaunch/hand-over inheritance and conflicting saved-name refusal. All evidence 
 
 `--gaps=repair-space-name` covers core-named repair sources, matching and unrelated crew
 registrations, internal fallback IDs, and legacy saved-name inheritance without a native app.
+
+`--gaps=finish-idempotent-race` pauses ordinary and forced finishes before gate acquisition,
+lets another finish close the task, and proves duplicate cleanup preserves a reused folder.
+The existing `--gaps=preparation-recovery` concurrent finish assertions remain unchanged.
 
 `--gaps=finish-contention` uses deterministic settle/transition barriers to prove unrelated
 tell/spawn progress, same-task follow-up/replacement protection, foreign-holder preservation,
