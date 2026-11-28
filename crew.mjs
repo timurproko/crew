@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 
 export const VERSION = '0.12.1';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -1013,7 +1014,7 @@ function createHome(dir) {
 
 function cmdProject(args) {
   if (args[0] === 'set-kind' || args.some(a => ['--capabilities', '--json', '--home', '--expected-path'].includes(a))) {
-    cmdProjectKinds(args); return;
+    return cmdProjectKinds(args);
   }
   const h = home();
   const [verb, name, source] = args;
@@ -1068,12 +1069,13 @@ function cmdProject(args) {
 const WORKFLOWS = ['delivery', 'plain'];
 const PROJECT_KINDS = ['workflow', 'plain', 'gate'];
 const PROJECT_KINDS_API = { capability: 'project-kinds', version: 1 };
-function gateAvailable(folder) {
-  return Boolean(toolPath('no-mistakes')) && run('git', ['-C', folder, 'remote', 'get-url', 'no-mistakes'], { timeout: 2000 }).code === 0;
+const projectTools = () => ({ delivery: toolPath('delivery'), gate: toolPath('no-mistakes') });
+function gateAvailable(folder, tools = projectTools()) {
+  return Boolean(tools.gate) && run('git', ['-C', folder, 'remote', 'get-url', 'no-mistakes'], { timeout: 2000 }).code === 0;
 }
 // List and admission resolve the same source that a fresh allocation starts from.
 // Fetch objects only: never move a checkout, tracking ref, index or FETCH_HEAD.
-function allocationSnapshot(folder) {
+function allocationSnapshot(folder, tools = projectTools()) {
   const deadline = Date.now() + 10000;
   const git = (...args) => run('git', ['-C', folder, ...args], {
     timeout: Math.max(1, Math.min(5000, deadline - Date.now())),
@@ -1081,7 +1083,7 @@ function allocationSnapshot(folder) {
   });
   const local = git('rev-parse', '--verify', 'HEAD').stdout.trim();
   if (!/^[a-f0-9]{40,64}$/.test(local)) return { error: 'The allocation source HEAD cannot be read.' };
-  if (!toolPath('delivery') || git('remote', 'get-url', 'origin').code !== 0) return { head: local, checkoutStale: false };
+  if (!tools.delivery || git('remote', 'get-url', 'origin').code !== 0) return { head: local, checkoutStale: false };
   // origin/HEAD is only a local cache: the remote's default may have changed.
   const remote = git('ls-remote', '--symref', 'origin', 'HEAD');
   const branch = remote.code === 0 ? /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(remote.stdout)?.[1] : null;
@@ -1111,27 +1113,70 @@ function snapshotFollowsWorkflow(folder, head) {
   return [...files].filter(file => /^\.github\/workflows\/[^/]+\.ya?ml$/i.test(file)).slice(0, 100).some(file =>
     /^\s*uses:\s*['"]?(?:timurproko\/MyWorkflows\/\.github\/workflows\/delivery\.ya?ml@[^\s'"]+|\.\/\.github\/workflows\/delivery\.ya?ml)['"]?\s*(?:#.*)?$/im.test(text(file)));
 }
-function projectDelivery(project) {
+function projectDelivery(project, tools = projectTools()) {
   let kindSource = project.kind ? 'explicit' : project.workflow ? 'legacy' : 'detected';
   let kind = project.kind, checkoutStale = null;
-  if (!kind && gateAvailable(project.path)) { kind = 'gate'; kindSource = 'detected'; }
+  if (!kind && gateAvailable(project.path, tools)) { kind = 'gate'; kindSource = 'detected'; }
   if (!kind && project.workflow) kind = project.workflow === 'delivery' ? 'workflow' : 'plain';
   if (!kind) {
-    if (!toolPath('delivery')) kind = 'plain';
+    if (!tools.delivery) kind = 'plain';
     else {
-      const snapshot = allocationSnapshot(project.path);
+      const snapshot = allocationSnapshot(project.path, tools);
       if (snapshot.error) return { error: snapshot.error };
       checkoutStale = snapshot.checkoutStale;
       try { kind = snapshotFollowsWorkflow(project.path, snapshot.head) ? 'workflow' : 'plain'; }
       catch (error) { return { error: error.message }; }
     }
   }
-  return { kind, kindSource, available: projectKindAvailable(kind, project.path), checkoutStale };
+  return { kind, kindSource, available: projectKindAvailable(kind, project.path, tools), checkoutStale };
 }
-function projectKindAvailable(kind, folder) {
-  return kind === 'plain' || (kind === 'workflow' ? Boolean(toolPath('delivery')) : gateAvailable(folder));
+function projectKindAvailable(kind, folder, tools = projectTools()) {
+  return kind === 'plain' || (kind === 'workflow' ? Boolean(tools.delivery) : gateAvailable(folder, tools));
 }
-function cmdProjectKinds(args) {
+// Read Git's local indirection files, not an extra subprocess per project. Worktrees
+// sharing an object store stay in one lane, so missing-object fetches cannot race.
+function projectObjectStore(folder) {
+  try {
+    let dir = path.join(folder, '.git');
+    if (fs.statSync(dir).isFile()) {
+      const target = /^gitdir: (.+)\r?$/m.exec(fs.readFileSync(dir, 'utf8'))?.[1];
+      if (!target) return comparablePath(folder);
+      dir = path.resolve(folder, target);
+    }
+    const common = path.join(dir, 'commondir');
+    if (fs.existsSync(common)) dir = path.resolve(dir, fs.readFileSync(common, 'utf8').trim());
+    return comparablePath(fs.realpathSync.native(dir));
+  } catch { return comparablePath(folder); }
+}
+async function listedProjectSelections(entries) {
+  const tools = projectTools(), groups = new Map(), results = new Array(entries.length);
+  entries.forEach(([, project], index) => {
+    const key = projectObjectStore(project.path);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ project, index });
+  });
+  const queue = [...groups.values()];
+  const lane = async () => {
+    while (queue.length) {
+      const batch = queue.shift();
+      // Await exit, not just message: every worker is gone before stdout settles.
+      const selections = await new Promise(resolve => {
+        let message, worker, failed = false;
+        const failure = () => batch.map(() => ({ error: 'Project inspection worker could not complete.' }));
+        try { worker = new Worker(new URL(import.meta.url), { workerData: { crewProjectKinds: 1, batch, tools } }); }
+        catch { resolve(failure()); return; }
+        worker.once('message', value => { message = value; });
+        worker.once('error', () => { failed = true; });
+        worker.once('exit', code => resolve(!failed && code === 0 && Array.isArray(message) && message.length === batch.length
+          ? message : failure()));
+      });
+      batch.forEach(({ index }, i) => { results[index] = selections[i]; });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(8, queue.length) }, lane));
+  return results;
+}
+async function cmdProjectKinds(args) {
   let h;
   try {
     if (args.length === 2 && args.includes('--capabilities') && args.includes('--json')) {
@@ -1156,9 +1201,13 @@ function cmdProjectKinds(args) {
     if (!target) localSettingRefuse('home-missing', 'No initialized Crew home was found.');
     h = localWorkerSpaceHome(target);
     if (!setting) {
-      const projects = Object.entries(h.config.projects).map(([name, project]) => {
+      const entries = Object.entries(h.config.projects);
+      for (const [name, project] of entries) {
         if (projectNameError(name) || !path.isAbsolute(project.path)) localSettingRefuse('invalid-registry', 'The project registry contains an invalid name or path.');
-        const selection = projectDelivery(project);
+      }
+      const selections = await listedProjectSelections(entries);
+      const projects = entries.map(([name, project], i) => {
+        const selection = selections[i];
         if (selection.error) localSettingRefuse('kind-unavailable', `${name}: ${selection.error}`);
         return { name, path: project.path, ...selection };
       });
@@ -4249,9 +4298,9 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   project kind wins over legacy detection and refuses if its required tool/remote is unavailable.
 `;
 
-export function main(argv) {
+export async function main(argv) {
   const [name, ...args] = argv;
-  if (name === '--capabilities') { cmdProjectKinds([name, ...args]); return; }
+  if (name === '--capabilities') return cmdProjectKinds([name, ...args]);
   if (name === '--version') { console.log(VERSION); return; }
   const command = COMMANDS[name];
   // `crew <command> --help` is a question, never an id or a task text.
@@ -4259,7 +4308,7 @@ export function main(argv) {
   const projectApi = name === 'project' && (args[0] === 'set-kind' || args.some(a => ['--capabilities', '--json', '--home', '--expected-path'].includes(a)));
   if (command && name !== 'backlog' && !localConfig && !projectApi && args.some(a => a === '--help' || a === '-h')) { console.log(USAGE); return; }
   if (!command) { console.log(USAGE); process.exitCode = name && name !== '--help' && name !== 'help' ? 2 : 0; return; }
-  try { command(args); } catch (error) {
+  try { await command(args); } catch (error) {
     if (error instanceof Refusal) {
       console.error(`crew: ${error.message}`);
       process.exitCode = error.exitCode;
@@ -4274,4 +4323,11 @@ export function main(argv) {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main(process.argv.slice(2));
+if (!isMainThread && workerData?.crewProjectKinds === 1) {
+  const cache = new Map();
+  parentPort.postMessage(workerData.batch.map(({ project }) => {
+    const key = JSON.stringify([comparablePath(project.path), project.kind, project.workflow]);
+    if (!cache.has(key)) cache.set(key, projectDelivery(project, workerData.tools));
+    return cache.get(key);
+  }));
+} else if (isMainThread && process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main(process.argv.slice(2));

@@ -10,10 +10,10 @@ Each numbered group maps to one draft-PR Implementation outcome, in this order. 
 
 ## 2. JSON project listing overlaps independent resolution without stale admission
 
-- [ ] 2.1 Add a listing-only pool of at most eight workers around the shared resolver, with invocation-local tool discovery, equivalent-folder deduplication and safe shared-object retrieval; cover overlap and bounded fan-out in a focused `project-list-speed` group.
-- [ ] 2.2 Propagate async listing completion and errors through dispatch, preserve registry ordering and structured refusal, and await worker shutdown; cover empty homes, mixed selections, unavailable tools and worker failure in the same focused group.
-- [ ] 2.3 Keep spawn resolution live after an earlier list; run `node crew.test.mjs --gaps=project-list-speed`, `node crew.test.mjs --gaps=project-kinds` and `node crew.test.mjs --gaps=project-kind-ordering`.
-- [ ] 2.4 Document concurrent reads and unchanged authority in `docs/project-kinds.md`; repeat the eight-project measurement from the external task folder and record actual before/after elapsed times and remote-call counts.
+- [x] 2.1 Add a listing-only pool of at most eight workers around the shared resolver, with invocation-local tool discovery, equivalent-folder deduplication and safe shared-object retrieval; cover overlap and bounded fan-out in a focused `project-list-speed` group.
+- [x] 2.2 Propagate async listing completion and errors through dispatch, preserve registry ordering and structured refusal, and await worker shutdown; cover empty homes, mixed selections, unavailable tools and worker failure in the same focused group.
+- [x] 2.3 Keep spawn resolution live after an earlier list; run `node crew.test.mjs --gaps=project-list-speed`, `node crew.test.mjs --gaps=project-kinds` and `node crew.test.mjs --gaps=project-kind-ordering`.
+- [x] 2.4 Document concurrent reads and unchanged authority in `docs/project-kinds.md`; repeat the eight-project measurement from the external task folder and record actual before/after elapsed times and remote-call counts.
 
 ## 3. Windows task input preserves all description lines
 

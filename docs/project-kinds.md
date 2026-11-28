@@ -70,6 +70,12 @@ as Workflow with `checkoutStale:true`, and the next spawn uses Workflow. The rev
 is handled identically. Without origin, committed local HEAD is the allocation source. Without
 delivery, automatic delivery is Plain unless a gate is available.
 
+JSON listing inspects independent repositories concurrently, with at most eight workers and
+one invocation-local tool-discovery snapshot. Shared Git object stores are serialized and
+equivalent selections for the same folder are inspected once. Results and refusals retain
+registry order, and all workers exit before the command completes. There is no persistent kind
+cache: every spawn still reads the live published default and current tool availability.
+
 Each snapshot resolution has a ten-second Git-operation budget, with subprocesses at most
 five seconds; signal reads are bounded to two seconds and 128 KiB each, with at most 100 caller
 files. A remote head lookup may fetch missing objects with no tags or FETCH_HEAD writes; it
@@ -155,7 +161,8 @@ optional explicit-home list, `invalid-registry` for corrupt stored data, and the
 `setKindLocal` permission flag. Native Settings rendering and real-machine
 transport remain Herdr responsibilities; tests use only fake homes, local repositories and Core.
 
-Focused tests: `node crew.test.mjs --gaps=workflow-detection`,
+Focused tests: `node crew.test.mjs --gaps=project-list-speed`,
+`node crew.test.mjs --gaps=workflow-detection`,
 `node crew.test.mjs --gaps=project-kinds`, `node crew.test.mjs --gaps=project-kinds-concurrency`,
 `node crew.test.mjs --gaps=project-kind-paths`, `node crew.test.mjs --gaps=project-kind-snapshots`,
 `node crew.test.mjs --gaps=project-kind-stale-origin-head`,

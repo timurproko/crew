@@ -704,6 +704,58 @@ gapTests['workflow-detection'] = () => {
   assert.equal(r.code, 0, r.out); assert.equal(f.task('plain').workflow, undefined);
 };
 
+gapTests['project-list-speed'] = () => {
+  const f = projectKindFixture('list-speed'), registry = path.join(f.home, 'crew.json');
+  const config = JSON.parse(fs.readFileSync(registry, 'utf8')), head = git('-C', f.repo, 'rev-parse', 'HEAD').trim();
+  for (let i = 0; i < 8; i++) {
+    const folder = i ? path.join(f.dir, `repo-${i}`) : f.repo;
+    if (i) git('clone', '-q', f.repo, folder);
+    git('-C', folder, 'remote', ...(i ? ['set-url'] : ['add']), 'origin', f.repo);
+    config.projects[i ? `p${i}` : 'demo'] = { path: slash(folder) };
+  }
+  fs.writeFileSync(registry, JSON.stringify(config));
+  const barrier = path.join(f.dir, 'network'); fs.mkdirSync(barrier);
+  const hook = path.join(f.dir, 'parallel.cjs');
+  fs.writeFileSync(hook, `const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
+const {isMainThread}=require('node:worker_threads');
+if(!isMainThread && process.env.FAIL_KIND_WORKER==='1')throw Error('injected worker failure');
+const original=cp.spawnSync;
+cp.spawnSync=function(command,args,options){
+ if(command==='git'&&args.includes('ls-remote')){
+  const dir=${JSON.stringify(barrier)}, key=path.basename(args[1]);
+  fs.appendFileSync(path.join(dir,'calls'),key+'\\n');fs.writeFileSync(path.join(dir,key+'.ready'),'ready');
+  const end=Date.now()+20000;
+  while(fs.readdirSync(dir).filter(f=>f.endsWith('.ready')).length<8){
+   if(Date.now()>end)return {status:1,stdout:'',stderr:'Remote reads did not overlap'};
+   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);
+  }
+  return {status:0,stdout:'ref: refs/heads/main\\tHEAD\\n${head}\\tHEAD\\n',stderr:''};
+ }
+ return original.apply(this,arguments);
+}; require('node:module').syncBuiltinESMExports();`);
+  const env = { NODE_OPTIONS: `--require ${JSON.stringify(hook)}` };
+  let r = f.call(['project', 'list', '--json'], env); assert.equal(r.code, 0, r.out);
+  const listed = JSON.parse(r.out);
+  assert.equal(listed.capability, 'project-kinds'); assert.equal(listed.version, 1);
+  assert.deepEqual(listed.projects, Object.entries(config.projects).map(([name, project]) => ({ name, path: project.path,
+    kind: 'plain', kindSource: 'detected', available: true, checkoutStale: false })));
+  const calls = () => fs.readFileSync(path.join(barrier, 'calls'), 'utf8').trim().split(/\r?\n/);
+  assert.equal(calls().length, 8, 'One advertisement per independent project, all eight overlap');
+  config.projects.alias = { ...config.projects.demo };
+  config.projects.explicit = { ...config.projects.demo, kind: 'plain' };
+  config.projects.legacy = { ...config.projects.demo, workflow: 'plain' };
+  fs.writeFileSync(registry, JSON.stringify(config));
+  r = f.call(['project', 'list', '--json'], env); assert.equal(r.code, 0, r.out);
+  assert.equal(calls().length, 16, 'Equivalent folders and selections are inspected only once per invocation');
+  assert.deepEqual(JSON.parse(r.out).projects.slice(-3).map(p => [p.name, p.kindSource]), [['alias', 'detected'], ['explicit', 'explicit'], ['legacy', 'legacy']]);
+  r = f.call(['project', 'list', '--json'], { ...env, FAIL_KIND_WORKER: '1' });
+  assert.equal(r.code, 2, r.out); assert.equal(JSON.parse(r.out).error.code, 'kind-unavailable');
+  assert.match(JSON.parse(r.out).error.message, /^demo:/, 'Failure order follows the registry, not completion order');
+  commit(f.repo, { 'AGENTS.md': '# Agent instructions\nThis file is `templates/AGENTS.md` of `example/workflow`.\n' }, 'new live instructions');
+  const t = f.spawn('live-after-list', ['--kind', 'ship', '--agent', 'pi']);
+  assert.equal(t.deliveryKind, 'workflow', 'Admission never reuses a prior listing snapshot');
+};
+
 gapTests['project-kinds'] = () => {
   const f = projectKindFixture('api'), registry = path.join(f.home, 'crew.json');
   const read = () => JSON.parse(fs.readFileSync(registry, 'utf8'));
