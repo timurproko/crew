@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 
 export const VERSION = '0.12.1';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -1013,7 +1014,7 @@ function createHome(dir) {
 
 function cmdProject(args) {
   if (args[0] === 'set-kind' || args.some(a => ['--capabilities', '--json', '--home', '--expected-path'].includes(a))) {
-    cmdProjectKinds(args); return;
+    return cmdProjectKinds(args);
   }
   const h = home();
   const [verb, name, source] = args;
@@ -1068,12 +1069,13 @@ function cmdProject(args) {
 const WORKFLOWS = ['delivery', 'plain'];
 const PROJECT_KINDS = ['workflow', 'plain', 'gate'];
 const PROJECT_KINDS_API = { capability: 'project-kinds', version: 1 };
-function gateAvailable(folder) {
-  return Boolean(toolPath('no-mistakes')) && run('git', ['-C', folder, 'remote', 'get-url', 'no-mistakes'], { timeout: 2000 }).code === 0;
+const projectTools = () => ({ delivery: toolPath('delivery'), gate: toolPath('no-mistakes') });
+function gateAvailable(folder, tools = projectTools()) {
+  return Boolean(tools.gate) && run('git', ['-C', folder, 'remote', 'get-url', 'no-mistakes'], { timeout: 2000 }).code === 0;
 }
 // List and admission resolve the same source that a fresh allocation starts from.
 // Fetch objects only: never move a checkout, tracking ref, index or FETCH_HEAD.
-function allocationSnapshot(folder) {
+function allocationSnapshot(folder, tools = projectTools()) {
   const deadline = Date.now() + 10000;
   const git = (...args) => run('git', ['-C', folder, ...args], {
     timeout: Math.max(1, Math.min(5000, deadline - Date.now())),
@@ -1081,15 +1083,12 @@ function allocationSnapshot(folder) {
   });
   const local = git('rev-parse', '--verify', 'HEAD').stdout.trim();
   if (!/^[a-f0-9]{40,64}$/.test(local)) return { error: 'The allocation source HEAD cannot be read.' };
-  if (!toolPath('delivery') || git('remote', 'get-url', 'origin').code !== 0) return { head: local, checkoutStale: false };
-  let branch = git('symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD').stdout.trim().replace(/^refs\/remotes\/origin\//, '');
-  if (!branch) {
-    const remote = git('ls-remote', '--symref', 'origin', 'HEAD');
-    branch = remote.code === 0 ? /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(remote.stdout)?.[1] : null;
-  }
+  if (!tools.delivery || git('remote', 'get-url', 'origin').code !== 0) return { head: local, checkoutStale: false };
+  // origin/HEAD is only a local cache: the remote's default may have changed.
+  const remote = git('ls-remote', '--symref', 'origin', 'HEAD');
+  const branch = remote.code === 0 ? /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(remote.stdout)?.[1] : null;
   if (!branch) return { error: 'The published default branch cannot be resolved.' };
-  const listed = git('ls-remote', '--exit-code', '--heads', 'origin', `refs/heads/${branch}`);
-  const head = listed.code === 0 ? /^([a-f0-9]{40,64})\t/m.exec(listed.stdout)?.[1] : null;
+  const head = /^([a-f0-9]{40,64})\tHEAD$/m.exec(remote.stdout)?.[1];
   if (!head) return { error: 'The published default head cannot be read.' };
   if (git('cat-file', '-e', `${head}^{commit}`).code !== 0
       && git('fetch', '--quiet', '--no-tags', '--no-write-fetch-head', 'origin', head).code !== 0) {
@@ -1114,27 +1113,70 @@ function snapshotFollowsWorkflow(folder, head) {
   return [...files].filter(file => /^\.github\/workflows\/[^/]+\.ya?ml$/i.test(file)).slice(0, 100).some(file =>
     /^\s*uses:\s*['"]?(?:timurproko\/MyWorkflows\/\.github\/workflows\/delivery\.ya?ml@[^\s'"]+|\.\/\.github\/workflows\/delivery\.ya?ml)['"]?\s*(?:#.*)?$/im.test(text(file)));
 }
-function projectDelivery(project) {
+function projectDelivery(project, tools = projectTools()) {
   let kindSource = project.kind ? 'explicit' : project.workflow ? 'legacy' : 'detected';
   let kind = project.kind, checkoutStale = null;
-  if (!kind && gateAvailable(project.path)) { kind = 'gate'; kindSource = 'detected'; }
+  if (!kind && gateAvailable(project.path, tools)) { kind = 'gate'; kindSource = 'detected'; }
   if (!kind && project.workflow) kind = project.workflow === 'delivery' ? 'workflow' : 'plain';
   if (!kind) {
-    if (!toolPath('delivery')) kind = 'plain';
+    if (!tools.delivery) kind = 'plain';
     else {
-      const snapshot = allocationSnapshot(project.path);
+      const snapshot = allocationSnapshot(project.path, tools);
       if (snapshot.error) return { error: snapshot.error };
       checkoutStale = snapshot.checkoutStale;
       try { kind = snapshotFollowsWorkflow(project.path, snapshot.head) ? 'workflow' : 'plain'; }
       catch (error) { return { error: error.message }; }
     }
   }
-  return { kind, kindSource, available: projectKindAvailable(kind, project.path), checkoutStale };
+  return { kind, kindSource, available: projectKindAvailable(kind, project.path, tools), checkoutStale };
 }
-function projectKindAvailable(kind, folder) {
-  return kind === 'plain' || (kind === 'workflow' ? Boolean(toolPath('delivery')) : gateAvailable(folder));
+function projectKindAvailable(kind, folder, tools = projectTools()) {
+  return kind === 'plain' || (kind === 'workflow' ? Boolean(tools.delivery) : gateAvailable(folder, tools));
 }
-function cmdProjectKinds(args) {
+// Read Git's local indirection files, not an extra subprocess per project. Worktrees
+// sharing an object store stay in one lane, so missing-object fetches cannot race.
+function projectObjectStore(folder) {
+  try {
+    let dir = path.join(folder, '.git');
+    if (fs.statSync(dir).isFile()) {
+      const target = /^gitdir: (.+)\r?$/m.exec(fs.readFileSync(dir, 'utf8'))?.[1];
+      if (!target) return comparablePath(folder);
+      dir = path.resolve(folder, target);
+    }
+    const common = path.join(dir, 'commondir');
+    if (fs.existsSync(common)) dir = path.resolve(dir, fs.readFileSync(common, 'utf8').trim());
+    return comparablePath(fs.realpathSync.native(dir));
+  } catch { return comparablePath(folder); }
+}
+async function listedProjectSelections(entries) {
+  const tools = projectTools(), groups = new Map(), results = new Array(entries.length);
+  entries.forEach(([, project], index) => {
+    const key = projectObjectStore(project.path);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ project, index });
+  });
+  const queue = [...groups.values()];
+  const lane = async () => {
+    while (queue.length) {
+      const batch = queue.shift();
+      // Await exit, not just message: every worker is gone before stdout settles.
+      const selections = await new Promise(resolve => {
+        let message, worker, failed = false;
+        const failure = () => batch.map(() => ({ error: 'Project inspection worker could not complete.' }));
+        try { worker = new Worker(new URL(import.meta.url), { workerData: { crewProjectKinds: 1, batch, tools } }); }
+        catch { resolve(failure()); return; }
+        worker.once('message', value => { message = value; });
+        worker.once('error', () => { failed = true; });
+        worker.once('exit', code => resolve(!failed && code === 0 && Array.isArray(message) && message.length === batch.length
+          ? message : failure()));
+      });
+      batch.forEach(({ index }, i) => { results[index] = selections[i]; });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(8, queue.length) }, lane));
+  return results;
+}
+async function cmdProjectKinds(args) {
   let h;
   try {
     if (args.length === 2 && args.includes('--capabilities') && args.includes('--json')) {
@@ -1159,9 +1201,13 @@ function cmdProjectKinds(args) {
     if (!target) localSettingRefuse('home-missing', 'No initialized Crew home was found.');
     h = localWorkerSpaceHome(target);
     if (!setting) {
-      const projects = Object.entries(h.config.projects).map(([name, project]) => {
+      const entries = Object.entries(h.config.projects);
+      for (const [name, project] of entries) {
         if (projectNameError(name) || !path.isAbsolute(project.path)) localSettingRefuse('invalid-registry', 'The project registry contains an invalid name or path.');
-        const selection = projectDelivery(project);
+      }
+      const selections = await listedProjectSelections(entries);
+      const projects = entries.map(([name, project], i) => {
+        const selection = selections[i];
         if (selection.error) localSettingRefuse('kind-unavailable', `${name}: ${selection.error}`);
         return { name, path: project.path, ...selection };
       });
@@ -1831,10 +1877,16 @@ const branchOf = task => task.branch ?? `crew/${task.id}`;
 function cmdSpawn(args) {
   const h = home();
   requireOwner(h, 'spawn work');
-  const { flags, rest } = takeFlags(args, ['project', 'kind', 'type', ...PICK_FLAGS], ['no-fallback']);
+  const { flags, rest } = takeFlags(args, ['project', 'kind', 'type', 'task-file', ...PICK_FLAGS], ['no-fallback']);
   const opts = { kind: flags.kind ?? 'scout', project: flags.project, ...(flags.type !== undefined ? { type: flags.type } : {}) };
   const [id, ...words] = rest;
-  const task = words.join(' ').trim();
+  let task = words.join(' ').trim();
+  if (flags['task-file'] !== undefined) {
+    if (words.length) refuse('Use either positional task text or --task-file, not both.');
+    try { task = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(path.resolve(flags['task-file']))).trim(); }
+    catch { refuse('Cannot read --task-file as a UTF-8 file; no task was created.'); }
+    if (!task) refuse('--task-file must contain a nonempty task description; no task was created.');
+  }
   requireProjectName(opts.project);
   if (!validId(id) || !task) refuse(`Usage: crew spawn <id> --project <name> [--kind scout|ship] [--type feature|fix|...] ${PICK_USAGE} "<task>"`);
   if (!['scout', 'ship'].includes(opts.kind)) refuse(`Unknown kind: ${opts.kind}`);
@@ -2121,7 +2173,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // copy and does not know whether that is a reused pool slot or a new folder. Without it,
   // crew makes a plain git worktree itself.
   const delivered = Boolean(toolPath('delivery'));
-  let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
+  let record = { id, task, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
     // Keep the original order, even for candidates that cannot work now: hand-over rereads
     // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
     launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks, dispatch: chosen.dispatch,
@@ -2152,7 +2204,8 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
       // reservation. Inherited names never depend on the current registry/path.
       const namingProject = independent && h.config.workerSpaceMode === 'per-project'
         ? extra.selfFix ? repairPlacement.project : opts.project : null;
-      const namingPath = namingProject && namingProject !== SELF_PROJECT ? registeredProject(h, namingProject)?.path : null;
+      const namingPath = namingProject === SELF_PROJECT ? record.projectPath
+        : namingProject ? registeredProject(h, namingProject)?.path : null;
       const name = namingPath ? repositorySpaceName(namingPath) : 'crew';
       const selection = !extra.selfFix && opts.kind === 'ship' ? registeredProject(h, opts.project) : null;
       const delivery = selection ? projectDelivery(selection) : null;
@@ -2178,7 +2231,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
         saveTask(h, record); // reservation and decision share the same gate
         return true;
       });
-    });
+    }, { waitMs: 10000 });
     if (reserved) break;
     if (Date.now() >= deadline || (pending && Date.now() >= pendingDeadline)) {
       refuse('worker-space-busy: a worker is still being published; retry. Nothing was launched.', 4);
@@ -2572,13 +2625,13 @@ function a1Api(type, target) {
 // `stopped: true` is returned only for something that was observed: Core says the terminal
 // is finished or gone, or A1 itself says the session no longer exists. A Core that does not
 // answer is never read as "gone".
-function workerToStop(task, force) {
+function workerToStop(task, force, settle = true) {
   let { state, t } = probe(task.terminal);
   if (state === 'unknown') refuse(`${CORE_SILENT} terminal ${task.terminal}; nothing was stopped or removed. Try again.`, 4);
   if (state !== 'live') return { state, t };
   // A worker reports from inside its last turn; give that turn a moment to end before
   // deciding it is still busy.
-  for (let i = 0; task.state === 'reported' && !force && state === 'live' && t.status?.state === 'working' && i < (Number(process.env.CREW_SETTLE_SECONDS) || 45); i++) {
+  for (let i = 0; settle && task.state === 'reported' && !force && state === 'live' && t.status?.state === 'working' && i < (Number(process.env.CREW_SETTLE_SECONDS) || 45); i++) {
     sleep(1000);
     ({ state, t } = probe(task.terminal));
   }
@@ -2586,16 +2639,16 @@ function workerToStop(task, force) {
   if (state === 'live' && t.status?.state === 'working' && !force) refuse(`Task ${task.id} is still working. Wait for it, or pass --force to cancel it.`, 6);
   return { state, t };
 }
-function stopTaskWorkers(task, { force = false, onStop = null } = {}) {
+function stopTaskWorkers(task, { force = false, onStop = null, settle = true } = {}) {
   const workers = ownedTerminals(task).map(t => ({ ...task, terminal: t.address, agent: t.agent }));
   // Refuse a busy or unobservable owned worker before stopping any of the set.
   // A singleton's stopWorker already does this check before any mutation.
-  if (workers.length > 1) for (const worker of workers) workerToStop(worker, force);
+  if (workers.length > 1) for (const worker of workers) workerToStop(worker, force, settle);
   const pending = [], results = [];
   let attempted = false;
   for (const worker of workers) {
     try {
-      const result = stopWorker(worker, { force, onStop: () => { attempted = true; onStop?.(); } });
+      const result = stopWorker(worker, { force, settle, onStop: () => { attempted = true; onStop?.(); } });
       results.push(result.how);
       if (!result.stopped) pending.push(worker.terminal);
     } catch (error) {
@@ -2605,8 +2658,8 @@ function stopTaskWorkers(task, { force = false, onStop = null } = {}) {
   }
   return { stopped: !pending.length, pending, how: workers.length === 1 ? results[0] : `${workers.length - pending.length} of ${workers.length} owned terminals stopped${pending.length ? '; stops pending' : ''}` };
 }
-function stopWorker(task, { force = false, onStop = null } = {}) {
-  const { state, t } = workerToStop(task, force);
+function stopWorker(task, { force = false, onStop = null, settle = true } = {}) {
+  const { state, t } = workerToStop(task, force, settle);
   if (state !== 'live') return { stopped: true, how: 'terminal already gone' };
   const working = t.status?.state === 'working';
   if (AGENTS[task.agent]?.exit === 'a1-api' && t.status?.app === 'a1' && t.labels?.['a1.session'] && t.labels?.['a1.runtime']) {
@@ -2659,7 +2712,10 @@ function cmdStop(args) {
 // head is exactly this commit (a squash merge leaves no ancestry). Anything unsure keeps it.
 function dropMergedBranch(h, project, task) {
   if (task.kind !== 'ship' || !project?.path) return '';
-  const branch = branchOf(task), git = (...a) => run('git', ['-C', project.path, ...a], { timeout: 60000 });
+  const deadline = Date.now() + 5000;
+  const budget = () => ({ timeout: Math.max(1, Math.min(2000, deadline - Date.now())) });
+  const branch = branchOf(task), git = (...a) => Date.now() >= deadline ? { code: 124, stdout: '', stderr: '' }
+    : run('git', ['-C', project.path, ...a], budget());
   const tip = git('rev-parse', '--verify', '-q', `refs/heads/${branch}`).stdout.trim();
   if (!tip) return '';
   let merged = ['HEAD', 'refs/remotes/origin/HEAD'].some(ref => git('merge-base', '--is-ancestor', tip, ref).code === 0);
@@ -2672,11 +2728,11 @@ function dropMergedBranch(h, project, task) {
     if (recorded && repository && recorded.toLowerCase().startsWith(`https://github.com/${repository.toLowerCase()}/pull/`)) {
       // Replace the existing branch read, not add another request. Exact URL reads
       // can also prove absence; a missing PR never proves the branch was merged.
-      const found = readPrAtUrl(task.pr, 'headRefOid', { cwd: project.path, timeout: 60000 });
+      const found = Date.now() < deadline ? readPrAtUrl(task.pr, 'headRefOid', { cwd: project.path, ...budget() }) : null;
       if (found) rememberTaskPr(h, task, found.facts);
       merged = found?.pr?.headRefOid === tip && found.pr.state === 'MERGED';
     } else {
-      const asked = gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid,url,state,mergedAt,closedAt'], { cwd: project.path, timeout: 60000 });
+      const asked = Date.now() < deadline ? gh(['pr', 'list', '--head', branch, '--state', 'merged', '--limit', '1', '--json', 'headRefOid,url,state,mergedAt,closedAt'], { cwd: project.path, ...budget() }) : { code: 124, stdout: '' };
       let pr; try { pr = JSON.parse(asked.stdout)?.[0]; } catch { /* No proof. */ }
       merged = asked.code === 0 && pr?.headRefOid === tip && pr.state === 'MERGED';
       if (merged) rememberTaskPr(h, task, prObservation(pr));
@@ -3008,7 +3064,11 @@ function removeOneStoppedTerminal(task) {
 // now (`crew finish <id> --force` on the closed task). A --force given at finish covered only
 // what was there then. { state: returned | gone | held | silent | kept | failed, line }.
 function returnWaiting(h, task, options = {}) {
-  const back = withPlacementGate(h, () => tryReturnWaiting(h, task, options));
+  const back = withPlacementGate(h, () => {
+    const current = readJson(taskFile(h, task.id));
+    if (current?.state !== 'closed' || !current.copyToReturn) return { state: 'gone', line: `the working copy of ${task.id} is no longer pending; nothing was removed` };
+    return tryReturnWaiting(h, current, options);
+  });
   return { ...back, line: back.line + discardSummary(back.disposal) };
 }
 function tryReturnWaiting(h, task, { force = false } = {}) {
@@ -3059,10 +3119,34 @@ function tryReturnWaiting(h, task, { force = false } = {}) {
   return { state: 'returned', disposal: { ...back, unseen: Boolean(check.unseen) || back.unseen }, line: `returned the working copy of finished task ${task.id}${back.said}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}` };
 }
 
+const finishGeneration = task => JSON.stringify([task.state, task.terminal, task.relaunched, task.reported, task.told, task.tells,
+  task.terminals, task.terminalLaunches, task.preparation]);
 function cmdFinish(args, options = {}) {
   const h = home();
   requireOwner(h, 'finish work');
-  return withPlacementGate(h, () => finishTask(h, args, options));
+  const id = args.find(a => !a.startsWith('--')), force = args.includes('--force');
+  if (!id) refuse('Usage: crew finish <id> [--force]');
+  const before = loadTask(h, id), settling = before.state === 'reported' && !force;
+  const generation = settling ? finishGeneration(before) : null;
+  // This is advisory/read-only. Never monopolize placement during the worker's
+  // last reporting turn; recheck its generation and busy state under the gate.
+  if (settling) {
+    for (const worker of ownedTerminals(before)) workerToStop({ ...before, terminal: worker.address, agent: worker.agent }, false);
+  }
+  const result = withPlacementGate(h, () => {
+    if (settling) {
+      const current = loadTask(h, id);
+      // A competing finish may already have closed this task. Its current closed
+      // cleanup path is idempotent and must not reuse the preflight's old copy.
+      if (current.state !== 'closed' && finishGeneration(current) !== generation) refuse(`Task ${id} changed while finish waited; retry. Nothing was stopped.`, 6);
+    }
+    // No unlocked settling observation authorizes force/preparation cleanup;
+    // finishTask always reloads and validates the current task under this gate.
+    return finishTask(h, args, options);
+  });
+  reviewLabels(h, id, 'abandon');
+  if (result?.backlog && loadTask(h, id).state === 'closed') backlogMove(h, id, 'done');
+  returnWaitingCopies(h, { skip: id });
 }
 function finishTask(h, args, { scratchProof } = {}) {
   const force = args.includes('--force'), id = args.find(a => !a.startsWith('--'));
@@ -3078,7 +3162,6 @@ function finishTask(h, args, { scratchProof } = {}) {
       if (pending) refuse(pending.text, pending.state === 'silent' ? 4 : 6);
       saveTask(h, { ...task, terminalLaunches: task.terminalLaunches.map(item => ({ ...item, late: false })) });
     }
-    reviewLabels(h, id, 'abandon');
     // A closed task whose copy still waits: --force is the person's word to discard what was
     // found in it and return it now. A terminal in it still keeps it, forced or not.
     if (task.copyToReturn && force) {
@@ -3090,8 +3173,7 @@ function finishTask(h, args, { scratchProof } = {}) {
       const back = returnWaiting(h, task);
       console.log(back.state === 'returned' || back.state === 'gone' ? `${id} is already closed; ${back.line}` : `${id} is already closed; its working copy still waits to be returned: ${back.line}`);
     } else console.log(`${id} is already closed; discarded none`);
-    returnWaitingCopies(h, { skip: id });
-    return;
+    return { backlog: false };
   }
   // Somebody else's terminal in the copy is never ended with it, forced or not: the copy then
   // stays until it is free, and everything else is finished. Core is asked before anything is
@@ -3109,7 +3191,7 @@ function finishTask(h, args, { scratchProof } = {}) {
   if (work.keep) refuse(`Task ${id} is marked to keep by .artifacts/KEEP in ${task.worktree}. Nothing was removed. Delete the marker, or pass --force.`, 6);
   if (scratch && left.operations.length) refuse(`Task ${id} has a protected Git operation or lock; nothing was removed.`, 6);
   let attempted = false, result;
-  try { result = stopTaskWorkers(task, { force, onStop: () => { attempted = true; } }); }
+  try { result = stopTaskWorkers(task, { force, settle: false, onStop: () => { attempted = true; } }); }
   catch (error) {
     if (!attempted || !(error instanceof Refusal)) throw error;
     result = { stopped: false, how: error.message };
@@ -3127,7 +3209,7 @@ function finishTask(h, args, { scratchProof } = {}) {
   const published = loadTask(h, id);
   if (ownedTerminals(published).some(t => !ownedTerminals(task).some(old => old.address === t.address))) {
     waiting.terminals = published.terminals;
-    try { result = stopTaskWorkers(published, { force }); }
+    try { result = stopTaskWorkers(published, { force, settle: false }); }
     catch (error) {
       if (!(error instanceof Refusal)) throw error;
       result = { stopped: false, how: error.message, pending: ownedTerminals(published).map(t => t.address) };
@@ -3157,10 +3239,8 @@ function finishTask(h, args, { scratchProof } = {}) {
     saveTask(h, closed);
     console.log(`finished ${id} (${result.how})${back.said}; report kept at ${task.report}${back.leftover}${back.released ? dropMergedBranch(h, project, task) : ''}${discardSummary({ ...back, unseen: Boolean(comparison?.unseen) || back.unseen })}`);
   }
-  reviewLabels(h, id, 'abandon');
-  // A legacy treehouse task moves its scout's item even after a review, as it always did.
-  if (task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews)) backlogMove(h, id, 'done');
-  returnWaitingCopies(h, { skip: id });
+  // Optional effects run after releasing placement, never over an old task save.
+  return { backlog: task.kind === 'scout' && task.state === 'reported' && (task.pool === 'treehouse' || !task.reviews) };
 }
 
 // --- follow-ups, review and delivery ------------------------------------------------
@@ -3189,12 +3269,12 @@ function sendTaskTell(h, task, message) {
   taskTransaction(h, id, current => {
     if (!sameWorker(current, task) || current.state !== task.state || current.reported !== task.reported || current.told !== task.told) no('worker or report changed; nothing was sent');
     writeJson(taskFile(h, id), { ...current, state: 'working', told, tells: (current.tells ?? 0) + 1, updated: now() });
-  });
+  }, { waitMs: 10000 });
   const sent = hc(['send', task.terminal, text]);
   taskTransaction(h, id, current => {
     if (!sameWorker({ ...current, state: task.state }, task) || current.told !== told) return;
     if (sent.code !== 0 && current.state === 'working') writeJson(taskFile(h, id), { ...current, state: task.state, updated: now() });
-  });
+  }, { waitMs: 10000 });
   if (sent.code !== 0) no(`Core did not deliver the message to terminal ${task.terminal}: ${lastLine(sent.stderr || sent.stdout)}`, 4);
   reviewLabels(h, id, 'rework');
 }
@@ -3845,6 +3925,11 @@ function cmdSelfmerge(args) {
   if (task.pr) { publishTaskTerminal(task); console.log(`${id} already has a pull request: ${task.pr}. After the person merges it, run \`crew update\` or use the next \`crew start\`.`); return; }
   if (task.merged) { console.log(`${id} is already published as ${short(task.merged)}`); return; }
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; a repair is published only after its worker reported.`);
+  const timeoutText = process.env.CREW_SELFTEST_TIMEOUT_SECONDS;
+  if (timeoutText !== undefined && (!/^\d+$/.test(timeoutText) || Number(timeoutText) < 1 || Number(timeoutText) > 7200)) {
+    refuse('CREW_SELFTEST_TIMEOUT_SECONDS must be an integer from 1 to 7200; no repair was published.');
+  }
+  const suiteTimeout = timeoutText === undefined ? 60 * 60 * 1000 : Number(timeoutText) * 1000;
   const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
   const no = (why, code = 6) => refuse(`Repair ${id} was not published: ${why}`, code);
   if (!fs.existsSync(path.join(wt, '.git'))) no(`its working copy ${wt} is gone.`);
@@ -3874,8 +3959,18 @@ function cmdSelfmerge(args) {
   // The suite runs as it would on a clean machine: nothing of this session leaks into it.
   const command = process.env.CREW_SELFTEST || 'node crew.test.mjs';
   const testEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(CREW_|HC_TERMINAL_ID$)/i.test(key)));
-  const tested = run(command, [], { shell: true, cwd: wt, env: testEnv, timeout: 15 * 60 * 1000 });
-  if (tested.code !== 0) no(`the test suite fails (${command}, exit ${tested.code ?? 'timeout'}):\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
+  const testStarted = Date.now();
+  const tested = run(command, [], { shell: true, cwd: wt, env: testEnv, timeout: suiteTimeout });
+  const testSeconds = ((Date.now() - testStarted) / 1000).toFixed(1);
+  if (tested.error || tested.code !== 0) {
+    const reason = tested.error?.code === 'ETIMEDOUT' ? `timed out after ${suiteTimeout / 1000} seconds`
+      : tested.error ? `could not complete (${tested.error.code ?? tested.error.message})`
+        : tested.code === null ? 'terminated without an exit code' : 'fails';
+    const detail = !tested.error && tested.code !== null
+      ? `(${command}, exit ${tested.code}); deadline ${suiteTimeout / 1000} seconds`
+      : `(${command}; deadline ${suiteTimeout / 1000} seconds)`;
+    no(`the test suite ${reason} ${detail}:\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
+  }
   const subject = git('log', '--reverse', '--format=%s', 'origin/main..HEAD').stdout.split(/\r?\n/).find(Boolean) || 'Repair the reported crew defect';
   // Commit subjects are untrusted prose, not PR-body markup. Keep the outcome one bounded line.
   let outcome = `Crew's reported defect is repaired: ${subject.replace(/https?:\/\/\S+|[@<>`]/g, '').replace(/\s+/g, ' ').trim()}`;
@@ -3893,7 +3988,7 @@ function cmdSelfmerge(args) {
   if (made.error || made.code !== 0 || !url) no(`its branch ${branch} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew selfrepair ${id}\` again.`, 4);
   saveTask(h, { ...loadTask(h, id), pr: url, landed: now() });
   publishTaskTerminal(loadTask(h, id));
-  console.log(`delivered repair ${id}: ${url}; tests passed. Merging it is the person's decision.`);
+  console.log(`delivered repair ${id}: ${url}; tests passed in ${testSeconds}s. Merging it is the person's decision.`);
   console.log('This machine was not updated. After the person merges it, run `crew update` or use the next `crew start`, then retry what failed.');
 }
 
@@ -4209,6 +4304,8 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew config worker-space --set-local <mode> --home <absolute-home> --json   local worker-space-only preference; no ownership needed
       existing workers never move; reviews and replacements inherit their task's space; connected project names need compatible Herdr
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
+      or --task-file <UTF-8 file> instead of positional task text (multiline safe)
+      PowerShell: crew.ps1 forwards multiline task text without cmd.exe truncation
       who: ${PICK_USAGE}
   crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   original rows and quota now, next choice marked
   crew relaunch <id> [who] ["<why>"]       end the current session, even busy; hand over working, stopped or failed work; copy stays
@@ -4252,9 +4349,20 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   project kind wins over legacy detection and refuses if its required tool/remote is unavailable.
 `;
 
-export function main(argv) {
+export async function main(argv) {
+  // PowerShell's native argument quoting varies by version. Its launcher sends
+  // one ASCII envelope instead of exposing multiline prose to cmd.exe/CRT parsing.
+  if (argv[0] === '_argv') {
+    let decoded;
+    try {
+      if (argv.length !== 2 || argv[1].length > 1048576) throw Error();
+      decoded = JSON.parse(Buffer.from(argv[1], 'base64').toString('utf8'));
+      if (!Array.isArray(decoded) || decoded.some(a => typeof a !== 'string') || decoded[0] === '_argv') throw Error();
+    } catch { console.error('crew: invalid launcher arguments; use crew.ps1 or node crew.mjs directly.'); process.exitCode = 2; return; }
+    return main(decoded);
+  }
   const [name, ...args] = argv;
-  if (name === '--capabilities') { cmdProjectKinds([name, ...args]); return; }
+  if (name === '--capabilities') return cmdProjectKinds([name, ...args]);
   if (name === '--version') { console.log(VERSION); return; }
   const command = COMMANDS[name];
   // `crew <command> --help` is a question, never an id or a task text.
@@ -4262,7 +4370,7 @@ export function main(argv) {
   const projectApi = name === 'project' && (args[0] === 'set-kind' || args.some(a => ['--capabilities', '--json', '--home', '--expected-path'].includes(a)));
   if (command && name !== 'backlog' && !localConfig && !projectApi && args.some(a => a === '--help' || a === '-h')) { console.log(USAGE); return; }
   if (!command) { console.log(USAGE); process.exitCode = name && name !== '--help' && name !== 'help' ? 2 : 0; return; }
-  try { command(args); } catch (error) {
+  try { await command(args); } catch (error) {
     if (error instanceof Refusal) {
       console.error(`crew: ${error.message}`);
       process.exitCode = error.exitCode;
@@ -4277,4 +4385,11 @@ export function main(argv) {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main(process.argv.slice(2));
+if (!isMainThread && workerData?.crewProjectKinds === 1) {
+  const cache = new Map();
+  parentPort.postMessage(workerData.batch.map(({ project }) => {
+    const key = JSON.stringify([comparablePath(project.path), project.kind, project.workflow]);
+    if (!cache.has(key)) cache.set(key, projectDelivery(project, workerData.tools));
+    return cache.get(key);
+  }));
+} else if (isMainThread && process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main(process.argv.slice(2));

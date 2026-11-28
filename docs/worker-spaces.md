@@ -100,8 +100,20 @@ Release retires the owned directory before deleting it privately. Transient Wind
 errors retry retirement for up to one second with the same populated claim intact; exhaustion
 refuses with the claim retained for later proven-dead recovery, never shared-path deletion.
 Live, unverifiable and old
-file-format gates are never stolen by PID/age guesses. This intentionally serializes terminal
-transitions within a home, so slow cleanup can require another command to retry. Registry locks
+file-format gates are never stolen by PID/age guesses. Actual terminal transitions and copy-return safety checks remain serialized within a home.
+Finish waits for a reported worker's last turn **outside** the placement gate, then reloads
+and compares its task/terminal generation before mutation. A follow-up or replacement during
+that wait refuses the stale finish attempt without stopping newer work. A competing finish
+that already closed the task uses the current idempotent closed-task cleanup path instead.
+Forced/preparation cleanup has no unlocked settling authorization to reuse: it always reloads
+and validates current preparation/terminal authority under the gate. Optional post-close
+labels/backlog work and the sweep driver also run outside the outer finish gate; each waiting
+copy is reloaded and returned under its own guarded attempt. Opportunistic merged-branch proof
+uses a five-second shared budget with at most two seconds per subprocess; unknown proof keeps
+the branch. Foreground tell/spawn acquisition allows ten seconds for brief gate contention;
+observation writers still yield immediately and publication keeps its longer allowance.
+Delivery-managed copy return and actual stop confirmation can still be slow and remain
+serialized for safety, so a longer transition can still require another command to retry. Registry locks
 remain regular files with complete OS identity and claim nonce. Under the placement gate, a dead
 registry claim is removed only after death proof and a fresh matching-nonce read; registry-only
 writers stay independent, but all reclaimers serialize through the gate. Legacy/unverifiable file
@@ -256,7 +268,7 @@ New launches additionally carry:
 | `crew.space.version` | `1` |
 | `crew.space.mode` | `combined` or `per-project` |
 | `crew.space.project` | Placement project key: exact registered name, or `crew:self` for internal repair fallback. |
-| `crew.space.name` | Per-project only: saved repository folder display name, preserving case and dots, or `crew` for internal repair fallback. Legacy registered-ID names remain valid. Omitted in combined mode to preserve directory-derived headings. |
+| `crew.space.name` | Per-project only: saved repository folder display name, preserving case and dots, including internal repairs. Legacy registered-ID and internal `crew` names remain valid. Omitted in combined mode to preserve directory-derived headings. |
 
 The display name is separate from project identity. For a fresh canonical placement,
 `myworkflows` registered at `D:/Git/MyWorkflows` requests `MyWorkflows`, while
@@ -360,7 +372,10 @@ the unchanged view version. No worker-space setting change rewrites task project
 For `crew fix`, combined behaves as before. Per-project fixes share the registration named
 `crew` only if its Git common directory matches the tool's repository (linked worktrees
 qualify, unrelated clones/registrations do not). Otherwise they use the internal fallback
-named `crew`. Task/dispatch project stays `crew:self`; `crew.space.project` can therefore
+with the source repository's directory name (for example **core** for `~/.crew/core`), using
+the same directory resolver as normal project workers. Crew, not Herdr, chooses this requested
+name. Existing saved/occupied names, including the old `crew` fallback, stay unchanged through
+replacement; this is not a rename of running spaces. Task/dispatch project stays `crew:self`; `crew.space.project` can therefore
 be `crew` for a verified shared binding. That binding protects the registration from
 removal/repointing while the fixer is unfinished or its copy still waits to return.
 Repository identity is checked outside the registry lock; admission rechecks the registered
@@ -484,6 +499,18 @@ the old name for a fresh canonical space. It also runs within `--gaps=space-name
 hash-bearing pool parents, dot-prefixed projects, safe-name and exact-label validation, old
 lower-case and directory-cased canonical joins, canonical-over-combined preference, review/
 relaunch/hand-over inheritance and conflicting saved-name refusal. All evidence is fake-Core only.
+
+`--gaps=repair-space-name` covers core-named repair sources, matching and unrelated crew
+registrations, internal fallback IDs, and legacy saved-name inheritance without a native app.
+
+`--gaps=finish-idempotent-race` pauses ordinary and forced finishes before gate acquisition,
+lets another finish close the task, and proves duplicate cleanup preserves a reused folder.
+The existing `--gaps=preparation-recovery` concurrent finish assertions remain unchanged.
+
+`--gaps=finish-contention` uses deterministic settle/transition barriers to prove unrelated
+tell/spawn progress, same-task follow-up/replacement protection, foreign-holder preservation,
+brief-contention retry and optional backlog work outside placement. Existing gate and
+launch-authorization groups continue to cover exclusion during actual terminal transitions.
 
 ## Named limits
 

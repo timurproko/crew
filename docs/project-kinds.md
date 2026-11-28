@@ -61,13 +61,20 @@ Additive v1 fields, advertised by `kindSource:true` and `checkoutStale:true` cap
 ### The same kind as the next spawn
 
 Automatic listing and ship admission use one resolver. With `delivery` and an `origin`, it
-reads delivery's allocation source: the published default branch (recorded `origin/HEAD`, or
-remote HEAD when not recorded), not the registered checkout's possibly old instructions.
+reads the published default branch advertised by remote HEAD, not the registered checkout's
+possibly old instructions or its cached `origin/HEAD`, which can outlive a default-branch rename.
+One `git ls-remote --symref origin HEAD` advertisement supplies both branch and commit.
 Instruction headers, the named skill and delivery callers are read from that commit's blobs.
 Thus a stale registered Plain checkout whose fresh copy contains delivery signals is listed
 as Workflow with `checkoutStale:true`, and the next spawn uses Workflow. The reverse mismatch
 is handled identically. Without origin, committed local HEAD is the allocation source. Without
 delivery, automatic delivery is Plain unless a gate is available.
+
+JSON listing inspects independent repositories concurrently, with at most eight workers and
+one invocation-local tool-discovery snapshot. Shared Git object stores are serialized and
+equivalent selections for the same folder are inspected once. Results and refusals retain
+registry order, and all workers exit before the command completes. There is no persistent kind
+cache: every spawn still reads the live published default and current tool availability.
 
 Each snapshot resolution has a ten-second Git-operation budget, with subprocesses at most
 five seconds; signal reads are bounded to two seconds and 128 KiB each, with at most 100 caller
@@ -154,7 +161,9 @@ optional explicit-home list, `invalid-registry` for corrupt stored data, and the
 `setKindLocal` permission flag. Native Settings rendering and real-machine
 transport remain Herdr responsibilities; tests use only fake homes, local repositories and Core.
 
-Focused tests: `node crew.test.mjs --gaps=workflow-detection`,
+Focused tests: `node crew.test.mjs --gaps=project-list-speed`,
+`node crew.test.mjs --gaps=workflow-detection`,
 `node crew.test.mjs --gaps=project-kinds`, `node crew.test.mjs --gaps=project-kinds-concurrency`,
 `node crew.test.mjs --gaps=project-kind-paths`, `node crew.test.mjs --gaps=project-kind-snapshots`,
+`node crew.test.mjs --gaps=project-kind-stale-origin-head`,
 `node crew.test.mjs --gaps=project-kind-ordering` and `node crew.test.mjs --gaps=project-kind-lifecycle`.

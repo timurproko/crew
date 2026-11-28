@@ -484,7 +484,9 @@ console.log('https://github.com/acme/crew/pull/' + log.filter(x => x.a[1] === 'c
   fs.writeFileSync(delivery, `import fs from 'node:fs'; const a = process.argv.slice(2), f = ${JSON.stringify(deliveryLog)}; fs.writeFileSync(f, JSON.stringify([...JSON.parse(fs.readFileSync(f, 'utf8')), a])); if (a[0] !== 'check-body' || !a.includes('--final')) process.exit(1);`);
   const script = path.join(repo, 'crew.mjs');
   const w = readWorld(); w.terminals[owner] = { address: owner, state: 'live', labels: {} }; fs.writeFileSync(world, JSON.stringify(w));
-  const env = { CREW_CLAUDE_ACCOUNTS: '', CREW_GH: fakeGh, CREW_SELFTEST: 'node docs/selftest.mjs', CREW_WORKTREES: path.join(dir, 'copies') };
+  const agents = path.join(dir, 'agents'); fs.mkdirSync(agents);
+  fs.writeFileSync(path.join(agents, WINDOWS ? 'pi.cmd' : 'pi'), 'fixture availability marker; never executed\n');
+  const env = { CREW_CLAUDE_ACCOUNTS: '', CREW_GH: fakeGh, CREW_SELFTEST: 'node docs/selftest.mjs', CREW_WORKTREES: path.join(dir, 'copies'), CREW_AGENT_PATH: agents };
   const call = (args, extra = {}) => crew(args, { script, cwd: home, terminal: owner, env: { ...env, ...extra } });
   assert.equal(call(['init', home]).code, 0); assert.equal(call(['start']).code, 0);
   const task = id => JSON.parse(fs.readFileSync(path.join(home, 'tasks', id, 'task.json'), 'utf8'));
@@ -544,6 +546,59 @@ gapTests['root-layout'] = () => {
   const crash = fs.readFileSync(path.join(crashes, fs.readdirSync(crashes)[0]), 'utf8');
   assert.ok(crash.includes(`at ${repaired.slice(0, 8)} (${slash(t.worktree)})`), crash);
 };
+gapTests['selfrepair-failure-diagnostic'] = () => {
+  const f = repairFixture('failure-diagnostic');
+  assert.equal(f.call(['fix', '--agent', 'pi', 'Repair a failing suite.']).code, 0);
+  const t = f.task('fix-1'); f.reported(t);
+  commit(t.worktree, { 'docs/check.mjs': "console.error('expected fixture assertion'); process.exit(1);\n" }, 'failing repair');
+  const r = f.call(['selfmerge', t.id], { CREW_SELFTEST: 'node docs/check.mjs' });
+  assert.equal(r.code, 6, r.out);
+  // Keep the legacy integration assertion as well as the new deadline detail.
+  assert.match(r.out, /the test suite fails \(node docs\/check\.mjs, exit 1\)/);
+  assert.match(r.out, /deadline 3600 seconds/); assert.match(r.out, /expected fixture assertion/);
+  assert.equal(f.task(t.id).pr, undefined);
+  assert.equal(spawnSync('git', ['-C', f.origin, 'rev-parse', '--verify', `refs/heads/${t.branch}`]).status, 128);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.log, 'utf8')), [], 'A failing suite never reaches GitHub publication');
+};
+
+gapTests['selfrepair-deadline'] = () => {
+  const f = repairFixture('deadline');
+  assert.equal(f.call(['fix', '--agent', 'pi', 'A bounded repair.']).code, 0);
+  const t = f.task('fix-1'); f.reported(t);
+  commit(t.worktree, { 'docs/deadline.md': 'Repair.\n' }, 'fix(crew): bounded suite');
+  const hook = path.join(f.dir, 'suite.cjs'), mode = path.join(f.dir, 'suite-mode'), observed = path.join(f.dir, 'suite-options.json');
+  fs.writeFileSync(hook, `const fs=require('node:fs'),cp=require('node:child_process'),original=cp.spawnSync;
+cp.spawnSync=function(command,args,options){
+ if(options?.shell&&options.cwd===${JSON.stringify(t.worktree)}){
+  const leaking=Object.keys(options.env).filter(k=>/^(CREW_|HC_TERMINAL_ID$)/i.test(k));
+  fs.writeFileSync(${JSON.stringify(observed)},JSON.stringify({command,timeout:options.timeout,leaking}));
+  const mode=fs.readFileSync(${JSON.stringify(mode)},'utf8');
+  return mode==='pass'?{status:0,stdout:'complete suite passed',stderr:''}
+   :mode==='fail'?{status:1,stdout:'a failing test',stderr:''}
+   :{status:null,stdout:'last completed test',stderr:'',error:Object.assign(Error('fixture error'),{code:mode})};
+ }
+ return original.apply(this,arguments);
+};require('node:module').syncBuiltinESMExports();`);
+  const env = { NODE_OPTIONS: `--require ${JSON.stringify(hook)}`, CREW_SELFTEST: '' };
+  for (const value of ['', '0', '-1', '1.5', 'wat', '7201']) {
+    const r = f.call(['selfrepair', t.id], { ...env, CREW_SELFTEST_TIMEOUT_SECONDS: value });
+    assert.equal(r.code, 2, r.out); assert.match(r.out, /integer from 1 to 7200/);
+    assert.ok(!fs.existsSync(observed), 'Invalid timeout refuses before running the suite');
+  }
+  for (const [value, pattern] of [['fail', /the test suite fails \(node crew\.test\.mjs, exit 1\); deadline 2 seconds:/], ['ETIMEDOUT', /timed out after 2 seconds/], ['ENOENT', /could not complete \(ENOENT\)/], ['ENOBUFS', /could not complete \(ENOBUFS\)/]]) {
+    fs.writeFileSync(mode, value);
+    const r = f.call(['selfrepair', t.id], { ...env, CREW_SELFTEST_TIMEOUT_SECONDS: '2' });
+    assert.equal(r.code, 6, r.out); assert.match(r.out, pattern);
+    assert.equal(JSON.parse(fs.readFileSync(observed, 'utf8')).timeout, 2000);
+    assert.equal(spawnSync('git', ['-C', f.origin, 'rev-parse', '--verify', `refs/heads/${t.branch}`]).status, 128);
+    assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 0, 'No publication on suite failure');
+  }
+  fs.writeFileSync(mode, 'pass');
+  const r = f.call(['selfrepair', t.id], env); assert.equal(r.code, 0, r.out); assert.match(r.out, /tests passed in [\d.]+s/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(observed, 'utf8')), { command: 'node crew.test.mjs', timeout: 3600000, leaking: [] });
+  assert.ok(f.task(t.id).pr, 'Successful complete suite still permits publication');
+};
+
 gapTests.selfrepair = () => {
   const f = repairFixture('root'), first = git('-C', f.origin, 'rev-parse', 'main').trim();
   let r = f.call(['fix', '--agent', 'pi', 'Repair the reported defect.']); assert.equal(r.code, 0, r.out);
@@ -664,8 +719,7 @@ const a=process.argv.slice(2); if(a[0]!=='start')process.exit(1);
 const detached=a[1]==='--detach', key=detached?a[2]:a[1], copy=path.join(${JSON.stringify(f.dir)},'delivery-copies',key.replaceAll('/','-'));
 let from='HEAD';
 if(spawnSync('git',['remote','get-url','origin']).status===0){
-  let branch=spawnSync('git',['symbolic-ref','--short','refs/remotes/origin/HEAD'],{encoding:'utf8'}).stdout.trim().replace(/^origin\\//,'');
-  if(!branch)branch=/^ref: refs\\/heads\\/(.+)\\tHEAD$/m.exec(spawnSync('git',['ls-remote','--symref','origin','HEAD'],{encoding:'utf8'}).stdout)?.[1];
+  const branch=/^ref: refs\\/heads\\/(.+)\\tHEAD$/m.exec(spawnSync('git',['ls-remote','--symref','origin','HEAD'],{encoding:'utf8'}).stdout)?.[1];
   if(spawnSync('git',['fetch','--quiet','origin',branch]).status!==0)process.exit(1);from='origin/'+branch;
 }
 if(process.env.KIND_COPY_READY){fs.writeFileSync(process.env.KIND_COPY_READY,'ready');while(!fs.existsSync(process.env.KIND_COPY_RELEASE))Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}
@@ -703,6 +757,93 @@ gapTests['workflow-detection'] = () => {
   commit(f.repo, { 'skills/change-delivery/SKILL.md': '---\nname: unrelated\n---\n', '.github/workflows/other.yml': '# uses: timurproko/MyWorkflows/.github/workflows/delivery.yml@main\njobs: {}\n' }, 'Not delivery');
   const r = f.call(['spawn', 'plain', '--project', 'demo', '--kind', 'ship', '--agent', 'pi', 'Count.']);
   assert.equal(r.code, 0, r.out); assert.equal(f.task('plain').workflow, undefined);
+};
+
+gapTests['spawn-multiline'] = () => {
+  const f = gapFixture('multiline'), text = 'First line\r\n\r\nUnicode: λ 日本語\r\nQuotes: "hello" and \'world\'; & | < > % ! $ ` last line';
+  const file = path.join(f.home, 'task.txt'); fs.writeFileSync(file, '\uFEFF' + text);
+  let r = f.call(['spawn', 'file-input', '--project', 'demo', '--agent', 'pi', '--task-file', 'task.txt']);
+  assert.equal(r.code, 0, r.out);
+  const check = id => { const t = f.task(id); assert.equal(t.task, text); assert.ok(fs.readFileSync(t.brief, 'utf8').includes(text)); };
+  check('file-input');
+  for (const [name, data] of [['empty', '  '], ['invalid', Buffer.from([0xff])]]) fs.writeFileSync(path.join(f.home, name), data);
+  for (const args of [['--task-file', 'missing'], ['--task-file', 'empty'], ['--task-file', 'invalid'], ['--task-file', file, 'also text']]) {
+    r = f.call(['spawn', 'refused', '--project', 'demo', '--agent', 'pi', ...args]);
+    assert.equal(r.code, 2, r.out); assert.match(r.out, /task-file/); assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'refused')));
+  }
+  r = f.call(['spawn', 'single', '--project', 'demo', '--agent', 'pi', 'Single line']);
+  assert.equal(r.code, 0, r.out); assert.equal(f.task('single').task, 'Single line');
+  if (WINDOWS) {
+    const driver = path.join(f.dir, 'powershell-driver.mjs'), script = path.join(f.dir, 'invoke.ps1');
+    fs.writeFileSync(driver, `import {spawnSync} from 'node:child_process';
+const r=spawnSync('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',${JSON.stringify(script)}],{stdio:'inherit'});process.exit(r.status??1);`);
+    const invoke = (launcher, id, taskArg = '$text') => {
+      fs.writeFileSync(script, `$text = @'\r\n${text}\r\n'@\r\n& '${slash(path.join(here, 'bin', launcher))}' spawn ${id} --project demo --agent pi ${taskArg}\r\nexit $LASTEXITCODE\r\n`, 'utf8');
+      // Windows PowerShell reads a BOM-less script as ANSI. Supply a UTF-8 BOM.
+      fs.writeFileSync(script, '\uFEFF' + fs.readFileSync(script, 'utf8'));
+      return f.call([], {}, driver);
+    };
+    r = invoke('crew.ps1', 'native'); assert.equal(r.code, 0, r.out); check('native');
+    r = invoke('crew.ps1', '123'); assert.equal(r.code, 0, r.out); check('123');
+    assert.equal(f.task('123').id, '123', 'Unquoted numeric PowerShell task IDs become string argv');
+    fs.writeFileSync(script, `& '${slash(path.join(here, 'bin', 'crew.ps1'))}' --help --rule 1\r\nexit $LASTEXITCODE\r\n`);
+    r = f.call([], {}, driver); assert.equal(r.code, 0, r.out); assert.match(r.out, /crew spawn/);
+    r = invoke('crew.cmd', 'batch-lossy'); assert.equal(r.code, 2, r.out); assert.match(r.out, /unsafe batch.*crew.ps1|task-file/);
+    assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'batch-lossy')), 'Batch guard rejects before a shortened task is created');
+    r = invoke('crew.cmd', 'batch-file', "--task-file 'task.txt'"); assert.equal(r.code, 0, r.out); check('batch-file');
+  }
+};
+
+gapTests['project-list-speed'] = () => {
+  const f = projectKindFixture('list-speed'), registry = path.join(f.home, 'crew.json');
+  const config = JSON.parse(fs.readFileSync(registry, 'utf8')), head = git('-C', f.repo, 'rev-parse', 'HEAD').trim();
+  for (let i = 0; i < 8; i++) {
+    const folder = i ? path.join(f.dir, `repo-${i}`) : f.repo;
+    if (i) git('clone', '-q', f.repo, folder);
+    git('-C', folder, 'remote', ...(i ? ['set-url'] : ['add']), 'origin', f.repo);
+    config.projects[i ? `p${i}` : 'demo'] = { path: slash(folder) };
+  }
+  fs.writeFileSync(registry, JSON.stringify(config));
+  const barrier = path.join(f.dir, 'network'); fs.mkdirSync(barrier);
+  const hook = path.join(f.dir, 'parallel.cjs');
+  fs.writeFileSync(hook, `const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
+const {isMainThread}=require('node:worker_threads');
+if(!isMainThread && process.env.FAIL_KIND_WORKER==='1')throw Error('injected worker failure');
+const original=cp.spawnSync;
+cp.spawnSync=function(command,args,options){
+ if(command==='git'&&args.includes('ls-remote')){
+  const dir=${JSON.stringify(barrier)}, key=path.basename(args[1]);
+  fs.appendFileSync(path.join(dir,'calls'),key+'\\n');fs.writeFileSync(path.join(dir,key+'.ready'),'ready');
+  const end=Date.now()+20000;
+  while(fs.readdirSync(dir).filter(f=>f.endsWith('.ready')).length<8){
+   if(Date.now()>end)return {status:1,stdout:'',stderr:'Remote reads did not overlap'};
+   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);
+  }
+  return {status:0,stdout:'ref: refs/heads/main\\tHEAD\\n${head}\\tHEAD\\n',stderr:''};
+ }
+ return original.apply(this,arguments);
+}; require('node:module').syncBuiltinESMExports();`);
+  const env = { NODE_OPTIONS: `--require ${JSON.stringify(hook)}` };
+  let r = f.call(['project', 'list', '--json'], env); assert.equal(r.code, 0, r.out);
+  const listed = JSON.parse(r.out);
+  assert.equal(listed.capability, 'project-kinds'); assert.equal(listed.version, 1);
+  assert.deepEqual(listed.projects, Object.entries(config.projects).map(([name, project]) => ({ name, path: project.path,
+    kind: 'plain', kindSource: 'detected', available: true, checkoutStale: false })));
+  const calls = () => fs.readFileSync(path.join(barrier, 'calls'), 'utf8').trim().split(/\r?\n/);
+  assert.equal(calls().length, 8, 'One advertisement per independent project, all eight overlap');
+  config.projects.alias = { ...config.projects.demo };
+  config.projects.explicit = { ...config.projects.demo, kind: 'plain' };
+  config.projects.legacy = { ...config.projects.demo, workflow: 'plain' };
+  fs.writeFileSync(registry, JSON.stringify(config));
+  r = f.call(['project', 'list', '--json'], env); assert.equal(r.code, 0, r.out);
+  assert.equal(calls().length, 16, 'Equivalent folders and selections are inspected only once per invocation');
+  assert.deepEqual(JSON.parse(r.out).projects.slice(-3).map(p => [p.name, p.kindSource]), [['alias', 'detected'], ['explicit', 'explicit'], ['legacy', 'legacy']]);
+  r = f.call(['project', 'list', '--json'], { ...env, FAIL_KIND_WORKER: '1' });
+  assert.equal(r.code, 2, r.out); assert.equal(JSON.parse(r.out).error.code, 'kind-unavailable');
+  assert.match(JSON.parse(r.out).error.message, /^demo:/, 'Failure order follows the registry, not completion order');
+  commit(f.repo, { 'AGENTS.md': '# Agent instructions\nThis file is `templates/AGENTS.md` of `example/workflow`.\n' }, 'new live instructions');
+  const t = f.spawn('live-after-list', ['--kind', 'ship', '--agent', 'pi']);
+  assert.equal(t.deliveryKind, 'workflow', 'Admission never reuses a prior listing snapshot');
 };
 
 gapTests['project-kinds'] = () => {
@@ -861,6 +1002,43 @@ gapTests['project-kind-snapshots'] = () => {
   assert.equal(f.call(['project', 'set-kind', 'demo', '--kind', 'workflow', '--home', f.home, '--expected-path', f.repo, '--json']).code, 0);
   const unavailable = f.call(['project', 'list', '--json'], { CREW_TOOL_DELIVERY: '' }); assert.equal(unavailable.code, 0, unavailable.out);
   assert.equal(JSON.parse(unavailable.out).projects[0].kind, 'workflow'); assert.equal(JSON.parse(unavailable.out).projects[0].available, false);
+};
+
+gapTests['project-kind-stale-origin-head'] = () => {
+  for (const retained of [false, true]) {
+    const f = projectKindFixture(`stale-origin-head-${retained}`);
+    git('-C', f.repo, 'branch', '-M', 'main');
+    const local = git('-C', f.repo, 'rev-parse', 'HEAD').trim();
+    git('-C', f.repo, 'branch', 'develop');
+    const published = commit(f.repo, { 'AGENTS.md': '# Agent instructions\nThis file is `templates/AGENTS.md` of `example/workflow`.\n' }, 'published workflow');
+    const origin = path.join(f.dir, 'origin.git');
+    git('clone', '--bare', '-q', f.repo, origin);
+    if (!retained) git('-C', origin, 'branch', '-D', 'develop');
+    git('-C', f.repo, 'remote', 'add', 'origin', origin);
+    git('-C', f.repo, 'reset', '--hard', local);
+    git('-C', f.repo, 'update-ref', 'refs/remotes/origin/develop', local);
+    git('-C', f.repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop');
+    const refs = git('-C', f.repo, 'show-ref'), fetchHead = path.join(f.repo, '.git', 'FETCH_HEAD');
+    fs.writeFileSync(fetchHead, 'sentinel\n');
+    const trace = path.join(f.dir, 'remote-trace.jsonl');
+    const listed = f.call(['project', 'list', '--json'], { GIT_TRACE2_EVENT: slash(trace) });
+    assert.equal(listed.code, 0, listed.out);
+    const remoteCalls = () => fs.readFileSync(trace, 'utf8').trim().split(/\r?\n/).map(JSON.parse)
+      .filter(e => e.event === 'start' && e.argv.includes('ls-remote'));
+    assert.equal(remoteCalls().length, 1, 'One live advertisement supplies branch and commit');
+    assert.deepEqual(JSON.parse(listed.out).projects[0], { name: 'demo', path: slash(f.repo), kind: 'workflow', kindSource: 'detected', available: true, checkoutStale: true });
+    assert.equal(git('-C', f.repo, 'show-ref'), refs, 'Listing leaves the stale cached default and tracking refs untouched');
+    assert.equal(git('-C', f.repo, 'rev-parse', 'HEAD').trim(), local);
+    assert.equal(fs.readFileSync(fetchHead, 'utf8'), 'sentinel\n');
+    assert.equal(git('-C', f.repo, 'status', '--porcelain'), '');
+    fs.writeFileSync(trace, '');
+    const admitted = f.call(['spawn', 'published-default', '--project', 'demo', '--kind', 'ship', '--type', 'refactor', '--agent', 'pi', 'Count.'], { GIT_TRACE2_EVENT: slash(trace) });
+    assert.equal(admitted.code, 0, admitted.out);
+    assert.equal(remoteCalls().length, 2, 'Admission and the fake allocator each read live HEAD once');
+    const task = f.task('published-default');
+    assert.equal(task.deliveryKind, 'workflow'); assert.equal(task.workflow, 'delivery');
+    assert.equal(git('-C', task.worktree, 'rev-parse', 'HEAD').trim(), published);
+  }
 };
 
 gapTests['project-kind-ordering'] = async () => {
@@ -1281,9 +1459,9 @@ function workerSpaceInheritanceTests() {
     assert.ok(!readWorld().log.slice(n).some(c => ['kill', 'rm', 'run'].includes(c[0])));
   }
 }
-function workerSpaceFixTests() {
+function workerSpaceFixTests(prefix = 'spaces') {
   for (const registration of ['matching', 'unrelated', 'missing']) {
-    const f = repairFixture(`spaces-${registration}`);
+    const f = repairFixture(`${prefix}-${registration}`);
     if (registration !== 'missing') {
       const repo = path.join(f.dir, registration === 'matching' ? 'linked-source' : 'unrelated');
       if (registration === 'matching') git('-C', f.repo, 'worktree', 'add', '--detach', repo, 'HEAD');
@@ -1298,9 +1476,9 @@ function workerSpaceFixTests() {
     const fleet = JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.find(task => task.id === t.id);
     assert.equal(fleet.project, full.project); assert.equal(fleet.project, 'crew:self');
     assert.equal(readWorld().terminals[t.terminal].labels['crew.space.project'], binding.project, 'Fleet task identity never rewrites the repair placement alias');
-    assert.equal(binding.name, registration === 'matching' ? 'core' : 'crew'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
+    assert.equal(binding.name, 'core', 'Repair names use the source repository directory, including internal fallback'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
     assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
-    r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: '' }); assert.equal(r.code, 0, r.out);
+    r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
     assert.deepEqual(f.task(t.id).workerSpace, binding);
     assert.equal(readWorld().terminals[f.task(t.id).terminal].labels['herdr.space'], binding.id);
     if (registration === 'matching') {
@@ -1313,6 +1491,27 @@ function workerSpaceFixTests() {
     }
   }
 }
+gapTests['repair-space-name'] = () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    workerSpaceFixTests('repair-names');
+    const f = repairFixture('repair-name-legacy');
+    assert.equal(f.call(['config', 'worker-space', 'per-project']).code, 0);
+    let r = f.call(['fix', '--agent', 'pi', 'Repair.']); assert.equal(r.code, 0, r.out);
+    const t = f.task('fix-1'); assert.equal(t.workerSpace.name, 'core');
+    const oldName = { ...t.workerSpace, name: 'crew' };
+    fs.writeFileSync(path.join(f.home, 'tasks', t.id, 'task.json'), JSON.stringify({ ...t, workerSpace: oldName,
+      terminalLaunches: t.terminalLaunches.map(launch => ({ ...launch, workerSpace: oldName })) }));
+    const w = readWorld(); w.terminals[t.terminal].labels['crew.space.name'] = 'crew'; fs.writeFileSync(world, JSON.stringify(w));
+    const absent = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: path.join(f.dir, 'no-agents') });
+    assert.equal(absent.code, 8, absent.out); assert.match(absent.out, /pi is not installed/);
+    assert.equal(f.task(t.id).terminal, t.terminal, 'Missing agents still refuse before stopping the current worker');
+    r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task(t.id).workerSpace, oldName, 'Existing occupied repair names are not renamed');
+    assert.equal(readWorld().terminals[f.task(t.id).terminal].labels['crew.space.name'], 'crew');
+  } finally { fs.writeFileSync(world, before); }
+};
+
 async function workerSpaceRepairAdmissionTest() {
   const f = repairFixture('spaces-admission-race');
   assert.equal(f.call(['project', 'add', 'crew', f.repo]).code, 0);
@@ -1648,7 +1847,7 @@ const original = cp.spawnSync; let paused = false;
 cp.spawnSync = (...args) => {
   if (paused || !args[1]?.includes(${JSON.stringify(verb)}) || (${JSON.stringify(address)} && !args[1]?.includes(${JSON.stringify(address)}))) return original(...args);
   paused = true; const result = ${after} ? original(...args) : undefined;
-  fs.writeFileSync(${JSON.stringify(ready)}, JSON.stringify({command:args[0],args:args[1],status:result?.status,stderr:result?.stderr})); const deadline = Date.now() + 15000;
+  fs.writeFileSync(${JSON.stringify(ready)}, JSON.stringify({command:args[0],args:args[1],status:result?.status,stderr:result?.stderr})); const deadline = Date.now() + 30000;
   while (!fs.existsSync(${JSON.stringify(release)})) { if (Date.now() > deadline) throw Error('Core barrier timeout'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); }
   return ${after} ? result : original(...args);
 }; syncBuiltinESMExports();
@@ -1708,6 +1907,96 @@ async function joinProjectSpaceHandoverRaceTests(scope = 'integrated') {
     }
   }
 }
+gapTests['finish-idempotent-race'] = async () => {
+  const original = fs.readFileSync(world, 'utf8');
+  try {
+    for (const force of [false, true]) {
+      const f = joinSpaceFixture(`finish-idempotent-${force}`), task = f.spawn('racing'); f.done(task);
+      const lock = path.join(f.home, 'worker-spaces.lock'), ready = path.join(f.dir, 'before-gate'), release = path.join(f.dir, 'gate-release');
+      const script = path.join(f.dir, 'late-finisher.mjs');
+      fs.writeFileSync(script, `import fs from 'node:fs';const rename=fs.renameSync;let paused=false;
+fs.renameSync=(from,to,...args)=>{if(!paused&&to===${JSON.stringify(lock)}){paused=true;fs.writeFileSync(${JSON.stringify(ready)},'ready');const end=Date.now()+30000;
+while(!fs.existsSync(${JSON.stringify(release)})){if(Date.now()>end)throw Error('finish race barrier timeout');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);}}
+return rename(from,to,...args);};
+const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});await main(process.argv.slice(2));`);
+      const args = ['finish', task.id, ...(force ? ['--force'] : [])];
+      const pending = projectProcess(f, args, { script, terminal: `owner-spaces-finish-idempotent-${force}`, env: f.env });
+      try {
+        await until(() => fs.existsSync(ready));
+        const first = f.call(args); assert.equal(first.code, 0, first.out); assert.equal(f.task(task.id).state, 'closed');
+        assert.ok(!fs.existsSync(task.worktree));
+        fs.mkdirSync(task.worktree); const sentinel = path.join(task.worktree, 'reused-folder'); fs.writeFileSync(sentinel, 'new owner');
+        fs.writeFileSync(release, 'go'); const second = await pending.result;
+        assert.equal(second.code, 0, second.out); assert.match(second.out, /already closed/);
+        assert.equal(fs.readFileSync(sentinel, 'utf8'), 'new owner', 'A duplicate finish never deletes a reused copy');
+        assert.ok(!f.task(task.id).copyToReturn);
+      } finally { fs.writeFileSync(release, 'go'); await pending.result; }
+    }
+  } finally { fs.writeFileSync(world, original); }
+};
+
+gapTests['finish-contention'] = async () => {
+  for (const change of ['none', 'tell', 'relaunch']) {
+    const f = joinSpaceFixture(`finish-settle-${change}`), old = f.spawn('old'), other = f.spawn('other');
+    f.done(old); setTerminal(old.terminal, { status: { app: 'pi', state: 'working' } });
+    const ready = path.join(f.dir, 'settle-ready'), release = path.join(f.dir, 'settle-release'), script = path.join(f.dir, 'settle.mjs');
+    fs.writeFileSync(script, `import fs from 'node:fs';const wait=Atomics.wait;let paused=false;
+Atomics.wait=(a,i,v,ms)=>{if(!paused&&ms===1000){paused=true;fs.writeFileSync(${JSON.stringify(ready)},'ready');const end=Date.now()+30000;
+while(!fs.existsSync(${JSON.stringify(release)})){if(Date.now()>end)throw Error('settle barrier timeout');wait(a,i,v,10);}return 'timed-out';}return wait(a,i,v,ms);};
+const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});await main(process.argv.slice(2));`);
+    const owner = `owner-spaces-finish-settle-${change}`;
+    const pending = projectProcess(f, ['finish', old.id], { script, terminal: owner, env: f.env });
+    try {
+      await until(() => fs.existsSync(ready));
+      assert.ok(!fs.existsSync(path.join(f.home, 'worker-spaces.lock')), 'Reported-worker settling leaves placement free');
+      let r = f.call(['tell', other.id, 'Continue unrelated work.']); assert.equal(r.code, 0, r.out);
+      f.spawn('during-settle');
+      setTerminal(old.terminal, { status: { app: 'pi', state: 'idle' } });
+      if (change !== 'none') {
+        r = f.call(['tell', old.id, 'New work.']); assert.equal(r.code, 0, r.out);
+        if (change === 'relaunch') {
+          r = f.call(['relaunch', old.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+        }
+      } else {
+        f.guest(old); fs.writeFileSync(path.join(old.worktree, 'foreign-sentinel'), 'keep');
+      }
+      fs.writeFileSync(release, 'go'); r = await pending.result;
+      if (change === 'none') {
+        assert.equal(r.code, 0, r.out); assert.equal(f.task(old.id).state, 'closed');
+        assert.ok(fs.existsSync(path.join(old.worktree, 'foreign-sentinel')), 'Foreign holders still protect the copy');
+        f.leave(); assert.equal(f.call(['finish', old.id]).code, 0);
+      } else {
+        assert.equal(r.code, 6, r.out); assert.match(r.out, /changed while finish waited/);
+        assert.equal(f.task(old.id).state, 'working');
+        assert.equal(readWorld().terminals[f.task(old.id).terminal].state, 'live', 'Newer work was not stopped');
+      }
+    } finally { fs.writeFileSync(release, 'go'); await pending.result; }
+  }
+  for (const action of ['tell', 'spawn']) {
+    const f = joinSpaceFixture(`finish-brief-${action}`), old = f.spawn('old'), other = f.spawn('other');
+    const barrier = joinCoreBarrier(f, 'finish-blocked', 'rm', old.terminal, true), owner = `owner-spaces-finish-brief-${action}`;
+    const writer = projectProcess(f, ['finish', old.id], { script: barrier.script, terminal: owner, env: f.env });
+    let contender;
+    try {
+      await until(() => fs.existsSync(barrier.ready));
+      const ready = path.join(f.dir, 'contender-ready'), script = path.join(f.dir, 'contender.mjs'), lock = path.join(f.home, 'worker-spaces.lock');
+      fs.writeFileSync(script, `import fs from 'node:fs';const rename=fs.renameSync;
+fs.renameSync=(from,to,...args)=>{if(to===${JSON.stringify(lock)})fs.writeFileSync(${JSON.stringify(ready)},'ready');return rename(from,to,...args);};
+const {main}=await import(${JSON.stringify(pathToFileURL(path.join(here, 'crew.mjs')).href)});await main(process.argv.slice(2));`);
+      contender = projectProcess(f, action === 'tell' ? ['tell', other.id, 'Continue.'] : ['spawn', 'new', '--project', 'demo', '--agent', 'pi', 'Count.'], { script, terminal: owner, env: f.env });
+      await until(() => fs.existsSync(ready)); fs.writeFileSync(barrier.release, 'go');
+      const stopped = await writer.result; assert.equal(stopped.code, 0, stopped.out);
+      const admitted = await contender.result; assert.equal(admitted.code, 0, admitted.out);
+    } finally { fs.writeFileSync(barrier.release, 'go'); await writer.result; if (contender) await contender.result; }
+  }
+  const f = joinSpaceFixture('finish-optional'), old = f.spawn('old'); f.done(old);
+  const marker = path.join(f.dir, 'optional.json'), tool = path.join(f.dir, 'tasks.mjs');
+  fs.writeFileSync(path.join(f.home, 'backlog.md'), '- [ ] old A backlog item\n');
+  fs.writeFileSync(tool, `import fs from 'node:fs';fs.writeFileSync(${JSON.stringify(marker)},JSON.stringify({locked:fs.existsSync(${JSON.stringify(path.join(f.home, 'worker-spaces.lock'))})}));`);
+  const r = f.call(['finish', old.id], { CREW_TOOL_TASKS_AXI: tool }); assert.equal(r.code, 0, r.out);
+  assert.deepEqual(JSON.parse(fs.readFileSync(marker, 'utf8')), { locked: false }, 'Optional backlog work is outside placement');
+};
+
 async function joinPlacementGateTests(scope = 'integrated') {
   for (const action of ['relaunch', 'finish', 'stop', 'review']) {
     const f = joinSpaceFixture(`join-gate-${scope}-${action}`), old = f.spawn('old', 'demo', action === 'review' ? ['--kind', 'ship'] : []);

@@ -24,7 +24,8 @@ export PATH="$PWD/bin:$PATH"
 ```
 
 Add the clone's `bin` folder to your persistent PATH to use `crew` from any folder.
-Windows uses `bin/crew.cmd`; POSIX shells (including Git Bash) use `bin/crew`.
+PowerShell uses `bin/crew.ps1`; Windows batch callers use `bin/crew.cmd`;
+POSIX shells (including Git Bash) use `bin/crew`.
 The Herdr Crew plugin instead installs its managed clone at `~/.crew/core`.
 All source files live at the repository root; the former nested source layout is not supported.
 
@@ -175,6 +176,22 @@ tasks. The next spawn reads the new selection without restart. The explicit kind
 tools/remote refuse rather than silently falling back. This is a separate narrow local permission, not an extension of work-control authority. Spawn,
 stop, finish, tell, relaunch, land, backlog mutations and end remain owner-only; add/remove
 retain their existing independent registration safeguards. See [JSON contract, refusals and availability](docs/project-kinds.md).
+
+### Multiline task descriptions
+
+PowerShell callers can pass a here-string through `crew.ps1`; the native launcher preserves
+newlines, blank lines, Unicode and quotes without forwarding task prose through cmd.exe.
+The batch launcher refuses multiline spawn arguments (or an unverifiable batch command line)
+before creating a shortened task. For batch callers or long descriptions, use a UTF-8 file:
+
+```text
+crew spawn inspect --project demo --agent pi --task-file C:/work/task.txt
+```
+
+`--task-file` replaces positional task text; missing, unreadable, invalid UTF-8 and empty files
+or mixed file/positional input refuse before admission. Relative paths use the caller's current
+directory. Internal line breaks are preserved in the task and brief; surrounding whitespace is
+trimmed as with positional input. No task text is interpreted as shell syntax by the native launcher.
 
 ## Worker spaces
 
@@ -795,7 +812,12 @@ the defect. The person reviews and merges the repair's pull request.
 `crew selfmerge` remains an alias for `crew selfrepair`. The fixer commits and stops;
 it does not push or open the pull request itself. Crew refuses delivery unless the fixer
 reported, nothing is uncommitted, the branch can incorporate the published `main`,
-and the whole suite passes in the fixer's copy (`node crew.test.mjs`).
+and the whole suite passes in the fixer's copy (`node crew.test.mjs`). The suite has a
+finite **60-minute** default allowance (the Windows CI suite can exceed 15 minutes).
+`CREW_SELFTEST_TIMEOUT_SECONDS` overrides it with an integer from **1 to 7200**; invalid
+explicit values refuse before running the suite. Timeouts, launch/output errors and failing
+exits each prevent publication with distinct diagnostics; successful delivery prints the
+suite's elapsed seconds. No tests are skipped to meet the deadline.
 
 Only the tool's own `crew.mjs`, `crew.test.mjs`, `README.md`, and files inside its `bin/`
 and `docs/` may change, with the allowlist relative to the repository root. Repository
