@@ -70,6 +70,10 @@ Alternative rejected: globally allowing minute-long lock waits, stealing live lo
 
 Focused regression: deterministic fake-Core barriers hold a reported worker in its settle interval while unrelated tell/spawn succeeds; same-task tell/relaunch forces fresh finish validation. Keep coverage for actual terminal-transition exclusion, foreign terminals, protected writes, late launch fencing and interrupted return. Bound-contention tests cover release within the allowance and safe timeout beyond it.
 
+### 6. Derive internal repair-space names like normal project spaces
+
+The coordinator explicitly added this sixth outcome during implementation. Crew chooses the title in `launchWorker`: internal `crew:self` naming currently falls back to the literal `crew`. Resolve a fresh repair's name from its source repository through the existing `repositorySpaceName` rule instead, so a source/copy named `core` requests `core`. Retain the internal placement ID and task project and never rename an inherited/occupied space. Add `repair-space-name` coverage for a core-named source, registered aliases, fallback identity and saved-name inheritance; document the Crew-owned naming decision.
+
 ## Risks / Trade-offs
 
 - [Worker startup and Windows Git overhead reduce ideal speedup] -> Cap concurrency, retain call-count proof, and measure actual eight-project latency after implementation. No speedup is claimed at planning time.

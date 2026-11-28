@@ -2,7 +2,7 @@
 
 ## Why
 
-Crew's Windows command path is slow or lossy at several lifecycle boundaries: project listing delays the Projects panel, stale default-branch metadata can select the wrong delivery kind, multiline tasks can be truncated, passing self-repairs can time out, and finish can block unrelated work. The person requested these five existing problems be planned together in one pull request, with small, separately tested fixes.
+Crew's Windows command path is slow or lossy at several lifecycle boundaries: project listing delays the Projects panel, stale default-branch metadata can select the wrong delivery kind, multiline tasks can be truncated, passing self-repairs can time out, and finish can block unrelated work. The person requested these existing problems be planned together in one pull request, with small, separately tested fixes.
 
 ## What Changes
 
@@ -11,6 +11,7 @@ Crew's Windows command path is slow or lossy at several lifecycle boundaries: pr
 - Preserve multiline task input through the supported Windows command path, or refuse unsupported forwarding before launching a shortened task; provide a lossless task-file input path.
 - Give self-repair's unchanged complete-suite gate a realistic finite Windows timeout and distinguish timeout from an actual failing test.
 - Keep reported-worker settling and optional post-close work from monopolizing placement serialization, with bounded foreground contention handling and all copy/terminal safety checks intact.
+- Name new internal repair spaces from the repository directory by the normal worker naming rule, rather than the hardcoded crew fallback, preserving saved names and placement identity.
 - Add one focused regression group per issue and record real-machine project-list before/after measurements after implementation.
 
 ## Capabilities

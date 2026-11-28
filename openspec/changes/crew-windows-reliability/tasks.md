@@ -1,6 +1,6 @@
 # Tasks
 
-Each numbered group maps to one draft-PR Implementation outcome, in this order. All boxes remain unchecked until implementation is approved and delivered.
+Each numbered group maps to one draft-PR Implementation outcome, in this order. The coordinator approved implementation and explicitly added outcome 6.
 
 ## 1. Published-default selection survives branch renames with one remote read
 
@@ -33,3 +33,8 @@ Each numbered group maps to one draft-PR Implementation outcome, in this order. 
 - [ ] 5.2 Move optional post-close label/backlog work and sweep driving out of the outer gate, retaining a guarded return attempt for each copy and safe current-state transactions; use deterministic barriers to cover newer task state and foreign-terminal preservation.
 - [ ] 5.3 Bound opportunistic branch-proof reads and allow ten seconds for brief foreground placement contention without altering observation yield, dead-owner proof or publication fences; cover successful brief release and safe bounded refusal in `finish-contention`.
 - [ ] 5.4 Run `node crew.test.mjs --gaps=finish-contention`, `node crew.test.mjs --gaps=join-project-space-gate` and `node crew.test.mjs --gaps=launch-authorization-gate`; document the new settle/gate boundary and retained slow-copy-return limitation in `docs/worker-spaces.md`.
+
+## 6. Internal repair-space names preserve repository directory spelling
+
+- [ ] 6.1 Replace Crew's hardcoded internal repair title with the normal directory-name resolver while preserving internal IDs and saved names; cover core-named source and registered alias/fallback cases in `repair-space-name`.
+- [ ] 6.2 Run `node crew.test.mjs --gaps=repair-space-name` and document Crew-owned repair naming and inherited-name compatibility in `docs/worker-spaces.md`.

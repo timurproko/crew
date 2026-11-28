@@ -2,6 +2,16 @@
 
 ## ADDED Requirements
 
+### Requirement: Internal repair-space titles follow directory spelling
+
+Crew SHALL derive fresh internal repair-space display names using the same repository-directory rule as normal workers, preserving case and dots. A core-named source SHALL request core rather than a hardcoded crew title. This SHALL NOT change task project, placement IDs, terminal ownership or inherited saved names.
+
+#### Scenario: Internal repair runs from a core repository
+
+- **WHEN** a new per-project crew:self repair is allocated from a repository named core without an eligible occupied repair space
+- **THEN** Crew requests display name core while retaining the internal repair identity, and later replacements retain the saved name
+
+
 ### Requirement: Project listing avoids serial network latency
 
 Crew SHALL resolve independent projects concurrently with bounded fan-out, preserving registry order and the project-kinds v1 response and refusal contracts. Under normal remote latency, an eight-project listing SHALL complete in a few seconds rather than accumulating every project's network delay. Listing SHALL NOT weaken live published-default admission checks or introduce persistent stale kind authority.
