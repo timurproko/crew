@@ -1086,8 +1086,7 @@ function allocationSnapshot(folder) {
   const remote = git('ls-remote', '--symref', 'origin', 'HEAD');
   const branch = remote.code === 0 ? /^ref: refs\/heads\/(.+)\tHEAD$/m.exec(remote.stdout)?.[1] : null;
   if (!branch) return { error: 'The published default branch cannot be resolved.' };
-  const listed = git('ls-remote', '--exit-code', '--heads', 'origin', `refs/heads/${branch}`);
-  const head = listed.code === 0 ? /^([a-f0-9]{40,64})\t/m.exec(listed.stdout)?.[1] : null;
+  const head = /^([a-f0-9]{40,64})\tHEAD$/m.exec(remote.stdout)?.[1];
   if (!head) return { error: 'The published default head cannot be read.' };
   if (git('cat-file', '-e', `${head}^{commit}`).code !== 0
       && git('fetch', '--quiet', '--no-tags', '--no-write-fetch-head', 'origin', head).code !== 0) {
