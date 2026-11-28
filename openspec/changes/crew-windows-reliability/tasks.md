@@ -23,9 +23,9 @@ Each numbered group maps to one draft-PR Implementation outcome, in this order. 
 
 ## 4. Passing self-repairs have a realistic bounded suite allowance
 
-- [ ] 4.1 Set the selfrepair suite default to 60 minutes, accept validated `CREW_SELFTEST_TIMEOUT_SECONDS` values from 1 to 7200, and retain sanitized child environment; assert timeout options and invalid inputs in a focused `selfrepair-deadline` group.
-- [ ] 4.2 Distinguish suite failure, timeout and launch/output errors without weakening publication checks; exercise short fake passing/failing/hanging suites and run `node crew.test.mjs --gaps=selfrepair-deadline` and `node crew.test.mjs --gaps=selfrepair`.
-- [ ] 4.3 Document the finite default, override and refusal diagnostics in README; confirm the default command still runs the complete suite and no full local suite was needed for this change's targeted tests.
+- [x] 4.1 Set the selfrepair suite default to 60 minutes, accept validated `CREW_SELFTEST_TIMEOUT_SECONDS` values from 1 to 7200, and retain sanitized child environment; assert timeout options and invalid inputs in a focused `selfrepair-deadline` group.
+- [x] 4.2 Distinguish suite failure, timeout and launch/output errors without weakening publication checks; exercise short fake passing/failing/hanging suites and run `node crew.test.mjs --gaps=selfrepair-deadline` and `node crew.test.mjs --gaps=selfrepair`.
+- [x] 4.3 Document the finite default, override and refusal diagnostics in README; confirm the default command still runs the complete suite and no full local suite was needed for this change's targeted tests.
 
 ## 5. Finish settling allows unrelated foreground work to progress
 

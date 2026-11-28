@@ -3897,6 +3897,11 @@ function cmdSelfmerge(args) {
   if (task.pr) { publishTaskTerminal(task); console.log(`${id} already has a pull request: ${task.pr}. After the person merges it, run \`crew update\` or use the next \`crew start\`.`); return; }
   if (task.merged) { console.log(`${id} is already published as ${short(task.merged)}`); return; }
   if (task.state !== 'reported') refuse(`Task ${id} is ${task.state}; a repair is published only after its worker reported.`);
+  const timeoutText = process.env.CREW_SELFTEST_TIMEOUT_SECONDS;
+  if (timeoutText !== undefined && (!/^\d+$/.test(timeoutText) || Number(timeoutText) < 1 || Number(timeoutText) > 7200)) {
+    refuse('CREW_SELFTEST_TIMEOUT_SECONDS must be an integer from 1 to 7200; no repair was published.');
+  }
+  const suiteTimeout = timeoutText === undefined ? 60 * 60 * 1000 : Number(timeoutText) * 1000;
   const wt = task.worktree, git = (...a) => run('git', ['-C', wt, ...a], { timeout: 120000 });
   const no = (why, code = 6) => refuse(`Repair ${id} was not published: ${why}`, code);
   if (!fs.existsSync(path.join(wt, '.git'))) no(`its working copy ${wt} is gone.`);
@@ -3926,8 +3931,15 @@ function cmdSelfmerge(args) {
   // The suite runs as it would on a clean machine: nothing of this session leaks into it.
   const command = process.env.CREW_SELFTEST || 'node crew.test.mjs';
   const testEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(CREW_|HC_TERMINAL_ID$)/i.test(key)));
-  const tested = run(command, [], { shell: true, cwd: wt, env: testEnv, timeout: 15 * 60 * 1000 });
-  if (tested.code !== 0) no(`the test suite fails (${command}, exit ${tested.code ?? 'timeout'}):\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
+  const testStarted = Date.now();
+  const tested = run(command, [], { shell: true, cwd: wt, env: testEnv, timeout: suiteTimeout });
+  const testSeconds = ((Date.now() - testStarted) / 1000).toFixed(1);
+  if (tested.error || tested.code !== 0) {
+    const reason = tested.error?.code === 'ETIMEDOUT' ? `timed out after ${suiteTimeout / 1000} seconds`
+      : tested.error ? `could not complete (${tested.error.code ?? tested.error.message})`
+        : tested.code === null ? 'terminated without an exit code' : `fails (exit ${tested.code})`;
+    no(`the test suite ${reason} (${command}; deadline ${suiteTimeout / 1000} seconds):\n${`${tested.stdout}\n${tested.stderr}`.trim().split(/\r?\n/).slice(-12).join('\n')}`);
+  }
   const subject = git('log', '--reverse', '--format=%s', 'origin/main..HEAD').stdout.split(/\r?\n/).find(Boolean) || 'Repair the reported crew defect';
   // Commit subjects are untrusted prose, not PR-body markup. Keep the outcome one bounded line.
   let outcome = `Crew's reported defect is repaired: ${subject.replace(/https?:\/\/\S+|[@<>`]/g, '').replace(/\s+/g, ' ').trim()}`;
@@ -3945,7 +3957,7 @@ function cmdSelfmerge(args) {
   if (made.error || made.code !== 0 || !url) no(`its branch ${branch} is pushed, but the pull request was not opened (${made.error?.message ?? lastLine(made.stderr || made.stdout)}). Run \`crew selfrepair ${id}\` again.`, 4);
   saveTask(h, { ...loadTask(h, id), pr: url, landed: now() });
   publishTaskTerminal(loadTask(h, id));
-  console.log(`delivered repair ${id}: ${url}; tests passed. Merging it is the person's decision.`);
+  console.log(`delivered repair ${id}: ${url}; tests passed in ${testSeconds}s. Merging it is the person's decision.`);
   console.log('This machine was not updated. After the person merges it, run `crew update` or use the next `crew start`, then retry what failed.');
 }
 

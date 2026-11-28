@@ -812,7 +812,12 @@ the defect. The person reviews and merges the repair's pull request.
 `crew selfmerge` remains an alias for `crew selfrepair`. The fixer commits and stops;
 it does not push or open the pull request itself. Crew refuses delivery unless the fixer
 reported, nothing is uncommitted, the branch can incorporate the published `main`,
-and the whole suite passes in the fixer's copy (`node crew.test.mjs`).
+and the whole suite passes in the fixer's copy (`node crew.test.mjs`). The suite has a
+finite **60-minute** default allowance (the Windows CI suite can exceed 15 minutes).
+`CREW_SELFTEST_TIMEOUT_SECONDS` overrides it with an integer from **1 to 7200**; invalid
+explicit values refuse before running the suite. Timeouts, launch/output errors and failing
+exits each prevent publication with distinct diagnostics; successful delivery prints the
+suite's elapsed seconds. No tests are skipped to meet the deadline.
 
 Only the tool's own `crew.mjs`, `crew.test.mjs`, `README.md`, and files inside its `bin/`
 and `docs/` may change, with the allowlist relative to the repository root. Repository

@@ -544,6 +544,44 @@ gapTests['root-layout'] = () => {
   const crash = fs.readFileSync(path.join(crashes, fs.readdirSync(crashes)[0]), 'utf8');
   assert.ok(crash.includes(`at ${repaired.slice(0, 8)} (${slash(t.worktree)})`), crash);
 };
+gapTests['selfrepair-deadline'] = () => {
+  const f = repairFixture('deadline');
+  assert.equal(f.call(['fix', '--agent', 'pi', 'A bounded repair.']).code, 0);
+  const t = f.task('fix-1'); f.reported(t);
+  commit(t.worktree, { 'docs/deadline.md': 'Repair.\n' }, 'fix(crew): bounded suite');
+  const hook = path.join(f.dir, 'suite.cjs'), mode = path.join(f.dir, 'suite-mode'), observed = path.join(f.dir, 'suite-options.json');
+  fs.writeFileSync(hook, `const fs=require('node:fs'),cp=require('node:child_process'),original=cp.spawnSync;
+cp.spawnSync=function(command,args,options){
+ if(options?.shell&&options.cwd===${JSON.stringify(t.worktree)}){
+  const leaking=Object.keys(options.env).filter(k=>/^(CREW_|HC_TERMINAL_ID$)/i.test(k));
+  fs.writeFileSync(${JSON.stringify(observed)},JSON.stringify({command,timeout:options.timeout,leaking}));
+  const mode=fs.readFileSync(${JSON.stringify(mode)},'utf8');
+  return mode==='pass'?{status:0,stdout:'complete suite passed',stderr:''}
+   :mode==='fail'?{status:1,stdout:'a failing test',stderr:''}
+   :{status:null,stdout:'last completed test',stderr:'',error:Object.assign(Error('fixture error'),{code:mode})};
+ }
+ return original.apply(this,arguments);
+};require('node:module').syncBuiltinESMExports();`);
+  const env = { NODE_OPTIONS: `--require ${JSON.stringify(hook)}`, CREW_SELFTEST: '' };
+  for (const value of ['', '0', '-1', '1.5', 'wat', '7201']) {
+    const r = f.call(['selfrepair', t.id], { ...env, CREW_SELFTEST_TIMEOUT_SECONDS: value });
+    assert.equal(r.code, 2, r.out); assert.match(r.out, /integer from 1 to 7200/);
+    assert.ok(!fs.existsSync(observed), 'Invalid timeout refuses before running the suite');
+  }
+  for (const [value, pattern] of [['fail', /fails \(exit 1\)/], ['ETIMEDOUT', /timed out after 2 seconds/], ['ENOENT', /could not complete \(ENOENT\)/], ['ENOBUFS', /could not complete \(ENOBUFS\)/]]) {
+    fs.writeFileSync(mode, value);
+    const r = f.call(['selfrepair', t.id], { ...env, CREW_SELFTEST_TIMEOUT_SECONDS: '2' });
+    assert.equal(r.code, 6, r.out); assert.match(r.out, pattern);
+    assert.equal(JSON.parse(fs.readFileSync(observed, 'utf8')).timeout, 2000);
+    assert.equal(spawnSync('git', ['-C', f.origin, 'rev-parse', '--verify', `refs/heads/${t.branch}`]).status, 128);
+    assert.equal(JSON.parse(fs.readFileSync(f.log, 'utf8')).length, 0, 'No publication on suite failure');
+  }
+  fs.writeFileSync(mode, 'pass');
+  const r = f.call(['selfrepair', t.id], env); assert.equal(r.code, 0, r.out); assert.match(r.out, /tests passed in [\d.]+s/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(observed, 'utf8')), { command: 'node crew.test.mjs', timeout: 3600000, leaking: [] });
+  assert.ok(f.task(t.id).pr, 'Successful complete suite still permits publication');
+};
+
 gapTests.selfrepair = () => {
   const f = repairFixture('root'), first = git('-C', f.origin, 'rev-parse', 'main').trim();
   let r = f.call(['fix', '--agent', 'pi', 'Repair the reported defect.']); assert.equal(r.code, 0, r.out);
