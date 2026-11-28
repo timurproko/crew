@@ -2204,7 +2204,8 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
       // reservation. Inherited names never depend on the current registry/path.
       const namingProject = independent && h.config.workerSpaceMode === 'per-project'
         ? extra.selfFix ? repairPlacement.project : opts.project : null;
-      const namingPath = namingProject && namingProject !== SELF_PROJECT ? registeredProject(h, namingProject)?.path : null;
+      const namingPath = namingProject === SELF_PROJECT ? record.projectPath
+        : namingProject ? registeredProject(h, namingProject)?.path : null;
       const name = namingPath ? repositorySpaceName(namingPath) : 'crew';
       const selection = !extra.selfFix && opts.kind === 'ship' ? registeredProject(h, opts.project) : null;
       const delivery = selection ? projectDelivery(selection) : null;

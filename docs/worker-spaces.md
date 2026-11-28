@@ -265,7 +265,7 @@ New launches additionally carry:
 | `crew.space.version` | `1` |
 | `crew.space.mode` | `combined` or `per-project` |
 | `crew.space.project` | Placement project key: exact registered name, or `crew:self` for internal repair fallback. |
-| `crew.space.name` | Per-project only: saved repository folder display name, preserving case and dots, or `crew` for internal repair fallback. Legacy registered-ID names remain valid. Omitted in combined mode to preserve directory-derived headings. |
+| `crew.space.name` | Per-project only: saved repository folder display name, preserving case and dots, including internal repairs. Legacy registered-ID and internal `crew` names remain valid. Omitted in combined mode to preserve directory-derived headings. |
 
 The display name is separate from project identity. For a fresh canonical placement,
 `myworkflows` registered at `D:/Git/MyWorkflows` requests `MyWorkflows`, while
@@ -369,7 +369,10 @@ the unchanged view version. No worker-space setting change rewrites task project
 For `crew fix`, combined behaves as before. Per-project fixes share the registration named
 `crew` only if its Git common directory matches the tool's repository (linked worktrees
 qualify, unrelated clones/registrations do not). Otherwise they use the internal fallback
-named `crew`. Task/dispatch project stays `crew:self`; `crew.space.project` can therefore
+with the source repository's directory name (for example **core** for `~/.crew/core`), using
+the same directory resolver as normal project workers. Crew, not Herdr, chooses this requested
+name. Existing saved/occupied names, including the old `crew` fallback, stay unchanged through
+replacement; this is not a rename of running spaces. Task/dispatch project stays `crew:self`; `crew.space.project` can therefore
 be `crew` for a verified shared binding. That binding protects the registration from
 removal/repointing while the fixer is unfinished or its copy still waits to return.
 Repository identity is checked outside the registry lock; admission rechecks the registered
@@ -493,6 +496,9 @@ the old name for a fresh canonical space. It also runs within `--gaps=space-name
 hash-bearing pool parents, dot-prefixed projects, safe-name and exact-label validation, old
 lower-case and directory-cased canonical joins, canonical-over-combined preference, review/
 relaunch/hand-over inheritance and conflicting saved-name refusal. All evidence is fake-Core only.
+
+`--gaps=repair-space-name` covers core-named repair sources, matching and unrelated crew
+registrations, internal fallback IDs, and legacy saved-name inheritance without a native app.
 
 `--gaps=finish-contention` uses deterministic settle/transition barriers to prove unrelated
 tell/spawn progress, same-task follow-up/replacement protection, foreign-holder preservation,

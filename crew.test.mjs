@@ -1438,9 +1438,9 @@ function workerSpaceInheritanceTests() {
     assert.ok(!readWorld().log.slice(n).some(c => ['kill', 'rm', 'run'].includes(c[0])));
   }
 }
-function workerSpaceFixTests() {
+function workerSpaceFixTests(prefix = 'spaces') {
   for (const registration of ['matching', 'unrelated', 'missing']) {
-    const f = repairFixture(`spaces-${registration}`);
+    const f = repairFixture(`${prefix}-${registration}`);
     if (registration !== 'missing') {
       const repo = path.join(f.dir, registration === 'matching' ? 'linked-source' : 'unrelated');
       if (registration === 'matching') git('-C', f.repo, 'worktree', 'add', '--detach', repo, 'HEAD');
@@ -1455,7 +1455,7 @@ function workerSpaceFixTests() {
     const fleet = JSON.parse(f.call(['status', '--json', '--view', 'fleet']).out).tasks.find(task => task.id === t.id);
     assert.equal(fleet.project, full.project); assert.equal(fleet.project, 'crew:self');
     assert.equal(readWorld().terminals[t.terminal].labels['crew.space.project'], binding.project, 'Fleet task identity never rewrites the repair placement alias');
-    assert.equal(binding.name, registration === 'matching' ? 'core' : 'crew'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
+    assert.equal(binding.name, 'core', 'Repair names use the source repository directory, including internal fallback'); assert.ok(binding.id.endsWith(registration === 'matching' ? '-project-crew' : '-self'));
     assert.equal(f.call(['config', 'worker-space', 'combined']).code, 0);
     r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second'], { CREW_AGENT_PATH: '' }); assert.equal(r.code, 0, r.out);
     assert.deepEqual(f.task(t.id).workerSpace, binding);
@@ -1470,6 +1470,24 @@ function workerSpaceFixTests() {
     }
   }
 }
+gapTests['repair-space-name'] = () => {
+  const before = fs.readFileSync(world, 'utf8');
+  try {
+    workerSpaceFixTests('repair-names');
+    const f = repairFixture('repair-name-legacy');
+    assert.equal(f.call(['config', 'worker-space', 'per-project']).code, 0);
+    let r = f.call(['fix', '--agent', 'pi', 'Repair.']); assert.equal(r.code, 0, r.out);
+    const t = f.task('fix-1'); assert.equal(t.workerSpace.name, 'core');
+    const oldName = { ...t.workerSpace, name: 'crew' };
+    fs.writeFileSync(path.join(f.home, 'tasks', t.id, 'task.json'), JSON.stringify({ ...t, workerSpace: oldName,
+      terminalLaunches: t.terminalLaunches.map(launch => ({ ...launch, workerSpace: oldName })) }));
+    const w = readWorld(); w.terminals[t.terminal].labels['crew.space.name'] = 'crew'; fs.writeFileSync(world, JSON.stringify(w));
+    r = f.call(['relaunch', t.id, '--agent', 'pi', '--model', 'second']); assert.equal(r.code, 0, r.out);
+    assert.deepEqual(f.task(t.id).workerSpace, oldName, 'Existing occupied repair names are not renamed');
+    assert.equal(readWorld().terminals[f.task(t.id).terminal].labels['crew.space.name'], 'crew');
+  } finally { fs.writeFileSync(world, before); }
+};
+
 async function workerSpaceRepairAdmissionTest() {
   const f = repairFixture('spaces-admission-race');
   assert.equal(f.call(['project', 'add', 'crew', f.repo]).code, 0);

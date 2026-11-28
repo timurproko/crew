@@ -1,5 +1,26 @@
 # Task orchestration delta
 
+## MODIFIED Requirements
+
+### Requirement: Self-repair placement identifies Crew safely
+
+Crew self-repairs SHALL use combined placement in combined mode. In per-project mode they SHALL use the crew placement project only when that registration identifies Crew's own repository; otherwise they SHALL use crew:self. Independent repair admission SHALL reuse an eligible exclusive occupied space for that placement project before requesting its canonical identity. An unrelated crew registration SHALL NOT receive the fixer. Repair task identity and inheritance SHALL remain unchanged.
+
+#### Scenario: Crew source is registered accurately
+
+- **WHEN** a new per-project self-repair starts and the crew registration identifies the tool's repository
+- **THEN** it selects an eligible occupied space for that placement project or its canonical project identity while retaining its internal repair task identity
+
+#### Scenario: Crew registration is missing or unrelated
+
+- **WHEN** a new per-project self-repair starts without a matching crew registration
+- **THEN** it selects an eligible occupied crew:self space or requests the internal repair space using its repository-directory display name rather than joining an unrelated project's space
+
+#### Scenario: Shared repair placement protects registration identity
+
+- **WHEN** an unfinished self-repair or one with a copy waiting shares a registered crew project's placement
+- **THEN** removing or repointing that registration is refused until the reference is released, preventing an unrelated repository from joining the occupied repair space
+
 ## ADDED Requirements
 
 ### Requirement: Internal repair-space titles follow directory spelling

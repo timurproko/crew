@@ -36,5 +36,5 @@ Each numbered group maps to one draft-PR Implementation outcome, in this order. 
 
 ## 6. Internal repair-space names preserve repository directory spelling
 
-- [ ] 6.1 Replace Crew's hardcoded internal repair title with the normal directory-name resolver while preserving internal IDs and saved names; cover core-named source and registered alias/fallback cases in `repair-space-name`.
-- [ ] 6.2 Run `node crew.test.mjs --gaps=repair-space-name` and document Crew-owned repair naming and inherited-name compatibility in `docs/worker-spaces.md`.
+- [x] 6.1 Replace Crew's hardcoded internal repair title with the normal directory-name resolver while preserving internal IDs and saved names; cover core-named source and registered alias/fallback cases in `repair-space-name`.
+- [x] 6.2 Run `node crew.test.mjs --gaps=repair-space-name` and document Crew-owned repair naming and inherited-name compatibility in `docs/worker-spaces.md`.
