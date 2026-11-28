@@ -17,9 +17,9 @@ Each numbered group maps to one draft-PR Implementation outcome, in this order. 
 
 ## 3. Windows task input preserves all description lines
 
-- [ ] 3.1 Add PowerShell-native forwarding and a UTF-8 `spawn --task-file` route, rejecting missing/unreadable/empty files and positional/file conflicts before admission; cover exact internal line and Unicode preservation in a focused `spawn-multiline` group.
-- [ ] 3.2 Exercise a real PowerShell here-string through the supported launcher against fake Core, including quotes and metacharacters, and keep legacy single-line compatibility; run `node crew.test.mjs --gaps=spawn-multiline`.
-- [ ] 3.3 Document explicit native launcher and shell-safe task-file examples in README/help, and ensure any known lossy invocation is refused clearly or routed to the lossless launcher in the focused tests.
+- [x] 3.1 Add PowerShell-native forwarding and a UTF-8 `spawn --task-file` route, rejecting missing/unreadable/empty files and positional/file conflicts before admission; cover exact internal line and Unicode preservation in a focused `spawn-multiline` group.
+- [x] 3.2 Exercise a real PowerShell here-string through the supported launcher against fake Core, including quotes and metacharacters, and keep legacy single-line compatibility; run `node crew.test.mjs --gaps=spawn-multiline`.
+- [x] 3.3 Document explicit native launcher and shell-safe task-file examples in README/help, and ensure any known lossy invocation is refused clearly or routed to the lossless launcher in the focused tests.
 
 ## 4. Passing self-repairs have a realistic bounded suite allowance
 

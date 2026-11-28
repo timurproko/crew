@@ -1877,10 +1877,16 @@ const branchOf = task => task.branch ?? `crew/${task.id}`;
 function cmdSpawn(args) {
   const h = home();
   requireOwner(h, 'spawn work');
-  const { flags, rest } = takeFlags(args, ['project', 'kind', 'type', ...PICK_FLAGS], ['no-fallback']);
+  const { flags, rest } = takeFlags(args, ['project', 'kind', 'type', 'task-file', ...PICK_FLAGS], ['no-fallback']);
   const opts = { kind: flags.kind ?? 'scout', project: flags.project, ...(flags.type !== undefined ? { type: flags.type } : {}) };
   const [id, ...words] = rest;
-  const task = words.join(' ').trim();
+  let task = words.join(' ').trim();
+  if (flags['task-file'] !== undefined) {
+    if (words.length) refuse('Use either positional task text or --task-file, not both.');
+    try { task = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(path.resolve(flags['task-file']))).trim(); }
+    catch { refuse('Cannot read --task-file as a UTF-8 file; no task was created.'); }
+    if (!task) refuse('--task-file must contain a nonempty task description; no task was created.');
+  }
   requireProjectName(opts.project);
   if (!validId(id) || !task) refuse(`Usage: crew spawn <id> --project <name> [--kind scout|ship] [--type feature|fix|...] ${PICK_USAGE} "<task>"`);
   if (!['scout', 'ship'].includes(opts.kind)) refuse(`Unknown kind: ${opts.kind}`);
@@ -2167,7 +2173,7 @@ function launchWorker(h, { id, opts, chosen, project, task, extra = {} }) {
   // copy and does not know whether that is a reused pool slot or a new folder. Without it,
   // crew makes a plain git worktree itself.
   const delivered = Boolean(toolPath('delivery'));
-  let record = { id, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
+  let record = { id, task, kind: opts.kind, agent: opts.agent, project: opts.project, state: 'preparing', created: now(), worktree, report, brief, terminal: null,
     // Keep the original order, even for candidates that cannot work now: hand-over rereads
     // them. `chain` is the untried remainder; `candidates` also retains the attempted choices.
     launch: { ...pick, source: chosen.source }, candidates: chosen.candidates, chain: chosen.rest, candidateChecks: chosen.checks, dispatch: chosen.dispatch,
@@ -4255,6 +4261,8 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
   crew config worker-space --set-local <mode> --home <absolute-home> --json   local worker-space-only preference; no ownership needed
       existing workers never move; reviews and replacements inherit their task's space; connected project names need compatible Herdr
   crew spawn <id> --project <name> [--kind scout|ship] [--type <type>] [who] "<task>"
+      or --task-file <UTF-8 file> instead of positional task text (multiline safe)
+      PowerShell: crew.ps1 forwards multiline task text without cmd.exe truncation
       who: ${PICK_USAGE}
   crew agents [--role scout|ship|review|fix] [--project <name>] [who] [--json]   original rows and quota now, next choice marked
   crew relaunch <id> [who] ["<why>"]       end the current session, even busy; hand over working, stopped or failed work; copy stays
@@ -4299,6 +4307,17 @@ const USAGE = `crew ${VERSION} - a small crew tool on Herdr Core
 `;
 
 export async function main(argv) {
+  // PowerShell's native argument quoting varies by version. Its launcher sends
+  // one ASCII envelope instead of exposing multiline prose to cmd.exe/CRT parsing.
+  if (argv[0] === '_argv') {
+    let decoded;
+    try {
+      if (argv.length !== 2 || argv[1].length > 1048576) throw Error();
+      decoded = JSON.parse(Buffer.from(argv[1], 'base64').toString('utf8'));
+      if (!Array.isArray(decoded) || decoded.some(a => typeof a !== 'string') || decoded[0] === '_argv') throw Error();
+    } catch { console.error('crew: invalid launcher arguments; use crew.ps1 or node crew.mjs directly.'); process.exitCode = 2; return; }
+    return main(decoded);
+  }
   const [name, ...args] = argv;
   if (name === '--capabilities') return cmdProjectKinds([name, ...args]);
   if (name === '--version') { console.log(VERSION); return; }

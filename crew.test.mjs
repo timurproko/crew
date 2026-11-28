@@ -704,6 +704,37 @@ gapTests['workflow-detection'] = () => {
   assert.equal(r.code, 0, r.out); assert.equal(f.task('plain').workflow, undefined);
 };
 
+gapTests['spawn-multiline'] = () => {
+  const f = gapFixture('multiline'), text = 'First line\r\n\r\nUnicode: λ 日本語\r\nQuotes: "hello" and \'world\'; & | < > % ! $ ` last line';
+  const file = path.join(f.home, 'task.txt'); fs.writeFileSync(file, '\uFEFF' + text);
+  let r = f.call(['spawn', 'file-input', '--project', 'demo', '--agent', 'pi', '--task-file', 'task.txt']);
+  assert.equal(r.code, 0, r.out);
+  const check = id => { const t = f.task(id); assert.equal(t.task, text); assert.ok(fs.readFileSync(t.brief, 'utf8').includes(text)); };
+  check('file-input');
+  for (const [name, data] of [['empty', '  '], ['invalid', Buffer.from([0xff])]]) fs.writeFileSync(path.join(f.home, name), data);
+  for (const args of [['--task-file', 'missing'], ['--task-file', 'empty'], ['--task-file', 'invalid'], ['--task-file', file, 'also text']]) {
+    r = f.call(['spawn', 'refused', '--project', 'demo', '--agent', 'pi', ...args]);
+    assert.equal(r.code, 2, r.out); assert.match(r.out, /task-file/); assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'refused')));
+  }
+  r = f.call(['spawn', 'single', '--project', 'demo', '--agent', 'pi', 'Single line']);
+  assert.equal(r.code, 0, r.out); assert.equal(f.task('single').task, 'Single line');
+  if (WINDOWS) {
+    const driver = path.join(f.dir, 'powershell-driver.mjs'), script = path.join(f.dir, 'invoke.ps1');
+    fs.writeFileSync(driver, `import {spawnSync} from 'node:child_process';
+const r=spawnSync('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',${JSON.stringify(script)}],{stdio:'inherit'});process.exit(r.status??1);`);
+    const invoke = (launcher, id, taskArg = '$text') => {
+      fs.writeFileSync(script, `$text = @'\r\n${text}\r\n'@\r\n& '${slash(path.join(here, 'bin', launcher))}' spawn ${id} --project demo --agent pi ${taskArg}\r\nexit $LASTEXITCODE\r\n`, 'utf8');
+      // Windows PowerShell reads a BOM-less script as ANSI. Supply a UTF-8 BOM.
+      fs.writeFileSync(script, '\uFEFF' + fs.readFileSync(script, 'utf8'));
+      return f.call([], {}, driver);
+    };
+    r = invoke('crew.ps1', 'native'); assert.equal(r.code, 0, r.out); check('native');
+    r = invoke('crew.cmd', 'batch-lossy'); assert.equal(r.code, 2, r.out); assert.match(r.out, /unsafe batch.*crew.ps1|task-file/);
+    assert.ok(!fs.existsSync(path.join(f.home, 'tasks', 'batch-lossy')), 'Batch guard rejects before a shortened task is created');
+    r = invoke('crew.cmd', 'batch-file', "--task-file 'task.txt'"); assert.equal(r.code, 0, r.out); check('batch-file');
+  }
+};
+
 gapTests['project-list-speed'] = () => {
   const f = projectKindFixture('list-speed'), registry = path.join(f.home, 'crew.json');
   const config = JSON.parse(fs.readFileSync(registry, 'utf8')), head = git('-C', f.repo, 'rev-parse', 'HEAD').trim();
